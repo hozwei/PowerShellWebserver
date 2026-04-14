@@ -33,7 +33,7 @@ Invoke-RestMethod -Uri 'http://localhost/' -Headers @{ 'X-Api-Key' = 'your-api-k
 Expected result:
 
 ```json
-["/restart-comfyui-graceful.ps1", "/script1.ps1", "/subdir/script2.ps1"]
+["/script1.ps1", "/subdir/script2.ps1"]
 ```
 
 ---
@@ -97,37 +97,6 @@ Expected result:
   "exitCode": 0,
   "output": "=== Verzeichnisliste ===\nPfad    : C:\\Windows\\Temp\nFilter  : *.log\nAnzahl  : 3 Eintraege\n...\nFertig.",
   "error": ""
-}
-```
-
----
-
-### Restarting a background process
-
-Trigger a graceful restart of a running process. The script stops the process, waits for it to terminate, restarts it, and blocks until its port responds — then returns.
-
-```powershell
-Invoke-RestMethod -Uri 'http://localhost/restart-comfyui-graceful.ps1' `
-    -Headers @{ 'X-Api-Key' = 'your-api-key' }
-```
-
-Expected result when the process restarts within the timeout:
-
-```json
-{
-  "exitCode": 0,
-  "output": "ComfyUI beendet: 1 Prozess(e) sauber, 0 Prozess(e) hart beendet.\nComfyUI gestartet. Warte auf Port 8188 (max. 60s)...\nComfyUI ist bereit. Erreichbar auf Port 8188 nach 18s.",
-  "error": ""
-}
-```
-
-Expected result when the process fails to start within the timeout (HTTP 500):
-
-```json
-{
-  "exitCode": 1,
-  "output": "Kein laufender ComfyUI-Prozess gefunden - starte direkt neu.\nComfyUI gestartet. Warte auf Port 8188 (max. 60s)...",
-  "error": "Timeout: ComfyUI hat Port 8188 nicht innerhalb von 60s geoeffnet."
 }
 ```
 

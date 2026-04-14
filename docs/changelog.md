@@ -36,6 +36,4 @@
 - `Write-Log`: `ReleaseMutex()` is now only called when `WaitOne()` returned `$true` — calling it from a thread that does not hold the mutex caused an `ApplicationException`.
 - `Invoke-Script`: job state is now read into a local variable before `Remove-Job` is called — previously `$job.ChildJobs[0]` was accessed after the job object was already removed, causing a null reference error.
 - `Get-ScriptIndex` now wraps its result in `@(...)` before serialising — empty arrays lost their array type in the pipeline and serialised as `null` instead of `[]`.
-- `restart-comfyui-graceful.ps1`: `TcpClient` is now disposed in a `finally` block — previously undisposed instances accumulated during the port-polling loop.
-- `restart-comfyui-graceful.ps1`: `CloseMainWindow()` return value now suppressed with `$null =` instead of `| Out-Null` — consistent with project code style.
 - `script1.ps1`: `Get-CimInstance Win32_OperatingSystem` called once and stored — previously called twice, wasting a WMI round-trip.

@@ -13,7 +13,6 @@ C:\posh\
 ├── logs\                        # Runtime logs, one file per day (YYYY-MM-DD.log)
 └── webroot\                     # HTTP endpoints — each .ps1 file is a route
     ├── script1.ps1              # Example: returns system information
-    ├── restart-comfyui-graceful.ps1  # Example: gracefully restarts a ComfyUI process
     └── subdir\                  # Subdirectories map to URL path segments
         └── script2.ps1          # Example: lists files in a directory
 ```

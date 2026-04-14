@@ -2,10 +2,7 @@
 
 A Windows HTTP server that maps URL paths directly to PowerShell scripts and returns their output as JSON.
 
-```
-GET /restart-comfyui-graceful.ps1
-→ { "exitCode": 0, "output": "ComfyUI ist bereit...", "error": "" }
-```
+Place a `.ps1` file in `webroot\` — it is immediately reachable as an HTTP endpoint. No registration, no framework, no restart required.
 
 ## Documentation
 
@@ -16,3 +13,153 @@ GET /restart-comfyui-graceful.ps1
 - [Configuration](./docs/configuration.md) — All configuration options
 - [Contributing](./docs/contributing.md) — Development workflow, conventions, and adding new endpoints
 - [Changelog](./docs/changelog.md) — Version history
+
+## Features
+
+- **URL-to-script routing** — every `.ps1` file in `webroot\` is an HTTP endpoint; subdirectories map to URL path segments.
+- **Query-parameter forwarding** — URL query parameters are passed as named PowerShell arguments to the target script.
+- **JSON response envelope** — all responses follow `{ "exitCode", "output", "error" }`, regardless of which script ran.
+- **API key authentication** — all endpoints except `GET /health` require an `X-Api-Key` header. The key is configured via the `POSH_API_KEY` system environment variable.
+- **Concurrent request handling** — up to `MaxConcurrent` (default: 10) requests are processed in parallel using `Start-ThreadJob`. Requests beyond the limit receive HTTP 503 immediately.
+- **Script timeout enforcement** — scripts exceeding `ScriptTimeoutSec` (default: 900 s) are terminated and the caller receives HTTP 504.
+- **Log rotation** — daily log files in `logs\`; files older than `LogRetentionDays` days are deleted at startup.
+- **Built-in health endpoint** — `GET /health` returns server status, uptime, and total request count without authentication.
+- **Windows Scheduled Task** — `Register-ScheduledTask.ps1` installs the server as an auto-starting task in one command.
+
+## Quick Start
+
+**Prerequisites:** Windows 10 / Server 2019, PowerShell 7, local administrator account with password.
+
+```powershell
+# 1. Copy to deployment directory
+Copy-Item -Path ".\*" -Destination "C:\posh\" -Recurse -Force
+
+# 2. Register as a Windows Scheduled Task (Administrator PowerShell 7)
+cd C:\posh
+.\Register-ScheduledTask.ps1        # prompts for username, password, and API key
+
+# 3. Start immediately (no reboot needed)
+Start-ScheduledTask -TaskName 'PowerShell-Webserver'
+
+# 4. Verify
+Invoke-RestMethod -Uri 'http://localhost/health'
+```
+
+Expected response from `/health`:
+
+```json
+{ "status": "ok", "uptime": "0h 0m 5s", "requestsTotal": 0 }
+```
+
+For the full installation guide, see [Setup](./docs/setup.md).
+
+## Calling an Endpoint
+
+Every `.ps1` file in `webroot\` is immediately callable via HTTP GET. Include the `X-Api-Key` header and pass script parameters as URL query parameters.
+
+```powershell
+Invoke-RestMethod -Uri 'http://localhost/script1.ps1' `
+    -Headers @{ 'X-Api-Key' = 'your-api-key' }
+```
+
+Response:
+
+```json
+{
+  "exitCode": 0,
+  "output": "=== Systeminformation ===\nHostname    : WORKSTATION\n...",
+  "error": ""
+}
+```
+
+Scripts in subdirectories are reachable by path:
+
+```powershell
+Invoke-RestMethod -Uri 'http://localhost/subdir/script2.ps1?Path=C:\Windows\Temp' `
+    -Headers @{ 'X-Api-Key' = 'your-api-key' }
+```
+
+## Adding an Endpoint
+
+Create a `.ps1` file anywhere inside `webroot\` — it is reachable immediately, no server restart needed:
+
+```powershell
+# webroot\get-disk-usage.ps1
+#Requires -Version 7.0
+param(
+    [string] $Drive = 'C'
+)
+
+$disk   = Get-PSDrive -Name $Drive -ErrorAction SilentlyContinue
+if (-not $disk) {
+    Write-Error "Drive not found: $Drive"
+    exit 1
+}
+
+$freeGB = [math]::Round($disk.Free / 1GB, 2)
+$usedGB = [math]::Round($disk.Used / 1GB, 2)
+Write-Output "Drive ${Drive}: free=${freeGB} GB, used=${usedGB} GB"
+```
+
+Call it:
+
+```powershell
+Invoke-RestMethod -Uri 'http://localhost/get-disk-usage.ps1?Drive=D' `
+    -Headers @{ 'X-Api-Key' = 'your-api-key' }
+```
+
+Rules for webroot scripts: use `Write-Output` for normal output, `Write-Error` for errors, `exit 1` to signal HTTP 500, `exit 0` (or no explicit exit) for HTTP 200. All query parameters arrive as `string` — cast explicitly when needed. See [Contributing](./docs/contributing.md) for the full rules.
+
+## HTTP Status Codes
+
+| Code | Meaning |
+|---|---|
+| `200` | Script exited with code `0` |
+| `400` | Request path does not end in `.ps1` |
+| `401` | `X-Api-Key` header missing or incorrect |
+| `403` | Path-traversal attempt detected |
+| `404` | Script file not found in `webroot\` |
+| `405` | HTTP method not allowed — only GET is accepted |
+| `500` | Script exited with a non-zero exit code |
+| `503` | Server is at maximum concurrent request capacity |
+| `504` | Script exceeded `ScriptTimeoutSec` and was terminated |
+
+## Configuration
+
+All configuration is inline in `Start-WebServer.ps1` as the `$cfg` hashtable. There is no external config file.
+
+| Option | Default | Description |
+|---|---|---|
+| `$baseDir` | `C:\posh` | Deployment directory — base for `WebRoot` and `LogDir` |
+| `Prefix` | `http://+:80/` | `HttpListener` URL prefix — change port here |
+| `WebRoot` | `C:\posh\webroot` | Directory containing the `.ps1` endpoint scripts |
+| `LogDir` | `C:\posh\logs` | Directory for daily log files |
+| `ApiKey` | `$env:POSH_API_KEY` | API key — always read from the `POSH_API_KEY` environment variable |
+| `ScriptTimeoutSec` | `900` | Seconds before a running script is killed and HTTP 504 is returned |
+| `MaxConcurrent` | `10` | Maximum parallel requests — excess requests receive HTTP 503 |
+| `LogRetentionDays` | `180` | Days to keep log files; `0` disables rotation |
+
+For the full options reference, see [Configuration](./docs/configuration.md).
+
+## Architecture Overview
+
+```
+Client
+  │  GET /subdir/script2.ps1?Path=C:\Temp   X-Api-Key: <key>
+  ▼
+HttpListener  ──  Main Loop (GetContext)
+  │  SemaphoreSlim: full → HTTP 503
+  │  Start-ThreadJob { $requestHandler }
+  ▼
+$requestHandler (ThreadJob)
+  │  Auth · Method · Path validation
+  │  Invoke-Script
+  ▼
+pwsh.exe -File webroot\subdir\script2.ps1 -Path "C:\Temp"
+  │  stdout + stderr via ReadToEndAsync()
+  │  $proc.ExitCode → HTTP 200 / 500 / 504
+  ▼
+{ "exitCode": 0, "output": "...", "error": "" }
+```
+
+posh has no external dependencies beyond the .NET base class library and PowerShell 7 built-ins. For a full component breakdown, see [Architecture](./docs/architecture.md).
