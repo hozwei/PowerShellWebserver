@@ -2,7 +2,7 @@
 
 ## What is it?
 
-posh is a Windows HTTP server that maps URL paths directly to PowerShell scripts and returns their output as JSON.
+posh is a Windows HTTP/HTTPS server that maps URL paths directly to PowerShell scripts and returns their output as JSON.
 
 ## Problem Statement
 
@@ -11,8 +11,9 @@ Windows automation tasks — restarting services, querying system state, trigger
 ## Key Features
 
 - **URL-to-script routing** — every `.ps1` file placed in the `webroot\` directory is immediately reachable as an HTTP endpoint, with no registration or configuration required.
-- **Query-parameter forwarding** — URL query parameters are passed directly as named PowerShell arguments to the target script.
+- **GET and POST support** — URL query parameters (GET) and flat JSON body keys (POST) are passed directly as named PowerShell arguments to the target script. Body keys take precedence when names collide.
 - **JSON response envelope** — all responses follow a uniform `{ "exitCode", "output", "error" }` structure, making results predictable for any HTTP client.
+- **HTTPS support** — optional TLS on a configurable port. A certificate is created and bound to the port automatically by `Register-ScheduledTask.ps1`. Self-signed and imported PFX certificates are supported.
 - **API key authentication** — all endpoints except `GET /health` require an `X-Api-Key` header, configured via the `POSH_API_KEY` system environment variable.
 - **Concurrent request handling** — up to 10 requests are processed simultaneously; requests beyond the limit receive an immediate HTTP 503 instead of queuing indefinitely.
 - **Script timeout enforcement** — scripts that run longer than the configured threshold are terminated and the caller receives HTTP 504, preventing indefinite hangs.

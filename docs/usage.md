@@ -5,7 +5,11 @@
 Send an HTTP GET or POST request to a `.ps1` file under the server's `webroot\`. Include the `X-Api-Key` header with every request. The server executes the script and returns a JSON object with the exit code, standard output, and error output.
 
 ```powershell
+# HTTP
 Invoke-RestMethod -Uri 'http://localhost/script1.ps1' -Headers @{ 'X-Api-Key' = 'your-api-key' }
+
+# HTTPS (add -SkipCertificateCheck for self-signed certificates)
+Invoke-RestMethod -Uri 'https://localhost/script1.ps1' -Headers @{ 'X-Api-Key' = 'your-api-key' } -SkipCertificateCheck
 ```
 
 Expected response:

@@ -1,6 +1,6 @@
 # posh
 
-A Windows HTTP server that maps URL paths directly to PowerShell scripts and returns their output as JSON.
+A Windows HTTP/HTTPS server that maps URL paths directly to PowerShell scripts and returns their output as JSON.
 
 Place a `.ps1` file in `webroot\` — it is immediately reachable as an HTTP endpoint. No registration, no framework, no restart required.
 
@@ -17,8 +17,9 @@ Place a `.ps1` file in `webroot\` — it is immediately reachable as an HTTP end
 ## Features
 
 - **URL-to-script routing** — every `.ps1` file in `webroot\` is an HTTP endpoint; subdirectories map to URL path segments.
-- **Query-parameter and POST-body forwarding** — URL query parameters (GET) and JSON body keys (POST) are passed as named PowerShell arguments to the target script. Body keys take precedence when names collide.
+- **GET and POST support** — URL query parameters (GET) and flat JSON body keys (POST) are passed as named PowerShell arguments to the target script. Body keys take precedence when names collide.
 - **JSON response envelope** — all responses follow `{ "exitCode", "output", "error" }`, regardless of which script ran.
+- **HTTPS support** — optional TLS on a configurable port. Certificate creation, `netsh` binding, and firewall rules are handled automatically by `Register-ScheduledTask.ps1`.
 - **API key authentication** — all endpoints except `GET /health` require an `X-Api-Key` header. The key is configured via the `POSH_API_KEY` system environment variable.
 - **Concurrent request handling** — up to `MaxConcurrent` (default: 10) requests are processed in parallel using `Start-ThreadJob`. Requests beyond the limit receive HTTP 503 immediately.
 - **Script timeout enforcement** — scripts exceeding `ScriptTimeoutSec` (default: 900 s) are terminated and the caller receives HTTP 504.
@@ -36,7 +37,7 @@ Copy-Item -Path ".\*" -Destination "C:\posh\" -Recurse -Force
 
 # 2. Register as a Windows Scheduled Task (Administrator PowerShell 7)
 cd C:\posh
-.\Register-ScheduledTask.ps1        # prompts for username, password, and API key
+.\Register-ScheduledTask.ps1        # prompts for username, password, API key, and optional HTTPS
 
 # 3. Start immediately (no reboot needed)
 Start-ScheduledTask -TaskName 'PowerShell-Webserver'
@@ -51,7 +52,7 @@ Expected response from `/health`:
 { "status": "ok", "uptime": "0h 0m 5s", "requestsTotal": 0 }
 ```
 
-For the full installation guide, see [Setup](./docs/setup.md).
+For the full installation guide including HTTPS setup, see [Setup](./docs/setup.md).
 
 ## Calling an Endpoint
 
@@ -91,32 +92,32 @@ Invoke-RestMethod -Uri 'http://localhost/subdir/script2.ps1?Path=C:\Windows\Temp
     -Headers @{ 'X-Api-Key' = 'your-api-key' }
 ```
 
+**HTTPS** (add `-SkipCertificateCheck` for self-signed certificates):
+
+```powershell
+Invoke-RestMethod -Uri 'https://localhost/script1.ps1' `
+    -Headers @{ 'X-Api-Key' = 'your-api-key' } `
+    -SkipCertificateCheck
+```
+
 ## Adding an Endpoint
 
 Create a `.ps1` file anywhere inside `webroot\` — it is reachable immediately, no server restart needed:
 
 ```powershell
-# webroot\get-disk-usage.ps1
+# webroot\my-script.ps1
 #Requires -Version 7.0
 param(
-    [string] $Drive = 'C'
+    [string] $Name = 'World'
 )
 
-$disk   = Get-PSDrive -Name $Drive -ErrorAction SilentlyContinue
-if (-not $disk) {
-    Write-Error "Drive not found: $Drive"
-    exit 1
-}
-
-$freeGB = [math]::Round($disk.Free / 1GB, 2)
-$usedGB = [math]::Round($disk.Used / 1GB, 2)
-Write-Output "Drive ${Drive}: free=${freeGB} GB, used=${usedGB} GB"
+Write-Output "Hello, $Name!"
 ```
 
 Call it:
 
 ```powershell
-Invoke-RestMethod -Uri 'http://localhost/get-disk-usage.ps1?Drive=D' `
+Invoke-RestMethod -Uri 'http://localhost/my-script.ps1?Name=Max' `
     -Headers @{ 'X-Api-Key' = 'your-api-key' }
 ```
 
@@ -140,19 +141,20 @@ Rules for webroot scripts: use `Write-Output` for normal output, `Write-Error` f
 
 ## Configuration
 
-All configuration is inline in `Start-WebServer.ps1` as the `$cfg` hashtable. There is no external config file.
+All configuration is inline in `Start-WebServer.ps1` as the `$cfg` hashtable. There is no external config file. HTTP/HTTPS ports and HTTPS activation are runtime parameters.
 
 | Option | Default | Description |
 |---|---|---|
-| `$baseDir` | `C:\posh` | Deployment directory — base for `WebRoot` and `LogDir` |
-| `Prefix` | `http://+:80/` | `HttpListener` URL prefix — change port here |
+| `-HttpPort` | `80` | HTTP listen port; `0` = HTTP disabled |
+| `-HttpsEnabled` | off | Enable HTTPS (requires `netsh sslcert` binding) |
+| `-HttpsPort` | `443` | HTTPS listen port |
 | `WebRoot` | `C:\posh\webroot` | Directory containing the `.ps1` endpoint scripts |
 | `LogDir` | `C:\posh\logs` | Directory for daily log files |
-| `ApiKey` | `$env:POSH_API_KEY` | API key — always read from the `POSH_API_KEY` environment variable |
+| `ApiKey` | `$env:POSH_API_KEY` | API key — always read from the environment variable |
 | `ScriptTimeoutSec` | `900` | Seconds before a running script is killed and HTTP 504 is returned |
 | `MaxConcurrent` | `10` | Maximum parallel requests — excess requests receive HTTP 503 |
 | `LogRetentionDays` | `180` | Days to keep log files; `0` disables rotation |
-| `MaxRequestBodyBytes` | `20971520` (20 MB) | Maximum POST body size in bytes — larger bodies receive HTTP 413 |
+| `MaxRequestBodyBytes` | `20971520` (20 MB) | Maximum POST body size in bytes |
 
 For the full options reference, see [Configuration](./docs/configuration.md).
 
@@ -162,7 +164,8 @@ For the full options reference, see [Configuration](./docs/configuration.md).
 Client
   │  GET /subdir/script2.ps1?Path=C:\Temp   X-Api-Key: <key>
   ▼
-HttpListener  ──  Main Loop (GetContext)
+HttpListener  ──  http://+:80/  https://+:443/
+  │  Main Loop (GetContext)
   │  SemaphoreSlim: full → HTTP 503
   │  Start-ThreadJob { $requestHandler }
   ▼

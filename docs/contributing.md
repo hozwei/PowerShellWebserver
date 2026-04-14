@@ -89,33 +89,35 @@ An empty result means no syntax errors were detected.
 Create a new `.ps1` file anywhere inside `webroot\`. It is immediately reachable via HTTP — no registration or server restart required.
 
 ```powershell
-# webroot\get-disk-usage.ps1
+# webroot\my-script.ps1
 #Requires -Version 7.0
 <#
 .SYNOPSIS
-    Returns free disk space for a given drive.
-.PARAMETER Drive
-    Drive letter to check (default: C)
+    Example endpoint.
+.PARAMETER Name
+    A string parameter passed from the query string or POST body.
 #>
 param(
-    [string] $Drive = 'C'
+    [string] $Name = 'World'
 )
 
-$disk = Get-PSDrive -Name $Drive -ErrorAction SilentlyContinue
-if (-not $disk) {
-    Write-Error "Laufwerk nicht gefunden: $Drive"
-    exit 1
-}
-
-$freeGB  = [math]::Round($disk.Free  / 1GB, 2)
-$usedGB  = [math]::Round($disk.Used  / 1GB, 2)
-Write-Output "Laufwerk ${Drive}: frei=${freeGB} GB, belegt=${usedGB} GB"
+Write-Output "Hello, $Name!"
 ```
 
-Call via:
+Call via GET:
 
 ```powershell
-Invoke-RestMethod -Uri 'http://localhost/get-disk-usage.ps1?Drive=D' `
+Invoke-RestMethod -Uri 'http://localhost/my-script.ps1?Name=Max' `
+    -Headers @{ 'X-Api-Key' = 'your-api-key' }
+```
+
+Call via POST:
+
+```powershell
+Invoke-RestMethod -Uri 'http://localhost/my-script.ps1' `
+    -Method Post `
+    -ContentType 'application/json' `
+    -Body '{"Name":"Max"}' `
     -Headers @{ 'X-Api-Key' = 'your-api-key' }
 ```
 

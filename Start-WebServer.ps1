@@ -1,23 +1,54 @@
 #Requires -Version 7.0
 <#
 .SYNOPSIS
-    PowerShell HTTP-Webserver - fuehrt lokale .ps1-Skripte per HTTP-Request aus.
+    PowerShell HTTP/HTTPS-Webserver - fuehrt lokale .ps1-Skripte per HTTP-Request aus.
 
 .DESCRIPTION
-    Lauscht auf Port 80 (alle Interfaces).
+    Lauscht standardmaessig auf Port 80 (HTTP) und optional auf Port 443 (HTTPS).
     URL-Pfade werden direkt auf .\webroot\ gemappt.
     Query-Parameter werden als benannte Argumente an das Skript uebergeben.
     Jeder Request wird in .\logs\YYYY-MM-DD.log protokolliert.
 
     Erfordert PowerShell 7 (pwsh.exe).
-    Muss als Administrator ausgefuehrt werden (Port 80).
+    Muss als Administrator ausgefuehrt werden.
+
+    HTTPS-Voraussetzung: netsh sslcert-Bindung muss via Register-ScheduledTask.ps1
+    eingerichtet worden sein. Der Server prueft dies beim Start und bricht mit
+    exit 1 ab wenn die Bindung fehlt.
+
+.PARAMETER HttpsEnabled
+    HTTPS aktivieren. Erfordert eine netsh sslcert-Bindung fuer HttpsPort.
+
+.PARAMETER HttpPort
+    HTTP-Port. Standard: 80. Wert 0 = HTTP deaktiviert (nur sinnvoll mit -HttpsEnabled).
+
+.PARAMETER HttpsPort
+    HTTPS-Port. Standard: 443. Wird nur ausgewertet wenn -HttpsEnabled gesetzt ist.
 
 .EXAMPLE
+    # Nur HTTP (Standard)
+    .\Start-WebServer.ps1
+
+    # HTTP auf Port 8080
+    .\Start-WebServer.ps1 -HttpPort 8080
+
+    # HTTPS auf 443, HTTP auf 80 weiterhin aktiv
+    .\Start-WebServer.ps1 -HttpsEnabled -HttpPort 80 -HttpsPort 443
+
+    # Nur HTTPS (HTTP deaktiviert)
+    .\Start-WebServer.ps1 -HttpsEnabled -HttpPort 0 -HttpsPort 443
+
     http://localhost/script1.ps1
     http://localhost/subdir/script2.ps1?Name=Max&Wert=42
     http://localhost/                    <- listet alle verfuegbaren Skripte
     http://localhost/health              <- Serverstatus, Uptime, Request-Zaehler
 #>
+
+param(
+    [switch] $HttpsEnabled,
+    [int]    $HttpPort  = 80,
+    [int]    $HttpsPort = 443
+)
 
 # ---------------------------------------------------------------------------
 # PowerShell 7 - Pflichtpruefung
@@ -82,13 +113,18 @@ if ([string]::IsNullOrEmpty($apiKey)) {
 
 # ---------------------------------------------------------------------------
 # Konfiguration
+# Prefix wird nicht mehr in $cfg gespeichert - wird dynamisch aus HttpPort/
+# HttpsPort aufgebaut und direkt dem Listener hinzugefuegt.
+# HttpPort = 0 signalisiert: HTTP deaktiviert (nur sinnvoll mit HttpsEnabled).
 # ---------------------------------------------------------------------------
 $cfg = @{
-    Prefix           = 'http://+:80/'
-    WebRoot          = Join-Path $baseDir 'webroot'
-    LogDir           = Join-Path $baseDir 'logs'
-    PwshExe          = (Get-Process -Id $PID).MainModule.FileName   # pwsh.exe des laufenden Prozesses - kein Pfad-Hardcode
-    ApiKey           = $apiKey                                       # aus $env:POSH_API_KEY - bereits auf Leerstring geprueft
+    HttpsEnabled        = $HttpsEnabled.IsPresent                    # HTTPS aktiv?
+    HttpPort            = $HttpPort                                  # HTTP-Port (0 = deaktiviert)
+    HttpsPort           = $HttpsPort                                 # HTTPS-Port (nur relevant wenn HttpsEnabled)
+    WebRoot             = Join-Path $baseDir 'webroot'
+    LogDir              = Join-Path $baseDir 'logs'
+    PwshExe             = (Get-Process -Id $PID).MainModule.FileName # pwsh.exe des laufenden Prozesses - kein Pfad-Hardcode
+    ApiKey              = $apiKey                                    # aus $env:POSH_API_KEY - bereits auf Leerstring geprueft
     ScriptTimeoutSec    = 900    # 15 Minuten - Skripte die laenger laufen werden abgebrochen (HTTP 504)
     MaxConcurrent       = 10     # Maximale parallele Requests - darueber wird HTTP 503 zurueckgegeben
     LogRetentionDays    = 180    # Logdateien aelter als N Tage werden beim Start geloescht (0 = deaktiviert)
@@ -196,7 +232,7 @@ function Remove-OldLogs {
 # ---------------------------------------------------------------------------
 $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Write-StartupLog 'FEHLER: Nicht als Administrator gestartet. Port 80 erfordert Adminrechte.'
+    Write-StartupLog 'FEHLER: Nicht als Administrator gestartet. Portbindung erfordert Adminrechte.'
     Write-Output ''
     Write-Output 'FEHLER: Dieses Skript muss als Administrator ausgefuehrt werden.'
     Write-Output 'Loesung: pwsh.exe als Administrator oeffnen und erneut ausfuehren.'
@@ -204,9 +240,32 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 }
 
 # ---------------------------------------------------------------------------
+# HTTPS-Validierung
+# Vor dem Listener-Start pruefen ob eine netsh sslcert-Bindung fuer den
+# konfigurierten HTTPS-Port existiert. Fehlt sie: harter Abbruch mit exit 1.
+# Stiller Fallback auf HTTP waere gefaehrlich - unverschluesselte Kommunikation
+# wuerde unbemerkt stattfinden.
+# ---------------------------------------------------------------------------
+if ($cfg.HttpsEnabled) {
+    $netshOut = netsh http show sslcert "ipport=0.0.0.0:$($cfg.HttpsPort)" 2>&1
+    if ($LASTEXITCODE -ne 0 -or ($netshOut -join '') -notmatch 'IP:Port') {
+        Write-StartupLog "FEHLER: Keine netsh sslcert-Bindung fuer Port $($cfg.HttpsPort) gefunden."
+        Write-StartupLog 'Loesung: Register-ScheduledTask.ps1 erneut ausfuehren und HTTPS konfigurieren.'
+        Write-Output ''
+        Write-Output "FEHLER: HTTPS konfiguriert aber keine Zertifikat-Bindung fuer Port $($cfg.HttpsPort)."
+        Write-Output "Pruefen: netsh http show sslcert ipport=0.0.0.0:$($cfg.HttpsPort)"
+        Write-Output 'Loesung: Register-ScheduledTask.ps1 erneut ausfuehren.'
+        exit 1
+    }
+    Write-StartupLog "HTTPS-Validierung OK: netsh sslcert-Bindung fuer Port $($cfg.HttpsPort) gefunden."
+}
+
+# ---------------------------------------------------------------------------
 # Startup-Info loggen
 # ---------------------------------------------------------------------------
-Write-StartupLog "Webserver startet. BaseDir=$baseDir  WebRoot=$($cfg.WebRoot)  LogDir=$($cfg.LogDir)  PS=$($PSVersionTable.PSVersion)"
+$httpsInfo = if ($cfg.HttpsEnabled) { "  HTTPS=:$($cfg.HttpsPort)" } else { '' }
+$httpInfo  = if ($cfg.HttpPort -gt 0) { "  HTTP=:$($cfg.HttpPort)" } else { '  HTTP=deaktiviert' }
+Write-StartupLog "Webserver startet. BaseDir=$baseDir  WebRoot=$($cfg.WebRoot)  LogDir=$($cfg.LogDir)  PS=$($PSVersionTable.PSVersion)$httpInfo$httpsInfo"
 
 # ---------------------------------------------------------------------------
 # Verzeichnisse sicherstellen
@@ -227,24 +286,44 @@ if ($deletedLogs -gt 0) {
 }
 
 # ---------------------------------------------------------------------------
-# HTTP-Listener starten
+# HTTP-Listener konfigurieren
+# Prefixes werden dynamisch aus HttpPort/HttpsPort aufgebaut.
+# HttpPort = 0: kein HTTP-Prefix - nur HTTPS aktiv.
+# Beide Protokolle koennen gleichzeitig aktiv sein - HttpListener unterstuetzt
+# gemischte http/https Prefixes ohne Einschraenkungen.
 # ---------------------------------------------------------------------------
 $listener = [System.Net.HttpListener]::new()
-$listener.Prefixes.Add($cfg.Prefix)
+
+$activePrefixes = [System.Collections.Generic.List[string]]::new()
+if ($cfg.HttpsEnabled) {
+    $null = $activePrefixes.Add("https://+:$($cfg.HttpsPort)/")
+}
+if ($cfg.HttpPort -gt 0) {
+    $null = $activePrefixes.Add("http://+:$($cfg.HttpPort)/")
+}
+foreach ($prefix in $activePrefixes) {
+    $listener.Prefixes.Add($prefix)
+}
 
 try {
     $listener.Start()
 } catch {
     Write-StartupLog "FEHLER: HttpListener konnte nicht gestartet werden: $_"
-    Write-Output "FEHLER: Port 80 ist moeglicherweise bereits belegt."
-    Write-Output "Pruefen: netstat -ano | findstr :80"
+    $portHint = if ($cfg.HttpPort -gt 0) { $cfg.HttpPort } else { $cfg.HttpsPort }
+    Write-Output "FEHLER: Port $portHint ist moeglicherweise bereits belegt."
+    Write-Output "Pruefen: netstat -ano | findstr :$portHint"
     exit 1
 }
 
-Write-StartupLog "Webserver gestartet. Lauscht auf $($cfg.Prefix)"
+foreach ($prefix in $activePrefixes) {
+    Write-StartupLog "Webserver lauscht auf $prefix"
+}
+
 Write-Output ''
-Write-Output "PowerShell Webserver gestartet"
-Write-Output "Prefix  : $($cfg.Prefix)"
+Write-Output 'PowerShell Webserver gestartet'
+foreach ($prefix in $activePrefixes) {
+    Write-Output "Prefix  : $prefix"
+}
 Write-Output "WebRoot : $($cfg.WebRoot)"
 Write-Output "LogDir  : $($cfg.LogDir)"
 Write-Output ''

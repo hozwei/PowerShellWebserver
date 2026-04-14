@@ -3,22 +3,30 @@
 ## [Unreleased]
 
 ### Added
-- POST request support for webroot script endpoints — scripts can now be called via `POST` with a flat JSON object as the request body. Body parameters are passed to the script identically to query string parameters; body keys take precedence when the same key appears in both. `Content-Type: application/json` is required. Built-in endpoints (`GET /` and `GET /health`) continue to accept GET only.
-- `MaxRequestBodyBytes` configuration key (default: `20MB`) — POST request bodies exceeding this limit are rejected with HTTP 413. Bodies with an unknown size are validated after reading.
-- HTTP 413 response when a POST body exceeds `MaxRequestBodyBytes`.
-- HTTP 415 response when a POST request is made with a `Content-Type` other than `application/json`.
-- Graceful shutdown signal — mechanism to trigger a clean shutdown without relying on Ctrl+C or process termination.
+- HTTPS support via `System.Net.HttpListener` with `https://+:<port>/` prefix. Enabled with `-HttpsEnabled` switch; requires a `netsh http sslcert` binding for the configured port.
+- `Register-ScheduledTask.ps1` HTTPS setup flow: interactive prompts for certificate source (new self-signed, existing thumbprint, or PFX import), `netsh http add sslcert` binding, optional Windows Firewall rules, and optional HTTP disable.
+- Self-signed certificate creation with full SAN support: machine hostname, `localhost`, `127.0.0.1`, and all local IPv4 addresses included automatically via `-TextExtension`.
+- `POSH_CERT_THUMBPRINT` system environment variable set after successful certificate binding — for diagnostics only, not a secret.
+- `-HttpPort`, `-HttpsEnabled`, `-HttpsPort` parameters on `Start-WebServer.ps1` — HTTP/HTTPS ports and HTTPS activation are now runtime parameters instead of hardcoded values.
+- Startup validation: when `-HttpsEnabled` is set, `Start-WebServer.ps1` verifies the `netsh sslcert` binding exists before starting the listener. Exits with `exit 1` and a clear error message if the binding is missing.
+
+### Fixed
+- `netsh http add sslcert` binding in `Register-ScheduledTask.ps1` now correctly deletes any existing binding before adding the new one — previously the delete was silently ignored, causing `add` to fail with error 183 (`ERROR_ALREADY_EXISTS`) on re-installation.
+- HTTPS startup validation in `Start-WebServer.ps1` now checks for `IP:Port` in `netsh` output instead of `Certificate Hash` — the latter is locale-specific and absent on non-English Windows installations.
 
 ---
 
 ## 2026-04
 
 ### Added
+- POST request support for webroot script endpoints — scripts can now be called via `POST` with a flat JSON object as the request body. Body parameters are passed to the script identically to query string parameters; body keys take precedence when the same key appears in both. `Content-Type: application/json` is required. Built-in endpoints (`GET /` and `GET /health`) continue to accept GET only.
+- `MaxRequestBodyBytes` configuration key (default: `20MB`) — POST request bodies exceeding this limit are rejected with HTTP 413. Bodies with an unknown size are validated after reading.
+- HTTP 413 response when a POST body exceeds `MaxRequestBodyBytes`.
+- HTTP 415 response when a POST request is made with a `Content-Type` other than `application/json`.
 - API key authentication via `X-Api-Key` request header — all endpoints except `GET /health` now require a valid key. The key is configured via the `POSH_API_KEY` system environment variable, set automatically by `Register-ScheduledTask.ps1`.
 - `Register-ScheduledTask.ps1` now prompts for the API key and stores it as a `Machine`-scope system environment variable during task registration.
 - Health-check endpoint `GET /health` — returns server status, uptime since last start, and total completed script request count. No authentication required, no webroot script needed.
 - Log rotation on startup: log files older than `LogRetentionDays` days (default: 180) are deleted automatically when the server starts. Set `LogRetentionDays = 0` to disable.
-- HTTP 405 response for non-GET requests — all endpoints now reject POST, DELETE, and other methods with a `405 Method Not Allowed` response and an `Allow: GET` header.
 - Script execution timeout (`ScriptTimeoutSec = 900`): scripts running longer than 15 minutes are terminated and the caller receives HTTP 504 instead of waiting indefinitely.
 - HTTP 503 response when the concurrent request limit is exceeded — returned directly from the main loop without consuming a thread slot.
 - `ThreadJob` module availability check on startup — installs the module automatically if it is missing from the PowerShell 7 environment.
@@ -32,6 +40,7 @@
 - Scheduled Task now runs under a configurable local administrator account instead of `SYSTEM` — required because GPU access and network authentication do not function correctly under `SYSTEM`.
 - Password variable in `Register-ScheduledTask.ps1` is zeroed from memory in a `finally` block — previously zeroed in `try` and `catch` separately, leaving a gap if an unexpected error occurred between decryption and use.
 - `Start-WebServer.ps1` now requires PowerShell 7 (`#Requires -Version 7.0`) — PowerShell 5.1 is no longer supported.
+- HTTP 405 now covers all non-GET/POST methods — previously only non-GET requests were rejected.
 - `Get-ScriptIndex` rewritten as a single `if/else` expression — eliminates an unnecessary initial assignment that was immediately overwritten.
 - Shutdown sequence now stops the `HttpListener` before the 5-second grace period — prevents a race condition where callbacks could access already-disposed objects.
 

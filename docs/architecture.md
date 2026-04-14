@@ -2,14 +2,14 @@
 
 ## Overview
 
-posh is a single-process PowerShell 7 HTTP server built on `System.Net.HttpListener`. Incoming requests are accepted synchronously in a `while` loop via `GetContext()`, then dispatched to a `Start-ThreadJob` for parallel execution. Each request resolves its URL path to a `.ps1` file inside the `webroot\` directory, executes it as a separate `pwsh.exe` process, and returns the result as a JSON envelope. The server runs as a Windows Scheduled Task under a local administrator account and writes daily-rotating log files to `logs\`. All logic is contained in two PowerShell scripts with no external dependencies beyond the .NET base class library.
+posh is a single-process PowerShell 7 HTTP/HTTPS server built on `System.Net.HttpListener`. Incoming requests are accepted synchronously in a `while` loop via `GetContext()`, then dispatched to a `Start-ThreadJob` for parallel execution. Each request resolves its URL path to a `.ps1` file inside the `webroot\` directory, executes it as a separate `pwsh.exe` process, and returns the result as a JSON envelope. The server runs as a Windows Scheduled Task under a local administrator account and writes daily-rotating log files to `logs\`. All logic is contained in two PowerShell scripts with no external dependencies beyond the .NET base class library.
 
 ## Directory Structure
 
 ```
 C:\posh\
 ├── Start-WebServer.ps1          # Entry point: HttpListener, main loop, ThreadJob dispatch
-├── Register-ScheduledTask.ps1   # One-time setup: registers the server as a Windows Scheduled Task
+├── Register-ScheduledTask.ps1   # One-time setup: Scheduled Task, HTTPS certificate, firewall
 ├── logs\                        # Runtime logs, one file per day (YYYY-MM-DD.log)
 └── webroot\                     # HTTP endpoints — each .ps1 file is a route
     ├── script1.ps1              # Example: returns system information
@@ -21,10 +21,10 @@ C:\posh\
 
 ### HttpListener
 
-**Purpose:** Accepts incoming TCP connections on port 80 and produces `HttpListenerContext` objects.
+**Purpose:** Accepts incoming TCP connections on the configured HTTP and/or HTTPS ports and produces `HttpListenerContext` objects.
 
 **Responsibilities:**
-- Binds to `http://+:80/` (all network interfaces)
+- Binds to `http://+:<HttpPort>/` and/or `https://+:<HttpsPort>/` depending on parameters
 - Blocks synchronously on `GetContext()` in the main loop until a request arrives
 - Stopping the listener causes `GetContext()` to throw, which exits the main loop cleanly
 
@@ -110,11 +110,12 @@ C:\posh\
 
 ### Register-ScheduledTask
 
-**Purpose:** One-time installation script that registers `Start-WebServer.ps1` as a Windows Scheduled Task.
+**Purpose:** One-time installation script that registers `Start-WebServer.ps1` as a Windows Scheduled Task and optionally configures HTTPS.
 
 **Responsibilities:**
 - Prompts for a local administrator username and password interactively
 - Prompts for the API key and sets it as a `Machine`-scope system environment variable (`POSH_API_KEY`)
+- Optionally configures HTTPS: creates a self-signed certificate or imports an existing one (by thumbprint or PFX file), binds it to the HTTPS port via `netsh http add sslcert`, and optionally opens Windows Firewall rules
 - Creates or replaces the `PowerShell-Webserver` task with an `AtStartup` trigger
 - Configures the task for indefinite runtime, up to 3 automatic restarts after crash (1-minute interval), and `RunLevel Highest`
 - Zeroes the password variable from memory in a `finally` block after use
@@ -141,7 +142,7 @@ C:\posh\
 
 | Package | Version | Purpose | Reason chosen |
 |---|---|---|---|
-| `System.Net.HttpListener` | .NET BCL | Accepts HTTP connections | Built into .NET; no external web framework needed |
+| `System.Net.HttpListener` | .NET BCL | Accepts HTTP/HTTPS connections | Built into .NET; no external web framework needed |
 | `System.Threading.SemaphoreSlim` | .NET BCL | Limits concurrent request slots | Lightweight; `Wait(0)` enables non-blocking capacity check |
 | `System.Threading.Mutex` | .NET BCL | Serializes log file writes across threads | Named mutex works across ThreadJob boundaries |
 | `System.Diagnostics.Process` | .NET BCL | Executes webroot scripts as child processes | Only reliable way to read `exit 0`/`exit 1` and enforce timeouts from within a ThreadJob |
@@ -158,6 +159,7 @@ Client
   │                                        Body: {"Detail":"true"}
   ▼
 HttpListener (System.Net.HttpListener)
+  │  http://+:80/  and/or  https://+:443/
   │  GetContext() — blocks synchronously
   ▼
 Main Loop
