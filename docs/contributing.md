@@ -126,7 +126,7 @@ Invoke-RestMethod -Uri 'http://localhost/get-disk-usage.ps1?Drive=D' `
 - Write normal output to `Write-Output` — it appears in `response.output`
 - Write errors to `Write-Error` — they appear in `response.error`
 - Signal failure with `exit 1` → HTTP 500; success with `exit 0` or no explicit exit → HTTP 200
-- All query parameters arrive as `string` — cast explicitly when another type is needed
+- All query parameters and POST body parameters arrive as `string` — cast explicitly when another type is needed
 - No access to `$cfg`, server internals, or other scope variables
 
 ## Code Style

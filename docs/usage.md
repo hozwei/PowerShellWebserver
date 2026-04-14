@@ -2,7 +2,7 @@
 
 ## Basic Usage
 
-Send an HTTP GET request to a `.ps1` file under the server's `webroot\`. Include the `X-Api-Key` header with every request. The server executes the script and returns a JSON object with the exit code, standard output, and error output.
+Send an HTTP GET or POST request to a `.ps1` file under the server's `webroot\`. Include the `X-Api-Key` header with every request. The server executes the script and returns a JSON object with the exit code, standard output, and error output.
 
 ```powershell
 Invoke-RestMethod -Uri 'http://localhost/script1.ps1' -Headers @{ 'X-Api-Key' = 'your-api-key' }
@@ -102,9 +102,35 @@ Expected result:
 
 ---
 
+### Calling a script via POST
+
+Pass parameters as a flat JSON object in the request body. The `Content-Type` header must be `application/json`. Body keys and query parameters can be combined — body keys take precedence when names collide.
+
+```powershell
+Invoke-RestMethod -Uri 'http://localhost/script1.ps1' `
+    -Method Post `
+    -ContentType 'application/json' `
+    -Body '{"ComputerName":"WORKSTATION","Detail":"true"}' `
+    -Headers @{ 'X-Api-Key' = 'your-api-key' }
+```
+
+Expected result:
+
+```json
+{
+  "exitCode": 0,
+  "output": "=== Systeminformation ===\nHostname    : WORKSTATION\n...\n=== Details ===\n...\nFertig.",
+  "error": ""
+}
+```
+
+The script receives POST body parameters identically to query string parameters — both arrive as `string` values via the `param()` block.
+
+---
+
 ### Calling the server from a non-PowerShell client
 
-The server accepts any HTTP GET request. Use any HTTP client:
+The server accepts HTTP GET and POST requests. Use any HTTP client:
 
 ```bash
 curl -H "X-Api-Key: your-api-key" "http://localhost/script1.ps1?Detail=true"
@@ -118,6 +144,6 @@ Expected result:
 
 ## Tips & Tricks
 
-- **HTTP status codes carry semantic meaning.** A `200` response guarantees `exitCode` is `0`. A `500` means the script called `exit 1` or encountered a terminating error — inspect the `error` field. A `504` means the script exceeded `ScriptTimeoutSec` and was forcibly terminated. A `401` means the `X-Api-Key` header is missing or incorrect.
+- **HTTP status codes carry semantic meaning.** A `200` response guarantees `exitCode` is `0`. A `500` means the script called `exit 1` or encountered a terminating error — inspect the `error` field. A `504` means the script exceeded `ScriptTimeoutSec` and was forcibly terminated. A `401` means the `X-Api-Key` header is missing or incorrect. A `400` on a POST request means the body is not valid flat JSON. A `413` means the body exceeded `MaxRequestBodyBytes`. A `415` means `Content-Type` was not `application/json`.
 - **Scripts are hot-reloaded automatically.** There is no cache and no restart required. Saving a new or updated `.ps1` file to `webroot\` makes it immediately available at the corresponding URL.
-- **Boolean parameters must be passed as strings.** PowerShell's `param()` block receives all query values as strings. Write `?Detail=true` and cast inside the script with `-eq 'true'` rather than using `[bool]` parameter types.
+- **Boolean parameters must be passed as strings.** PowerShell's `param()` block receives all values — whether from query parameters or a JSON body — as strings. Write `?Detail=true` or `{"Detail":"true"}` and cast inside the script with `-eq 'true'` rather than using `[bool]` parameter types.

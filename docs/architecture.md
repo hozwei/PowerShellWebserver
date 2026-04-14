@@ -55,10 +55,12 @@ C:\posh\
 **Purpose:** Processes a single HTTP request inside a ThreadJob.
 
 **Responsibilities:**
-- Validates HTTP method — rejects non-GET requests with HTTP 405
+- Validates HTTP method — rejects non-GET and non-POST requests with HTTP 405
 - Validates `X-Api-Key` header against `$cfg.ApiKey` — rejects missing or incorrect keys with HTTP 401; `/health` is exempt
 - Serves built-in endpoints `GET /` (script index) and `GET /health` (server status) without invoking webroot scripts
 - Resolves the URL path to a file under `webroot\`: validates `.ps1` extension, checks for path traversal, checks file existence
+- For POST requests, calls `Get-BodyParams` to parse and validate the JSON body — returns HTTP 400, 413, or 415 on error
+- Merges POST body parameters with query parameters (body wins on key collision) before dispatching
 - Dispatches the resolved script to `Invoke-Script`
 - Sends the JSON response via `Send-Response` and logs the outcome via `Write-Log`
 - Releases the semaphore slot in `finally` — always, even on error
@@ -78,7 +80,7 @@ C:\posh\
 
 **Responsibilities:**
 - Starts the target script as a separate `pwsh.exe` process via `System.Diagnostics.Process`
-- Passes URL query parameters as named PowerShell arguments (`-Key "Value"`)
+- Passes script parameters (merged from query string and POST body) as named PowerShell arguments (`-Key "Value"`)
 - Reads stdout and stderr asynchronously via `ReadToEndAsync()` — started before `WaitForExit()` to prevent deadlock when buffers fill
 - Calls `WaitForExit(TimeoutMs)` then a second `WaitForExit()` without timeout to ensure all buffered stream data is flushed before reading
 - Returns a `PSCustomObject` with `ExitCode`, `Output`, `Error`, and `TimedOut` fields
@@ -127,7 +129,7 @@ C:\posh\
 **Purpose:** The actual HTTP endpoints — each `.ps1` file is an independently callable unit of work.
 
 **Responsibilities:**
-- Accept parameters via `param()` block (values arrive from URL query parameters)
+- Accept parameters via `param()` block (values arrive as strings from URL query parameters or POST JSON body)
 - Write results to `Write-Output` (captured as `output` in the JSON response)
 - Write errors to `Write-Error` and call `exit 1` to signal HTTP 500
 - Exit with `exit 0` (or no explicit exit) to signal HTTP 200
@@ -150,8 +152,10 @@ C:\posh\
 ```
 Client
   │
-  │  GET /script1.ps1?Detail=true
-  │  X-Api-Key: <key>
+  │  GET /script1.ps1?Detail=true          POST /script1.ps1
+  │  X-Api-Key: <key>                      X-Api-Key: <key>
+  │                                        Content-Type: application/json
+  │                                        Body: {"Detail":"true"}
   ▼
 HttpListener (System.Net.HttpListener)
   │  GetContext() — blocks synchronously
@@ -163,13 +167,16 @@ Main Loop
   │  Start-ThreadJob { $requestHandler }
   ▼
 $requestHandler (ThreadJob thread)
-  │  Method check: non-GET → HTTP 405, return
+  │  Method check: non-GET/POST → HTTP 405, return
   │  Auth check: X-Api-Key missing/wrong → HTTP 401, return  (skipped for /health)
   │  Path: /  → Get-ScriptIndex → HTTP 200, return
   │  Path: /health → uptime + requestsTotal → HTTP 200, return
   │  Validate: must be .ps1, no path traversal, file must exist
   │    ├─ invalid → HTTP 400 / 403 / 404, return
-  │    └─ valid → Get-QueryParams → Invoke-Script
+  │    └─ valid → Get-QueryParams
+  │              POST: Get-BodyParams → merge (body wins on collision)
+  │                ├─ error → HTTP 400 / 413 / 415, return
+  │                └─ ok → Invoke-Script
   ▼
 Invoke-Script (blocks ThreadJob thread)
   │  System.Diagnostics.Process: pwsh.exe -File <script> -Key "Value"

@@ -12,14 +12,15 @@ There is no external configuration file. All configuration is defined inline in 
 $baseDir = 'C:\posh'
 
 $cfg = @{
-    Prefix           = 'http://+:80/'
-    WebRoot          = Join-Path $baseDir 'webroot'
-    LogDir           = Join-Path $baseDir 'logs'
-    PwshExe          = (Get-Process -Id $PID).MainModule.FileName
-    ApiKey           = $env:POSH_API_KEY
-    ScriptTimeoutSec = 900
-    MaxConcurrent    = 10
-    LogRetentionDays = 180
+    Prefix              = 'http://+:80/'
+    WebRoot             = Join-Path $baseDir 'webroot'
+    LogDir              = Join-Path $baseDir 'logs'
+    PwshExe             = (Get-Process -Id $PID).MainModule.FileName
+    ApiKey              = $env:POSH_API_KEY
+    ScriptTimeoutSec    = 900
+    MaxConcurrent       = 10
+    LogRetentionDays    = 180
+    MaxRequestBodyBytes = 20MB
 }
 ```
 
@@ -29,14 +30,15 @@ $cfg = @{
 $baseDir = 'D:\automation\posh'
 
 $cfg = @{
-    Prefix           = 'http://+:8080/'
-    WebRoot          = Join-Path $baseDir 'webroot'
-    LogDir           = Join-Path $baseDir 'logs'
-    PwshExe          = (Get-Process -Id $PID).MainModule.FileName
-    ApiKey           = $env:POSH_API_KEY
-    ScriptTimeoutSec = 300
-    MaxConcurrent    = 5
-    LogRetentionDays = 30
+    Prefix              = 'http://+:8080/'
+    WebRoot             = Join-Path $baseDir 'webroot'
+    LogDir              = Join-Path $baseDir 'logs'
+    PwshExe             = (Get-Process -Id $PID).MainModule.FileName
+    ApiKey              = $env:POSH_API_KEY
+    ScriptTimeoutSec    = 300
+    MaxConcurrent       = 5
+    LogRetentionDays    = 30
+    MaxRequestBodyBytes = 5MB
 }
 ```
 
@@ -71,6 +73,7 @@ To set manually (requires an Administrator session):
 | `ScriptTimeoutSec` | `integer` | `900` | Yes | Maximum number of seconds a webroot script may run before it is forcibly terminated. The caller receives HTTP 504 when this limit is exceeded. |
 | `MaxConcurrent` | `integer` | `10` | Yes | Maximum number of requests processed simultaneously. Requests that arrive when all slots are occupied immediately receive HTTP 503. |
 | `LogRetentionDays` | `integer` | `180` | Yes | Number of days to retain log files in `LogDir`. Log files older than this value are deleted at startup. Set to `0` to disable log rotation entirely. |
+| `MaxRequestBodyBytes` | `integer` | `20971520` (20 MB) | Yes | Maximum allowed size of a POST request body in bytes. Requests exceeding this limit receive HTTP 413 immediately. Use PowerShell byte literals for readability: `5MB`, `10MB`. |
 
 ### Scheduled Task Options
 

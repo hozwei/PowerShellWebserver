@@ -17,7 +17,7 @@ Place a `.ps1` file in `webroot\` — it is immediately reachable as an HTTP end
 ## Features
 
 - **URL-to-script routing** — every `.ps1` file in `webroot\` is an HTTP endpoint; subdirectories map to URL path segments.
-- **Query-parameter forwarding** — URL query parameters are passed as named PowerShell arguments to the target script.
+- **Query-parameter and POST-body forwarding** — URL query parameters (GET) and JSON body keys (POST) are passed as named PowerShell arguments to the target script. Body keys take precedence when names collide.
 - **JSON response envelope** — all responses follow `{ "exitCode", "output", "error" }`, regardless of which script ran.
 - **API key authentication** — all endpoints except `GET /health` require an `X-Api-Key` header. The key is configured via the `POSH_API_KEY` system environment variable.
 - **Concurrent request handling** — up to `MaxConcurrent` (default: 10) requests are processed in parallel using `Start-ThreadJob`. Requests beyond the limit receive HTTP 503 immediately.
@@ -55,7 +55,7 @@ For the full installation guide, see [Setup](./docs/setup.md).
 
 ## Calling an Endpoint
 
-Every `.ps1` file in `webroot\` is immediately callable via HTTP GET. Include the `X-Api-Key` header and pass script parameters as URL query parameters.
+Every `.ps1` file in `webroot\` is immediately callable via HTTP GET or POST. Include the `X-Api-Key` header and pass script parameters as URL query parameters (GET) or as a flat JSON body (POST).
 
 ```powershell
 Invoke-RestMethod -Uri 'http://localhost/script1.ps1' `
@@ -108,18 +108,20 @@ Invoke-RestMethod -Uri 'http://localhost/get-disk-usage.ps1?Drive=D' `
     -Headers @{ 'X-Api-Key' = 'your-api-key' }
 ```
 
-Rules for webroot scripts: use `Write-Output` for normal output, `Write-Error` for errors, `exit 1` to signal HTTP 500, `exit 0` (or no explicit exit) for HTTP 200. All query parameters arrive as `string` — cast explicitly when needed. See [Contributing](./docs/contributing.md) for the full rules.
+Rules for webroot scripts: use `Write-Output` for normal output, `Write-Error` for errors, `exit 1` to signal HTTP 500, `exit 0` (or no explicit exit) for HTTP 200. All query parameters and POST body parameters arrive as `string` — cast explicitly when needed. See [Contributing](./docs/contributing.md) for the full rules.
 
 ## HTTP Status Codes
 
 | Code | Meaning |
 |---|---|
 | `200` | Script exited with code `0` |
-| `400` | Request path does not end in `.ps1` |
+| `400` | Request path does not end in `.ps1`, or POST body is not valid flat JSON |
 | `401` | `X-Api-Key` header missing or incorrect |
 | `403` | Path-traversal attempt detected |
 | `404` | Script file not found in `webroot\` |
-| `405` | HTTP method not allowed — only GET is accepted |
+| `405` | HTTP method not allowed — only GET and POST are accepted |
+| `413` | POST body exceeds `MaxRequestBodyBytes` |
+| `415` | POST request `Content-Type` is not `application/json` |
 | `500` | Script exited with a non-zero exit code |
 | `503` | Server is at maximum concurrent request capacity |
 | `504` | Script exceeded `ScriptTimeoutSec` and was terminated |
@@ -138,6 +140,7 @@ All configuration is inline in `Start-WebServer.ps1` as the `$cfg` hashtable. Th
 | `ScriptTimeoutSec` | `900` | Seconds before a running script is killed and HTTP 504 is returned |
 | `MaxConcurrent` | `10` | Maximum parallel requests — excess requests receive HTTP 503 |
 | `LogRetentionDays` | `180` | Days to keep log files; `0` disables rotation |
+| `MaxRequestBodyBytes` | `20971520` (20 MB) | Maximum POST body size in bytes — larger bodies receive HTTP 413 |
 
 For the full options reference, see [Configuration](./docs/configuration.md).
 

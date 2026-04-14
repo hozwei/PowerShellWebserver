@@ -89,9 +89,10 @@ $cfg = @{
     LogDir           = Join-Path $baseDir 'logs'
     PwshExe          = (Get-Process -Id $PID).MainModule.FileName   # pwsh.exe des laufenden Prozesses - kein Pfad-Hardcode
     ApiKey           = $apiKey                                       # aus $env:POSH_API_KEY - bereits auf Leerstring geprueft
-    ScriptTimeoutSec = 900   # 15 Minuten - Skripte die laenger laufen werden abgebrochen (HTTP 504)
-    MaxConcurrent    = 10    # Maximale parallele Requests - darueber wird HTTP 503 zurueckgegeben
-    LogRetentionDays = 180   # Logdateien aelter als N Tage werden beim Start geloescht (0 = deaktiviert)
+    ScriptTimeoutSec    = 900    # 15 Minuten - Skripte die laenger laufen werden abgebrochen (HTTP 504)
+    MaxConcurrent       = 10     # Maximale parallele Requests - darueber wird HTTP 503 zurueckgegeben
+    LogRetentionDays    = 180    # Logdateien aelter als N Tage werden beim Start geloescht (0 = deaktiviert)
+    MaxRequestBodyBytes = 20MB   # Maximale POST-Body-Groesse in Bytes - groessere Requests: HTTP 413
 }
 
 # Laufzeitmessung ab Serverstart - fuer Health-Check-Uptime
@@ -300,6 +301,58 @@ function Get-QueryParams {
     return $params
 }
 
+function Get-BodyParams {
+    param([System.Net.HttpListenerRequest] $Request)
+
+    # Content-Type pruefen - muss application/json sein
+    # StartsWith erlaubt Varianten wie "application/json; charset=utf-8"
+    $ct = $Request.ContentType
+    if (-not $ct -or -not $ct.StartsWith('application/json', [System.StringComparison]::OrdinalIgnoreCase)) {
+        return [PSCustomObject]@{ Error = 415; Params = $null }
+    }
+
+    # Body-Groesse pruefen bevor gelesen wird - ContentLength64 ist -1 wenn kein Content-Length-Header gesetzt
+    # Nur ablehnen wenn Groesse bekannt UND zu gross - unbekannte Groesse wird nach dem Lesen geprueft
+    if ($Request.ContentLength64 -gt $script:cfg.MaxRequestBodyBytes) {
+        return [PSCustomObject]@{ Error = 413; Params = $null }
+    }
+
+    # Body lesen - StreamReader wird nicht disposed, InputStream gehoert dem HttpListenerRequest
+    $reader  = [System.IO.StreamReader]::new($Request.InputStream, [System.Text.Encoding]::UTF8)
+    $rawBody = $reader.ReadToEnd()
+
+    # Groesse nochmal pruefen falls Content-Length fehlte
+    if ($rawBody.Length -gt $script:cfg.MaxRequestBodyBytes) {
+        return [PSCustomObject]@{ Error = 413; Params = $null }
+    }
+
+    # Leerer Body ist erlaubt - entspricht einem Aufruf ohne Parameter
+    if ([string]::IsNullOrWhiteSpace($rawBody)) {
+        return [PSCustomObject]@{ Error = 0; Params = @{} }
+    }
+
+    # JSON parsen
+    try {
+        $parsed = $rawBody | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        return [PSCustomObject]@{ Error = 400; Params = $null }
+    }
+
+    # Flache Struktur validieren - keine Arrays, keine verschachtelten Objekte.
+    # ConvertFrom-Json gibt PSCustomObject zurueck - dessen Properties iterieren.
+    $params = @{}
+    foreach ($prop in $parsed.PSObject.Properties) {
+        $val = $prop.Value
+        if ($val -is [System.Management.Automation.PSCustomObject] -or $val -is [System.Object[]]) {
+            return [PSCustomObject]@{ Error = 400; Params = $null }
+        }
+        # Wert als String - identisch zur Query-String-Behandlung in Get-QueryParams
+        $params[$prop.Name] = if ($null -eq $val) { '' } else { [string]$val }
+    }
+
+    return [PSCustomObject]@{ Error = 0; Params = $params }
+}
+
 function Invoke-Script {
     param(
         [string]    $ScriptPath,
@@ -388,17 +441,18 @@ function Get-ScriptIndex {
 # und im Job per ${function:Name} = $shared.FnName eingebunden.
 # ---------------------------------------------------------------------------
 $shared = @{
-    Cfg           = $cfg
-    LogMutex      = $script:logMutex
-    Semaphore     = $semaphore
-    StartTime     = $startTime
-    RequestsTotal = $script:requestsTotal
-    FnWriteLog    = ${function:Write-Log}
-    FnSendResp    = ${function:Send-Response}
-    FnNewJson     = ${function:New-JsonResponse}
-    FnGetParams   = ${function:Get-QueryParams}
-    FnInvScript   = ${function:Invoke-Script}
-    FnGetIndex    = ${function:Get-ScriptIndex}
+    Cfg              = $cfg
+    LogMutex         = $script:logMutex
+    Semaphore        = $semaphore
+    StartTime        = $startTime
+    RequestsTotal    = $script:requestsTotal
+    FnWriteLog       = ${function:Write-Log}
+    FnSendResp       = ${function:Send-Response}
+    FnNewJson        = ${function:New-JsonResponse}
+    FnGetParams      = ${function:Get-QueryParams}
+    FnGetBodyParams  = ${function:Get-BodyParams}
+    FnInvScript      = ${function:Invoke-Script}
+    FnGetIndex       = ${function:Get-ScriptIndex}
 }
 
 # ---------------------------------------------------------------------------
@@ -420,6 +474,7 @@ $requestHandler = {
     ${function:Send-Response}    = $shared.FnSendResp
     ${function:New-JsonResponse} = $shared.FnNewJson
     ${function:Get-QueryParams}  = $shared.FnGetParams
+    ${function:Get-BodyParams}   = $shared.FnGetBodyParams
     ${function:Invoke-Script}    = $shared.FnInvScript
     ${function:Get-ScriptIndex}  = $shared.FnGetIndex
     $script:cfg      = $shared.Cfg
@@ -434,11 +489,11 @@ $requestHandler = {
         $requestLine = '{0} {1}' -f $req.HttpMethod, $req.Url.PathAndQuery
 
         # --------------------------------------------------------------
-        # Nur GET erlaubt - alle anderen Methoden werden abgewiesen
+        # Nur GET und POST erlaubt - alle anderen Methoden werden abgewiesen
         # --------------------------------------------------------------
-        if ($req.HttpMethod -ne 'GET') {
-            $body = New-JsonResponse -ExitCode 405 -Output '' -Err "Methode nicht erlaubt: $($req.HttpMethod). Nur GET wird unterstuetzt."
-            $resp.AddHeader('Allow', 'GET')
+        if ($req.HttpMethod -ne 'GET' -and $req.HttpMethod -ne 'POST') {
+            $body = New-JsonResponse -ExitCode 405 -Output '' -Err "Methode nicht erlaubt: $($req.HttpMethod). Nur GET und POST werden unterstuetzt."
+            $resp.AddHeader('Allow', 'GET, POST')
             Send-Response -Response $resp -StatusCode 405 -Body $body
             Write-Log -ClientIP $clientIP -Request $requestLine -Status 'METHOD NOT ALLOWED' -ExitCode '-'
             return
@@ -527,12 +582,35 @@ $requestHandler = {
         }
 
         # --------------------------------------------------------------
-        # Query-Parameter extrahieren und Skript ausfuehren.
+        # Parameter zusammenstellen und Skript ausfuehren.
+        # GET: Query-String-Parameter werden als benannte Argumente uebergeben.
+        # POST: JSON-Body-Keys werden als benannte Argumente uebergeben.
+        #       Bei Namenskollision gewinnt der Body (Query-Keys werden ueberschrieben).
         # Invoke-Script blockiert bis das Skript fertig ist oder der Timeout
         # (ScriptTimeoutSec) ablaeuft - der Client wartet entsprechend.
         # --------------------------------------------------------------
         $scriptParams = Get-QueryParams -QueryString $req.QueryString
-        $result       = Invoke-Script -ScriptPath $resolvedPath -Params $scriptParams -TimeoutSec $script:cfg.ScriptTimeoutSec
+
+        if ($req.HttpMethod -eq 'POST') {
+            $bodyResult = Get-BodyParams -Request $req
+            if ($bodyResult.Error -ne 0) {
+                $errMsg = switch ($bodyResult.Error) {
+                    413 { 'Request body too large. Maximum size: {0} MB.' -f [math]::Round($script:cfg.MaxRequestBodyBytes / 1MB) }
+                    415 { 'Content-Type must be application/json.' }
+                    400 { 'Invalid JSON body. Only flat key-value objects are supported — no nested objects or arrays.' }
+                }
+                $body = New-JsonResponse -ExitCode $bodyResult.Error -Output '' -Err $errMsg
+                Send-Response -Response $resp -StatusCode $bodyResult.Error -Body $body
+                Write-Log -ClientIP $clientIP -Request $requestLine -Status "HTTP $($bodyResult.Error)" -ExitCode '-'
+                return
+            }
+            # Body-Keys in scriptParams einspielen - ueberschreiben Query-Keys bei Namenskollision
+            foreach ($key in $bodyResult.Params.Keys) {
+                $scriptParams[$key] = $bodyResult.Params[$key]
+            }
+        }
+
+        $result = Invoke-Script -ScriptPath $resolvedPath -Params $scriptParams -TimeoutSec $script:cfg.ScriptTimeoutSec
 
         # Script-Request abgeschlossen - Zaehler atomisch erhoehen (thread-sicher)
         $null = [System.Threading.Interlocked]::Increment($shared.RequestsTotal)

@@ -3,6 +3,10 @@
 ## [Unreleased]
 
 ### Added
+- POST request support for webroot script endpoints — scripts can now be called via `POST` with a flat JSON object as the request body. Body parameters are passed to the script identically to query string parameters; body keys take precedence when the same key appears in both. `Content-Type: application/json` is required. Built-in endpoints (`GET /` and `GET /health`) continue to accept GET only.
+- `MaxRequestBodyBytes` configuration key (default: `20MB`) — POST request bodies exceeding this limit are rejected with HTTP 413. Bodies with an unknown size are validated after reading.
+- HTTP 413 response when a POST body exceeds `MaxRequestBodyBytes`.
+- HTTP 415 response when a POST request is made with a `Content-Type` other than `application/json`.
 - Graceful shutdown signal — mechanism to trigger a clean shutdown without relying on Ctrl+C or process termination.
 
 ---
