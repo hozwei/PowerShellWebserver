@@ -57,12 +57,24 @@ For the full installation guide, see [Setup](./docs/setup.md).
 
 Every `.ps1` file in `webroot\` is immediately callable via HTTP GET or POST. Include the `X-Api-Key` header and pass script parameters as URL query parameters (GET) or as a flat JSON body (POST).
 
+**GET — parameters as query string:**
+
 ```powershell
-Invoke-RestMethod -Uri 'http://localhost/script1.ps1' `
+Invoke-RestMethod -Uri 'http://localhost/script1.ps1?ComputerName=WORKSTATION&Detail=true' `
     -Headers @{ 'X-Api-Key' = 'your-api-key' }
 ```
 
-Response:
+**POST — parameters as JSON body:**
+
+```powershell
+Invoke-RestMethod -Uri 'http://localhost/script1.ps1' `
+    -Method Post `
+    -ContentType 'application/json' `
+    -Body '{"ComputerName":"WORKSTATION","Detail":"true"}' `
+    -Headers @{ 'X-Api-Key' = 'your-api-key' }
+```
+
+Both calls produce the same result:
 
 ```json
 {

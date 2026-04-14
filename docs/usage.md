@@ -106,6 +106,11 @@ Expected result:
 
 Pass parameters as a flat JSON object in the request body. The `Content-Type` header must be `application/json`. Body keys and query parameters can be combined — body keys take precedence when names collide.
 
+Use POST instead of GET when:
+- Parameter values contain special characters (`&`, `=`, `+`, spaces) that would need URL encoding in a query string
+- Parameter values are long (paths, tokens, multi-word strings)
+- Parameters should not appear in server logs or browser history
+
 ```powershell
 Invoke-RestMethod -Uri 'http://localhost/script1.ps1' `
     -Method Post `
@@ -132,8 +137,19 @@ The script receives POST body parameters identically to query string parameters 
 
 The server accepts HTTP GET and POST requests. Use any HTTP client:
 
+**GET:**
+
 ```bash
 curl -H "X-Api-Key: your-api-key" "http://localhost/script1.ps1?Detail=true"
+```
+
+**POST:**
+
+```bash
+curl -X POST http://localhost/script1.ps1 \
+    -H "X-Api-Key: your-api-key" \
+    -H "Content-Type: application/json" \
+    -d '{"ComputerName":"WORKSTATION","Detail":"true"}'
 ```
 
 Expected result:
