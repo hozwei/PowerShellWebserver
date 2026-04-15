@@ -17,7 +17,7 @@ Expected response:
 ```json
 {
   "exitCode": 0,
-  "output": "=== Systeminformation ===\nHostname    : WORKSTATION\nZeitstempel : 2026-04-14 11:30:00\nAufgerufen  : C:\\posh\\webroot\\script1.ps1\n\nFertig.",
+  "output": "=== System Information ===\nHostname    : WORKSTATION\nTimestamp   : 2026-04-14 11:30:00\nCalled from : C:\\posh\\webroot\\script1.ps1\n\nDone.",
   "error": ""
 }
 ```
@@ -78,7 +78,7 @@ Expected result:
 ```json
 {
   "exitCode": 0,
-  "output": "=== Systeminformation ===\nHostname    : WORKSTATION\n...\n=== Details ===\nOS          : Microsoft Windows 11 Pro\nUptime      : 2.14:07:22.1234567\nCPU-Last    : 12%\nRAM         : 14.3 GB / 31.9 GB belegt\n\nFertig.",
+  "output": "=== System Information ===\nHostname    : WORKSTATION\n...\n=== Details ===\nOS          : Microsoft Windows 11 Pro\nUptime      : 2.14:07:22.1234567\nCPU load    : 12%\nRAM         : 14.3 GB / 31.9 GB used\n\nDone.",
   "error": ""
 }
 ```
@@ -99,7 +99,7 @@ Expected result:
 ```json
 {
   "exitCode": 0,
-  "output": "=== Verzeichnisliste ===\nPfad    : C:\\Windows\\Temp\nFilter  : *.log\nAnzahl  : 3 Eintraege\n...\nFertig.",
+  "output": "=== Directory Listing ===\nPath    : C:\\Windows\\Temp\nFilter  : *.log\nCount   : 3 entries\n...\nDone.",
   "error": ""
 }
 ```
@@ -128,7 +128,7 @@ Expected result:
 ```json
 {
   "exitCode": 0,
-  "output": "=== Systeminformation ===\nHostname    : WORKSTATION\n...\n=== Details ===\n...\nFertig.",
+  "output": "=== System Information ===\nHostname    : WORKSTATION\n...\n=== Details ===\n...\nDone.",
   "error": ""
 }
 ```
@@ -159,7 +159,7 @@ curl -X POST http://localhost/script1.ps1 \
 Expected result:
 
 ```json
-{"exitCode":0,"output":"=== Systeminformation ===\n...","error":""}
+{"exitCode":0,"output":"=== System Information ===\n...","error":""}
 ```
 
 ## Tips & Tricks

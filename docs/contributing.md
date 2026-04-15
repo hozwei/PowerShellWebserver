@@ -20,7 +20,7 @@ No build system, test framework, or additional tooling is required.
 
 ## Branching Strategy
 
-This repository has no git history yet. The recommended naming schema when git is initialised:
+The recommended branch naming schema:
 
 | Type | Pattern | Example |
 |---|---|---|
@@ -149,5 +149,5 @@ Key conventions enforced by convention (not by tooling) — see `AGENTS.md` for 
 - All `param()` blocks have explicit type annotations
 - String formatting uses the `-f` operator, not `+` concatenation
 - Suppressed output uses `$null = ...`, not `| Out-Null`
-- All comments are written in German and explain *why*, not *what*
+- All comments are written in English and explain *why*, not *what*
 - Variables referenced inside `$cfg = @{...}` must be defined before the hashtable — PowerShell evaluates values at definition time, not lazily

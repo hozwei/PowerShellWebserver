@@ -53,7 +53,7 @@
 
 HTTPS is configured interactively during `Register-ScheduledTask.ps1`. When prompted:
 
-1. Answer **j** to enable HTTPS
+1. Answer **y** to enable HTTPS
 2. Confirm or change the HTTP port (default: `80`) and HTTPS port (default: `443`)
 3. Choose a certificate source:
    - **Option 1 — New self-signed certificate:** created automatically, stored in `Cert:\LocalMachine\My`, bound to the HTTPS port via `netsh http add sslcert`. Includes the machine hostname, `localhost`, and all local IPv4 addresses as Subject Alternative Names.
@@ -104,7 +104,7 @@ Expected output:
 ```json
 {
   "exitCode": 0,
-  "output": "=== Systeminformation ===\nHostname    : ...\nZeitstempel : ...\nAufgerufen  : C:\\posh\\webroot\\script1.ps1\n\nFertig.",
+  "output": "=== System Information ===\nHostname    : ...\nTimestamp   : ...\nCalled from : C:\\posh\\webroot\\script1.ps1\n\nDone.",
   "error": ""
 }
 ```

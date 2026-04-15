@@ -1,17 +1,17 @@
 #Requires -Version 7.0
 <#
 .SYNOPSIS
-    Beispielskript in einem Unterordner: Listet Dateien in einem Verzeichnis.
+    Example script in a subdirectory: Lists files in a directory.
 
 .DESCRIPTION
-    Demonstriert Skripte in Unterverzeichnissen des webroot.
-    Aufruf: http://localhost/subdir/script2.ps1?Path=C:\Windows\Temp&Filter=*.log
+    Demonstrates scripts in subdirectories of webroot.
+    Call: http://localhost/subdir/script2.ps1?Path=C:\Windows\Temp&Filter=*.log
 
 .PARAMETER Path
-    Verzeichnis das aufgelistet werden soll (Standard: TEMP)
+    Directory to list (default: TEMP)
 
 .PARAMETER Filter
-    Dateifilter (Standard: * = alle Dateien)
+    File filter (default: * = all files)
 #>
 param(
     [string] $Path   = $env:TEMP,
@@ -19,20 +19,20 @@ param(
 )
 
 if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
-    Write-Error "Verzeichnis nicht gefunden: $Path"
+    Write-Error "Directory not found: $Path"
     exit 1
 }
 
 $items = Get-ChildItem -Path $Path -Filter $Filter -ErrorAction SilentlyContinue
 
-Write-Output "=== Verzeichnisliste ==="
-Write-Output "Pfad    : $Path"
+Write-Output "=== Directory Listing ==="
+Write-Output "Path    : $Path"
 Write-Output "Filter  : $Filter"
-Write-Output "Anzahl  : $($items.Count) Eintraege"
+Write-Output "Count   : $($items.Count) entries"
 Write-Output ""
 
 if ($items.Count -eq 0) {
-    Write-Output "(Keine Dateien gefunden)"
+    Write-Output "(No files found)"
 } else {
     foreach ($item in $items | Sort-Object Name) {
         $type = if ($item.PSIsContainer) { '[DIR] ' } else { '[FILE]' }
@@ -42,4 +42,4 @@ if ($items.Count -eq 0) {
 }
 
 Write-Output ""
-Write-Output "Fertig."
+Write-Output "Done."

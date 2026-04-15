@@ -80,7 +80,7 @@ Both calls produce the same result:
 ```json
 {
   "exitCode": 0,
-  "output": "=== Systeminformation ===\nHostname    : WORKSTATION\n...",
+  "output": "=== System Information ===\nHostname    : WORKSTATION\n...",
   "error": ""
 }
 ```

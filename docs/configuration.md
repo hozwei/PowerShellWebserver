@@ -79,9 +79,10 @@ These are passed on the command line when starting the server. `Register-Schedul
 
 ### Start-WebServer.ps1 — $cfg Hashtable
 
+> **`$baseDir`** (line 91 in `Start-WebServer.ps1`, not part of `$cfg`): Hardcoded deployment path (`"C:\posh"`). Change this single line to relocate the entire server. Used as the base path for `WebRoot` and `LogDir`.
+
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `$baseDir` | `string` | `"C:\posh"` | Absolute path to the deployment directory. Used as the base for `WebRoot` and `LogDir`. Must exist before the server starts. |
 | `WebRoot` | `string` | `"C:\posh\webroot"` | Absolute path to the directory that contains the `.ps1` endpoint scripts. URL paths are resolved relative to this directory. |
 | `LogDir` | `string` | `"C:\posh\logs"` | Absolute path to the directory where daily log files are written. Created automatically at startup if it does not exist. |
 | `PwshExe` | `string` | `(Get-Process -Id $PID).MainModule.FileName` | Absolute path to `pwsh.exe` used to execute webroot scripts. Resolved from the currently running process — no hardcoded path. |

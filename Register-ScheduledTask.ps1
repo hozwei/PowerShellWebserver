@@ -1,36 +1,36 @@
 #Requires -Version 7.0
 <#
 .SYNOPSIS
-    Registriert Start-WebServer.ps1 als Windows Scheduled Task.
+    Registers Start-WebServer.ps1 as a Windows Scheduled Task.
 
 .DESCRIPTION
-    Erstellt einen Scheduled Task der:
-    - Beim Systemstart automatisch ausgefuehrt wird
-    - Als konfigurierter Administrator-User laeuft
-    - Den Webserver dauerhaft am Laufen haelt (kein Timeout)
-    - Bei Absturz bis zu 3x nach je 1 Minute automatisch neu startet
+    Creates a Scheduled Task that:
+    - Runs automatically at system startup
+    - Runs as the configured administrator user
+    - Keeps the web server running indefinitely (no timeout)
+    - Automatically restarts up to 3 times after a crash (1-minute interval)
 
-    Optional: HTTPS-Konfiguration mit Self-Signed Zertifikat oder
-    bestehendem Zertifikat (Thumbprint oder PFX-Import), netsh-Bindung
-    und Windows-Firewall-Regeln.
+    Optional: HTTPS configuration with a self-signed certificate or an
+    existing certificate (thumbprint or PFX import), netsh binding,
+    and Windows Firewall rules.
 
-    Erfordert PowerShell 7 (pwsh.exe).
-    Muss als Administrator ausgefuehrt werden.
+    Requires PowerShell 7 (pwsh.exe).
+    Must be run as Administrator.
 
 .EXAMPLE
     .\Register-ScheduledTask.ps1
 
-    # Sofort starten ohne Neustart:
+    # Start immediately without rebooting:
     Start-ScheduledTask -TaskName 'PowerShell-Webserver'
 
-    # Task entfernen:
+    # Remove the task:
     Unregister-ScheduledTask -TaskName 'PowerShell-Webserver' -Confirm:$false
 #>
 
 $ErrorActionPreference = 'Stop'
 
 # ---------------------------------------------------------------------------
-# Basispfad - robust gegen leeres $PSScriptRoot
+# Base path — robust against empty $PSScriptRoot
 # ---------------------------------------------------------------------------
 if ($PSScriptRoot -and $PSScriptRoot -ne '') {
     $baseDir = $PSScriptRoot
@@ -39,71 +39,71 @@ if ($PSScriptRoot -and $PSScriptRoot -ne '') {
 }
 
 # ---------------------------------------------------------------------------
-# Konfiguration
+# Configuration
 # ---------------------------------------------------------------------------
 $TASK_NAME   = 'PowerShell-Webserver'
 $SCRIPT_PATH = Join-Path $baseDir 'Start-WebServer.ps1'
 $WORK_DIR    = $baseDir
 
-# Feste AppID-GUID fuer netsh sslcert - identisch bei Re-Installation,
-# damit alte Bindungen sauber ersetzt werden koennen
+# Fixed AppID GUID for netsh sslcert — identical across re-installations
+# so old bindings can be cleanly replaced.
 $POSH_APP_GUID = 'a3b2c1d0-4e5f-6a7b-8c9d-0e1f2a3b4c5d'
 
 # ---------------------------------------------------------------------------
-# Admin-Pruefung
+# Admin check
 # ---------------------------------------------------------------------------
 $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Output ''
-    Write-Output 'FEHLER: Dieses Skript muss als Administrator ausgefuehrt werden.'
+    Write-Output 'ERROR: This script must be run as Administrator.'
     Write-Output ''
     exit 1
 }
 
 # ---------------------------------------------------------------------------
-# Start-WebServer.ps1 muss vorhanden sein
+# Start-WebServer.ps1 must be present
 # ---------------------------------------------------------------------------
 if (-not (Test-Path -LiteralPath $SCRIPT_PATH -PathType Leaf)) {
     Write-Output ''
-    Write-Output "FEHLER: Start-WebServer.ps1 nicht gefunden unter: $SCRIPT_PATH"
-    Write-Output 'Beide Skripte muessen im selben Verzeichnis liegen.'
+    Write-Output "ERROR: Start-WebServer.ps1 not found at: $SCRIPT_PATH"
+    Write-Output 'Both scripts must be in the same directory.'
     Write-Output ''
     exit 1
 }
 
 # ---------------------------------------------------------------------------
-# Hilfsfunktion: Eingabe mit Default-Wert
-# Zeigt "[Default]" an und gibt Default zurueck wenn Eingabe leer ist.
+# Helper: prompt with default value
+# Displays "[Default]" and returns the default when input is empty.
 # ---------------------------------------------------------------------------
 function Read-HostWithDefault {
     param(
         [string] $Prompt,
         [string] $Default
     )
-    $input = Read-Host "$Prompt [$Default]"
-    if ([string]::IsNullOrWhiteSpace($input)) { return $Default }
-    return $input.Trim()
+    $raw = Read-Host "$Prompt [$Default]"
+    if ([string]::IsNullOrWhiteSpace($raw)) { return $Default }
+    return $raw.Trim()
 }
 
 # ---------------------------------------------------------------------------
-# Hilfsfunktion: Ja/Nein-Abfrage
-# Gibt $true zurueck bei J/j/Y/y, $false bei N/n und allem anderen.
+# Helper: yes/no prompt
+# Returns $true for J/j/Y/y, $false for N/n and anything else.
 # ---------------------------------------------------------------------------
 function Read-YesNo {
     param(
         [string] $Prompt,
         [bool]   $Default = $false
     )
-    $defaultHint = if ($Default) { 'J/n' } else { 'j/N' }
-    $input = (Read-Host "$Prompt ($defaultHint)").Trim()
-    if ([string]::IsNullOrWhiteSpace($input)) { return $Default }
-    return $input -match '^[JjYy]'
+    $defaultHint = if ($Default) { 'Y/n' } else { 'y/N' }
+    $raw = (Read-Host "$Prompt ($defaultHint)").Trim()
+    if ([string]::IsNullOrWhiteSpace($raw)) { return $Default }
+    return $raw -match '^[JjYy]'
 }
 
 # ---------------------------------------------------------------------------
-# Hilfsfunktion: Thumbprint bereinigen
-# Entfernt unsichtbare Unicode-Zeichen (U+200E u.a.) und Leerzeichen.
-# netsh schlaegt bei verunreinigten Thumbprints mit kryptischem Fehler fehl.
+# Helper: clean thumbprint
+# Removes invisible Unicode characters (U+200E etc.) and whitespace.
+# netsh fails with a cryptic error on dirty thumbprints.
 # ---------------------------------------------------------------------------
 function Get-CleanThumbprint {
     param([string] $Thumbprint)
@@ -115,108 +115,108 @@ function Get-CleanThumbprint {
 # ---------------------------------------------------------------------------
 Write-Output ''
 Write-Output 'PowerShell Webserver - Scheduled Task Registration'
-Write-Output "Task-Name   : $TASK_NAME"
-Write-Output "Skript      : $SCRIPT_PATH"
-Write-Output "Arbeitsverz.: $WORK_DIR"
+Write-Output "Task name   : $TASK_NAME"
+Write-Output "Script      : $SCRIPT_PATH"
+Write-Output "Working dir : $WORK_DIR"
 Write-Output ''
 
 # ---------------------------------------------------------------------------
-# Benutzername und Passwort interaktiv abfragen
+# Prompt for username and password
 # ---------------------------------------------------------------------------
-Write-Output 'Der Task wird unter einem lokalen Administrator-Account ausgefuehrt.'
-Write-Output 'Benutzername leer lassen = "Administrator" verwenden.'
+Write-Output 'The task runs under a local administrator account.'
+Write-Output 'Leave username empty to use "Administrator".'
 Write-Output ''
 
-$inputUser = Read-Host 'Benutzername (Standard: Administrator)'
+$inputUser = Read-Host 'Username (default: Administrator)'
 if ([string]::IsNullOrWhiteSpace($inputUser)) {
     $taskUser = 'Administrator'
 } else {
     $taskUser = $inputUser.Trim()
 }
 
-$securePwd = Read-Host "Passwort fuer '$taskUser'" -AsSecureString
+$securePwd = Read-Host "Password for '$taskUser'" -AsSecureString
 $bstr      = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePwd)
 $taskPassword = $null
 try {
     $taskPassword = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
 } finally {
-    # BSTR immer nullen - unabhaengig davon ob die Konvertierung erfolgreich war
+    # Always zero the BSTR — regardless of whether conversion succeeded.
     [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
 }
 
 if ([string]::IsNullOrEmpty($taskPassword)) {
     Write-Output ''
-    Write-Output 'FEHLER: Passwort darf nicht leer sein.'
+    Write-Output 'ERROR: Password must not be empty.'
     Write-Output ''
     exit 1
 }
 
 # ---------------------------------------------------------------------------
-# API-Key abfragen und als System-Umgebungsvariable setzen
+# Prompt for API key and set it as a system environment variable
 # ---------------------------------------------------------------------------
 Write-Output ''
-Write-Output 'API-Key fuer POSH_API_KEY (Eingabe wird angezeigt - Fenster beobachten):'
-$apiKey = Read-Host 'API-Key'
+Write-Output 'API key for POSH_API_KEY (input is visible — watch your screen):'
+$apiKey = Read-Host 'API key'
 
 if ([string]::IsNullOrEmpty($apiKey)) {
     Write-Output ''
-    Write-Output 'FEHLER: API-Key darf nicht leer sein.'
+    Write-Output 'ERROR: API key must not be empty.'
     Write-Output ''
     exit 1
 }
 
 [Environment]::SetEnvironmentVariable('POSH_API_KEY', $apiKey, 'Machine')
-$apiKey = $null   # sofort aus Speicher loeschen
-Write-Output "POSH_API_KEY als System-Umgebungsvariable gesetzt."
+$apiKey = $null   # clear from memory immediately
+Write-Output 'POSH_API_KEY set as system environment variable.'
 
 # ---------------------------------------------------------------------------
-# HTTPS-Konfiguration
+# HTTPS configuration
 # ---------------------------------------------------------------------------
 Write-Output ''
 Write-Output '─────────────────────────────────────────────────────────────────────────'
-Write-Output ' HTTPS-Konfiguration'
+Write-Output ' HTTPS Configuration'
 Write-Output '─────────────────────────────────────────────────────────────────────────'
 Write-Output ''
 
-$httpsEnabled = Read-YesNo -Prompt 'HTTPS aktivieren?' -Default $false
+$httpsEnabled = Read-YesNo -Prompt 'Enable HTTPS?' -Default $false
 
-# Ports abfragen - immer (HTTP-Port benoetigt auch ohne HTTPS)
+# Prompt for ports — always needed (HTTP port is required even without HTTPS).
 Write-Output ''
-$httpPortStr  = Read-HostWithDefault -Prompt 'HTTP-Port'  -Default '80'
+$httpPortStr  = Read-HostWithDefault -Prompt 'HTTP port'  -Default '80'
 $httpPort     = [int]$httpPortStr
 
-# HTTPS-spezifische Konfiguration
+# HTTPS-specific configuration
 $httpsPort      = 443
 $httpDisabled   = $false
 $certThumbprint = $null
 
 if ($httpsEnabled) {
-    $httpsPortStr = Read-HostWithDefault -Prompt 'HTTPS-Port' -Default '443'
+    $httpsPortStr = Read-HostWithDefault -Prompt 'HTTPS port' -Default '443'
     $httpsPort    = [int]$httpsPortStr
 
     # ------------------------------------------------------------------
-    # Zertifikat-Quelle auswaehlen
+    # Select certificate source
     # ------------------------------------------------------------------
     Write-Output ''
-    Write-Output 'Zertifikat-Quelle:'
-    Write-Output '  1) Neues Self-Signed Zertifikat erstellen'
-    Write-Output '  2) Bestehendes Zertifikat verwenden'
+    Write-Output 'Certificate source:'
+    Write-Output '  1) Create a new self-signed certificate'
+    Write-Output '  2) Use an existing certificate'
     Write-Output ''
-    $certSource = Read-HostWithDefault -Prompt 'Auswahl' -Default '1'
+    $certSource = Read-HostWithDefault -Prompt 'Selection' -Default '1'
 
     if ($certSource -eq '1') {
         # --------------------------------------------------------------
-        # Option 1: Self-Signed Zertifikat erstellen
+        # Option 1: create a self-signed certificate
         # --------------------------------------------------------------
         Write-Output ''
-        $certYearsStr = Read-HostWithDefault -Prompt 'Zertifikat-Laufzeit in Jahren' -Default '10'
+        $certYearsStr = Read-HostWithDefault -Prompt 'Certificate validity in years' -Default '10'
         $certYears    = [int]$certYearsStr
         if ($certYears -lt 1) { $certYears = 1 }
 
         Write-Output ''
-        Write-Output 'Erstelle Self-Signed Zertifikat...'
+        Write-Output 'Creating self-signed certificate...'
 
-        # Lokale IPv4-Adressen ermitteln (kein Loopback, kein Link-Local)
+        # Determine local IPv4 addresses (no loopback, no link-local).
         $localIPs = @(Get-NetIPAddress `
             -AddressFamily IPv4 `
             -AddressState  Preferred `
@@ -227,8 +227,8 @@ if ($httpsEnabled) {
             } |
             Select-Object -ExpandProperty IPAddress)
 
-        # SAN-String aufbauen: DNS-Eintraege zuerst, dann IPs
-        # 127.0.0.1 immer einschliessen - auch wenn nicht in localIPs
+        # Build SAN string: DNS entries first, then IPs.
+        # Always include 127.0.0.1 — even if not in localIPs.
         $sanParts = [System.Collections.Generic.List[string]]::new()
         $null = $sanParts.Add("DNS=$env:COMPUTERNAME")
         $null = $sanParts.Add('DNS=localhost')
@@ -241,9 +241,9 @@ if ($httpsEnabled) {
         $certNotAfter = (Get-Date).AddYears($certYears)
 
         try {
-            # -DnsName darf nicht kombiniert mit -TextExtension (SAN-OID 2.5.29.17) verwendet werden -
-            # Windows lehnt beide SAN-Quellen gleichzeitig ab ("DnsName-Parameter steht in Konflikt").
-            # Alle SANs (DNS + IP) werden ausschliesslich ueber -TextExtension gesetzt.
+            # -DnsName must not be combined with -TextExtension (SAN OID 2.5.29.17) —
+            # Windows rejects both SAN sources simultaneously ("DnsName parameter conflicts").
+            # All SANs (DNS + IP) are set exclusively via -TextExtension.
             $cert = New-SelfSignedCertificate `
                 -Subject           "CN=$env:COMPUTERNAME" `
                 -TextExtension     @($textExt) `
@@ -255,7 +255,7 @@ if ($httpsEnabled) {
                 -ErrorAction       Stop
         } catch {
             Write-Output ''
-            Write-Output "FEHLER: Zertifikat konnte nicht erstellt werden: $_"
+            Write-Output "ERROR: Certificate could not be created: $_"
             Write-Output ''
             exit 1
         }
@@ -264,73 +264,73 @@ if ($httpsEnabled) {
 
         Write-Output "  Subject    : $($cert.Subject)"
         Write-Output "  SAN        : $env:COMPUTERNAME, localhost, $($localIPs -join ', ')"
-        Write-Output "  Gueltig    : $certYears Jahr(e) (bis $($certNotAfter.ToString('yyyy-MM-dd')))"
+        Write-Output "  Valid      : $certYears year(s) (until $($certNotAfter.ToString('yyyy-MM-dd')))"
         Write-Output "  Store      : LocalMachine\My"
         Write-Output "  Thumbprint : $certThumbprint"
 
     } else {
         # --------------------------------------------------------------
-        # Option 2: Bestehendes Zertifikat verwenden
+        # Option 2: use an existing certificate
         # --------------------------------------------------------------
         Write-Output ''
-        Write-Output 'Zertifikat angeben:'
-        Write-Output '  A) Thumbprint (Zertifikat bereits in LocalMachine\My installiert)'
-        Write-Output '  B) PFX-Datei importieren'
+        Write-Output 'Specify certificate:'
+        Write-Output '  A) Thumbprint (certificate already installed in LocalMachine\My)'
+        Write-Output '  B) Import PFX file'
         Write-Output ''
-        $certInputMethod = (Read-HostWithDefault -Prompt 'Auswahl' -Default 'A').ToUpper()
+        $certInputMethod = (Read-HostWithDefault -Prompt 'Selection' -Default 'A').ToUpper()
 
         if ($certInputMethod -eq 'A') {
             # ----------------------------------------------------------
-            # Option 2A: Thumbprint direkt eingeben
+            # Option 2A: enter thumbprint directly
             # ----------------------------------------------------------
             Write-Output ''
             $rawThumb = Read-Host 'Thumbprint'
             if ([string]::IsNullOrWhiteSpace($rawThumb)) {
                 Write-Output ''
-                Write-Output 'FEHLER: Thumbprint darf nicht leer sein.'
+                Write-Output 'ERROR: Thumbprint must not be empty.'
                 Write-Output ''
                 exit 1
             }
 
             $certThumbprint = Get-CleanThumbprint -Thumbprint $rawThumb
 
-            # Zertifikat im Store suchen
+            # Look up certificate in store.
             Write-Output ''
-            Write-Output 'Suche Zertifikat in LocalMachine\My...'
+            Write-Output 'Searching for certificate in LocalMachine\My...'
             $cert = Get-ChildItem 'Cert:\LocalMachine\My' |
                 Where-Object { (Get-CleanThumbprint -Thumbprint $_.Thumbprint) -eq $certThumbprint } |
                 Select-Object -First 1
 
             if ($null -eq $cert) {
                 Write-Output ''
-                Write-Output "FEHLER: Zertifikat mit Thumbprint '$certThumbprint' nicht in Cert:\LocalMachine\My gefunden."
-                Write-Output 'Loesung: Zertifikat zuerst in den Store importieren oder Option B (PFX) waehlen.'
+                Write-Output "ERROR: Certificate with thumbprint '$certThumbprint' not found in Cert:\LocalMachine\My."
+                Write-Output 'Solution: import the certificate into the store first, or choose option B (PFX).'
                 Write-Output ''
                 exit 1
             }
 
-            # Ablaufdatum pruefen
+            # Check expiry date.
             if ($cert.NotAfter -lt (Get-Date)) {
                 Write-Output ''
-                Write-Output "FEHLER: Zertifikat ist abgelaufen (NotAfter: $($cert.NotAfter.ToString('yyyy-MM-dd')))."
-                Write-Output 'Loesung: Ein gueltiges Zertifikat verwenden.'
+                Write-Output "ERROR: Certificate has expired (NotAfter: $($cert.NotAfter.ToString('yyyy-MM-dd')))."
+                Write-Output 'Solution: use a valid certificate.'
                 Write-Output ''
                 exit 1
             }
 
-            Write-Output "  Gefunden   : $($cert.Subject)"
-            Write-Output "  Gueltig bis: $($cert.NotAfter.ToString('yyyy-MM-dd'))"
+            Write-Output "  Found      : $($cert.Subject)"
+            Write-Output "  Valid until: $($cert.NotAfter.ToString('yyyy-MM-dd'))"
             Write-Output "  Thumbprint : $certThumbprint"
 
         } else {
             # ----------------------------------------------------------
-            # Option 2B: PFX-Datei importieren
+            # Option 2B: import PFX file
             # ----------------------------------------------------------
             Write-Output ''
-            $pfxPath = Read-Host 'Pfad zur PFX-Datei'
+            $pfxPath = Read-Host 'Path to PFX file'
             if ([string]::IsNullOrWhiteSpace($pfxPath)) {
                 Write-Output ''
-                Write-Output 'FEHLER: Pfad darf nicht leer sein.'
+                Write-Output 'ERROR: Path must not be empty.'
                 Write-Output ''
                 exit 1
             }
@@ -338,15 +338,15 @@ if ($httpsEnabled) {
 
             if (-not (Test-Path -LiteralPath $pfxPath -PathType Leaf)) {
                 Write-Output ''
-                Write-Output "FEHLER: Datei nicht gefunden: $pfxPath"
+                Write-Output "ERROR: File not found: $pfxPath"
                 Write-Output ''
                 exit 1
             }
 
-            $pfxPassword = Read-Host 'PFX-Passwort (leer lassen wenn kein Passwort)' -AsSecureString
+            $pfxPassword = Read-Host 'PFX password (leave empty if none)' -AsSecureString
 
             Write-Output ''
-            Write-Output 'Importiere Zertifikat...'
+            Write-Output 'Importing certificate...'
 
             try {
                 $imported = Import-PfxCertificate `
@@ -357,78 +357,78 @@ if ($httpsEnabled) {
                     -ErrorAction       Stop
             } catch {
                 Write-Output ''
-                Write-Output "FEHLER: PFX konnte nicht importiert werden: $_"
-                Write-Output 'Moegliche Ursachen: falsches Passwort, beschaedigte Datei, kein privater Schluessel.'
+                Write-Output "ERROR: PFX could not be imported: $_"
+                Write-Output 'Possible causes: wrong password, corrupted file, no private key.'
                 Write-Output ''
                 exit 1
             } finally {
-                # SecureString aus dem Speicher loeschen
+                # Clear SecureString from memory.
                 if ($null -ne $pfxPassword) {
                     $pfxPassword.Dispose()
                     $pfxPassword = $null
                 }
             }
 
-            # Bei PFX-Ketten gibt Import-PfxCertificate ein Array zurueck.
-            # Das Endentitaets-Zertifikat (mit privatem Schluessel) verwenden.
+            # Import-PfxCertificate returns an array for certificate chains.
+            # Use the end-entity certificate (the one with a private key).
             $cert = @($imported) | Where-Object { $_.HasPrivateKey } | Select-Object -First 1
 
             if ($null -eq $cert) {
                 Write-Output ''
-                Write-Output 'FEHLER: Kein Zertifikat mit privatem Schluessel in der PFX-Datei gefunden.'
+                Write-Output 'ERROR: No certificate with a private key found in the PFX file.'
                 Write-Output ''
                 exit 1
             }
 
-            # Ablaufdatum pruefen
+            # Check expiry date.
             if ($cert.NotAfter -lt (Get-Date)) {
                 Write-Output ''
-                Write-Output "FEHLER: Importiertes Zertifikat ist abgelaufen (NotAfter: $($cert.NotAfter.ToString('yyyy-MM-dd')))."
+                Write-Output "ERROR: Imported certificate has expired (NotAfter: $($cert.NotAfter.ToString('yyyy-MM-dd')))."
                 Write-Output ''
                 exit 1
             }
 
             $certThumbprint = Get-CleanThumbprint -Thumbprint $cert.Thumbprint
 
-            Write-Output "  Importiert : $($cert.Subject)"
-            Write-Output "  Gueltig bis: $($cert.NotAfter.ToString('yyyy-MM-dd'))"
+            Write-Output "  Imported   : $($cert.Subject)"
+            Write-Output "  Valid until: $($cert.NotAfter.ToString('yyyy-MM-dd'))"
             Write-Output "  Thumbprint : $certThumbprint"
         }
     }
 
     # ------------------------------------------------------------------
-    # netsh sslcert-Bindung setzen
-    # Erst vorhandene Bindung loeschen (sauberes Re-Install),
-    # dann neue Bindung hinzufuegen.
+    # Set netsh sslcert binding
+    # Delete any existing binding first (clean re-install),
+    # then add the new binding.
     # ------------------------------------------------------------------
     Write-Output ''
-    Write-Output "Binde Zertifikat an Port $httpsPort (netsh sslcert)..."
+    Write-Output "Binding certificate to port $httpsPort (netsh sslcert)..."
 
-    # Vorhandene Bindung entfernen - Exit-Code immer ignorieren (1 = nicht vorhanden = ok)
+    # Remove existing binding — always ignore exit code (1 = not found = ok).
     $null = netsh http delete sslcert "ipport=0.0.0.0:$httpsPort" 2>&1
 
-    # Neue Bindung setzen
+    # Add new binding.
     $addOut = netsh http add sslcert "ipport=0.0.0.0:$httpsPort" "certhash=$certThumbprint" "appid={$POSH_APP_GUID}" 2>&1
     if ($LASTEXITCODE -ne 0) {
         Write-Output ''
-        Write-Output "FEHLER: netsh sslcert add fehlgeschlagen (Exit: $LASTEXITCODE): $addOut"
-        Write-Output "Pruefen: netsh http show sslcert ipport=0.0.0.0:$httpsPort"
+        Write-Output "ERROR: netsh sslcert add failed (exit: $LASTEXITCODE): $addOut"
+        Write-Output "Check: netsh http show sslcert ipport=0.0.0.0:$httpsPort"
         Write-Output ''
         exit 1
     }
 
-    Write-Output "  OK - Zertifikat gebunden an 0.0.0.0:$httpsPort"
+    Write-Output "  OK - certificate bound to 0.0.0.0:$httpsPort"
 
-    # Thumbprint als Machine-Env fuer Diagnostics (kein Secret - nur Fingerabdruck)
+    # Store thumbprint as machine env var for diagnostics (not a secret — fingerprint only).
     [Environment]::SetEnvironmentVariable('POSH_CERT_THUMBPRINT', $certThumbprint, 'Machine')
 
     # ------------------------------------------------------------------
-    # HTTP deaktivieren?
+    # Disable HTTP?
     # ------------------------------------------------------------------
     Write-Output ''
-    $httpDisabled = Read-YesNo -Prompt "HTTP (Port $httpPort) deaktivieren?" -Default $false
+    $httpDisabled = Read-YesNo -Prompt "Disable HTTP (port $httpPort)?" -Default $false
     if ($httpDisabled) {
-        Write-Output "  HTTP wird deaktiviert - nur HTTPS (Port $httpsPort) aktiv."
+        Write-Output "  HTTP will be disabled — HTTPS only (port $httpsPort)."
     }
 }
 
@@ -441,7 +441,7 @@ Write-Output ' Windows Firewall'
 Write-Output '─────────────────────────────────────────────────────────────────────────'
 Write-Output ''
 
-# Aktive Ports zusammenstellen
+# Collect active ports.
 $activePorts = [System.Collections.Generic.List[int]]::new()
 if (-not $httpsEnabled -or -not $httpDisabled) {
     $null = $activePorts.Add($httpPort)
@@ -450,7 +450,7 @@ if ($httpsEnabled) {
     $null = $activePorts.Add($httpsPort)
 }
 
-$openFirewall = Read-YesNo -Prompt "Ports ($($activePorts -join ', ')) in Windows Firewall oeffnen?" -Default $false
+$openFirewall = Read-YesNo -Prompt "Open ports ($($activePorts -join ', ')) in Windows Firewall?" -Default $false
 
 if ($openFirewall) {
     Write-Output ''
@@ -458,30 +458,30 @@ if ($openFirewall) {
         $ruleName = "posh-webserver-$port"
         $existing = Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue
         if ($null -ne $existing) {
-            Write-Output "  Port $port  - Regel '$ruleName' existiert bereits, wird uebersprungen."
+            Write-Output "  Port $port  - rule '$ruleName' already exists, skipping."
         } else {
             try {
                 $null = New-NetFirewallRule `
                     -Name        $ruleName `
                     -DisplayName "posh-webserver Port $port" `
-                    -Description 'PowerShell Webserver - eingehender HTTP/HTTPS-Verkehr' `
+                    -Description 'PowerShell web server — inbound HTTP/HTTPS traffic' `
                     -Direction   Inbound `
                     -Protocol    TCP `
                     -LocalPort   $port `
                     -Action      Allow `
                     -Profile     Any `
                     -ErrorAction Stop
-                Write-Output "  Port $port  - Regel '$ruleName' angelegt."
+                Write-Output "  Port $port  - rule '$ruleName' created."
             } catch {
-                Write-Output "  Port $port  - WARNUNG: Firewall-Regel konnte nicht angelegt werden: $_"
-                # Kein exit 1 - Firewall-Fehler soll Setup nicht abbrechen
+                Write-Output "  Port $port  - WARNING: firewall rule could not be created: $_"
+                # No exit 1 — firewall failure should not abort the setup.
             }
         }
     }
 }
 
 # ---------------------------------------------------------------------------
-# Vorhandenen Task entfernen (sauberes Update)
+# Remove existing task (clean update)
 # ---------------------------------------------------------------------------
 Write-Output ''
 Write-Output '─────────────────────────────────────────────────────────────────────────'
@@ -491,12 +491,12 @@ Write-Output ''
 
 $existingTask = Get-ScheduledTask -TaskName $TASK_NAME -ErrorAction SilentlyContinue
 if ($existingTask) {
-    Write-Output "Vorhandener Task '$TASK_NAME' wird entfernt..."
+    Write-Output "Removing existing task '$TASK_NAME'..."
     Unregister-ScheduledTask -TaskName $TASK_NAME -Confirm:$false
 }
 
 # ---------------------------------------------------------------------------
-# pwsh.exe-Pfad aufloesen
+# Resolve pwsh.exe path
 # ---------------------------------------------------------------------------
 $pwshExe = (Get-Command pwsh -ErrorAction SilentlyContinue)?.Source
 if (-not $pwshExe -or -not (Test-Path -LiteralPath $pwshExe -PathType Leaf)) {
@@ -504,16 +504,16 @@ if (-not $pwshExe -or -not (Test-Path -LiteralPath $pwshExe -PathType Leaf)) {
 }
 if (-not (Test-Path -LiteralPath $pwshExe -PathType Leaf)) {
     Write-Output ''
-    Write-Output 'FEHLER: pwsh.exe nicht gefunden. Ist PowerShell 7 installiert?'
+    Write-Output 'ERROR: pwsh.exe not found. Is PowerShell 7 installed?'
     Write-Output ''
     exit 1
 }
 
 # ---------------------------------------------------------------------------
-# Task-Action-Argument aufbauen
-# Start-WebServer.ps1 erhaelt alle relevanten Parameter direkt.
-# -HttpsEnabled als Switch: einfach angeben, kein ':$true' noetig.
-# -HttpPort 0 signalisiert: HTTP deaktiviert.
+# Build task action arguments
+# Start-WebServer.ps1 receives all relevant parameters directly.
+# -HttpsEnabled as a switch: just specify it, no ':$true' needed.
+# -HttpPort 0 signals: HTTP disabled.
 # ---------------------------------------------------------------------------
 $scriptArgs = '-NonInteractive -NoProfile -ExecutionPolicy Bypass'
 $scriptArgs += " -File `"$SCRIPT_PATH`""
@@ -523,13 +523,13 @@ if ($httpsEnabled) {
     $scriptArgs += ' -HttpsEnabled'
     $scriptArgs += " -HttpsPort $httpsPort"
     if ($httpDisabled) {
-        # HttpPort 0 = HTTP deaktiviert - Guard in Start-WebServer.ps1: if ($HttpPort -gt 0)
+        # HttpPort 0 = HTTP disabled — guard in Start-WebServer.ps1: if ($HttpPort -gt 0)
         $scriptArgs = $scriptArgs -replace "-HttpPort $httpPort", '-HttpPort 0'
     }
 }
 
 # ---------------------------------------------------------------------------
-# Task-Komponenten
+# Task components
 # ---------------------------------------------------------------------------
 $action = New-ScheduledTaskAction `
     -Execute          $pwshExe `
@@ -547,12 +547,12 @@ $settings.RestartCount    = 3
 $settings.RestartInterval = 'PT1M'
 
 # ---------------------------------------------------------------------------
-# Task registrieren
+# Register task
 # ---------------------------------------------------------------------------
 try {
     $task = Register-ScheduledTask `
         -TaskName    $TASK_NAME `
-        -Description 'PowerShell HTTP/HTTPS-Webserver - fuehrt .ps1-Skripte per HTTP-Request aus' `
+        -Description 'PowerShell HTTP/HTTPS web server — executes .ps1 scripts via HTTP requests' `
         -Action      $action `
         -Trigger     $trigger `
         -Settings    $settings `
@@ -561,39 +561,39 @@ try {
         -RunLevel    Highest `
         -Force
 
-    Write-Output "Task '$TASK_NAME' erfolgreich registriert."
+    Write-Output "Task '$TASK_NAME' registered successfully."
     Write-Output ''
     Write-Output "Status      : $($task.State)"
-    Write-Output "Benutzer    : $taskUser"
+    Write-Output "User        : $taskUser"
     Write-Output "Shell       : $pwshExe"
-    Write-Output "Argumente   : $scriptArgs"
+    Write-Output "Arguments   : $scriptArgs"
     Write-Output ''
 
-    # Zusammenfassung der Netzwerk-Konfiguration
-    Write-Output 'Netzwerk-Konfiguration:'
+    # Network configuration summary
+    Write-Output 'Network configuration:'
     if (-not $httpsEnabled -or -not $httpDisabled) {
-        Write-Output "  HTTP  : http://+:$httpPort/  (aktiv)"
+        Write-Output "  HTTP  : http://+:$httpPort/  (active)"
     } else {
-        Write-Output "  HTTP  : deaktiviert"
+        Write-Output "  HTTP  : disabled"
     }
     if ($httpsEnabled) {
-        Write-Output "  HTTPS : https://+:$httpsPort/ (aktiv)"
-        Write-Output "  Zert. : $certThumbprint (bis $($cert.NotAfter.ToString('yyyy-MM-dd')))"
+        Write-Output "  HTTPS : https://+:$httpsPort/ (active)"
+        Write-Output "  Cert. : $certThumbprint (until $($cert.NotAfter.ToString('yyyy-MM-dd')))"
     }
     Write-Output ''
-    Write-Output 'Jetzt sofort starten (ohne Neustart):'
+    Write-Output 'Start immediately (without rebooting):'
     Write-Output "  Start-ScheduledTask -TaskName '$TASK_NAME'"
     Write-Output ''
-    Write-Output 'Task entfernen:'
+    Write-Output 'Remove task:'
     Write-Output "  Unregister-ScheduledTask -TaskName '$TASK_NAME' -Confirm:`$false"
     Write-Output ''
 
 } catch {
     Write-Output ''
-    Write-Output "FEHLER beim Registrieren des Tasks: $_"
+    Write-Output "ERROR registering the task: $_"
     Write-Output ''
     exit 1
 } finally {
-    # Passwort in allen Pfaden aus dem Speicher loeschen
+    # Clear password from memory in all code paths.
     $taskPassword = $null
 }

@@ -1,13 +1,13 @@
 # ---------------------------------------------------------------------------
-# Logs - Laufzeit-Logs sind maschinenspezifisch, nicht ins Repo
+# Runtime logs — machine-specific, not tracked in repo
 # ---------------------------------------------------------------------------
 logs/*.log
 
-# logs/-Ordner selbst via .gitkeep behalten
+# Keep the logs/ directory itself via .gitkeep
 !logs/.gitkeep
 
 # ---------------------------------------------------------------------------
-# Projektspezifische Ausschluesse
+# Project-specific exclusions
 # ---------------------------------------------------------------------------
 AGENTS.md
 CONTEXT.md
