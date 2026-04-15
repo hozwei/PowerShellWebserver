@@ -41,12 +41,15 @@
     http://localhost/script1.ps1
     http://localhost/subdir/script2.ps1?Name=Max&Value=42
     http://localhost/                    <- lists all available scripts
-    http://localhost/health              <- server status, uptime, request counter
+    http://localhost/health              <- server status, uptime, request counter (open)
+    http://localhost/metrics             <- uptime, requestsTotal, rateLimitedTotal (auth required)
 #>
 
 param(
     [switch] $HttpsEnabled,
+    [ValidateRange(0, 65535)]
     [int]    $HttpPort  = 80,
+    [ValidateRange(1, 65535)]
     [int]    $HttpsPort = 443
 )
 
@@ -116,17 +119,21 @@ $cfg = @{
     LogDir              = Join-Path $baseDir 'logs'
     PwshExe             = (Get-Process -Id $PID).MainModule.FileName # pwsh.exe of the running process — no hardcoded path
     ApiKey              = $apiKey                                    # from $env:POSH_API_KEY — already checked for empty string
-    ScriptTimeoutSec         = 900    # 15 minutes — scripts running longer are terminated (HTTP 504)
+    ScriptTimeoutSec         = 300    # 5 minutes — scripts running longer are terminated (HTTP 504)
     MaxConcurrent            = 10     # maximum parallel requests — excess requests receive HTTP 503
     LogRetentionDays         = 180    # log files older than N days are deleted at startup (0 = disabled)
+    PostJsonDir              = Join-Path $baseDir 'postjson' # directory where POST body JSON files are stored
+    PostJsonRetentionDays    = 30     # POST JSON files older than N days are deleted at startup (0 = disabled)
     MaxRequestBodyBytes      = 20MB   # maximum POST body size in bytes — larger requests: HTTP 413
     RateLimitRequests        = 100    # maximum requests per IP per window — excess requests: HTTP 429 (0 = disabled)
     RateLimitWindowSec       = 600    # fixed window size in seconds (10 minutes)
     RateLimitPenaltySec      = 1800   # penalty duration after first 429 in seconds (30 minutes)
     RateLimitMode            = 'reject' # 'reject' = immediate HTTP 429 | 'queue' = wait up to RateLimitQueueTimeoutSec
     RateLimitQueueTimeoutSec = 10     # 'queue' mode only: seconds to wait before returning HTTP 429
-    RateLimitExemptPaths     = @('/health') # paths excluded from rate limiting — always an array
-    MinRequestIntervalSec    = 1      # minimum seconds between dispatched requests, globally — 0 = disabled. /health is always exempt.
+    RateLimitExemptPaths     = @('/health', '/metrics') # paths excluded from rate limiting — always an array
+    MinRequestIntervalSec    = 1      # minimum seconds between dispatched requests, globally — 0 = disabled. /health and /metrics are always exempt.
+    AllowedIPs               = @()    # IP allowlist — empty = all IPs allowed; non-empty = only listed IPs pass (except /health)
+    BlockedIPs               = @()    # IP blocklist — always rejected before AllowedIPs check (except /health); empty = no blocks
 }
 
 # Runtime measurement from server start — used for health check uptime.
@@ -140,7 +147,7 @@ $script:requestsTotal = [ref] 0L
 # Kept separate from requestsTotal — used by the future /metrics endpoint.
 $script:rateLimitedTotal = [ref] 0L
 
-# Per-IP rate limit state — ConcurrentDictionary for lock-free access from ThreadJobs.
+# Per-IP rate limit state — ConcurrentDictionary for lock-free access from RunspacePool Runspaces.
 # Key: client IP string. Value: PSCustomObject { Count [ref]; WindowStart [datetime]; PenaltyUntil [datetime] }.
 $script:rateLimitTable = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
 
@@ -159,20 +166,22 @@ function Write-Log {
         [string] $ClientIP   = '-',
         [string] $Request    = '-',
         [string] $Status     = '-',
-        [string] $ExitCode   = '-'
+        [string] $ExitCode   = '-',
+        [string] $RequestId  = '-'
     )
 
     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $line = '{0} | {1} | {2} | EXIT:{3} | {4}' -f `
+    $line = '{0} | {1} | {2} | EXIT:{3} | {4} | {5}' -f `
         $timestamp,
         $ClientIP.PadRight(15),
         $Request.PadRight(60),
         $ExitCode.PadRight(4),
-        $Status
+        $Status.PadRight(13),
+        $RequestId
 
     $logFile = Join-Path $script:cfg.LogDir ((Get-Date -Format 'yyyy-MM-dd') + '.log')
 
-    # Mutex prevents corrupted lines from parallel writes across ThreadJobs.
+    # Mutex prevents corrupted lines from parallel writes across RunspacePool Runspaces.
     # WaitOne(500): wait at most 500ms — on failure continue silently, never kill the process.
     # Track $acquired: ReleaseMutex() must only be called when WaitOne() succeeded —
     # otherwise ApplicationException because the calling thread does not hold the mutex.
@@ -234,6 +243,77 @@ function Remove-OldLogs {
 }
 
 # ---------------------------------------------------------------------------
+# POST JSON file cleanup
+# Deletes .json files in PostJsonDir that are older than RetentionDays days.
+# Runs once at startup — never during operation.
+# RetentionDays = 0: cleanup disabled (explicit opt-out).
+# Returns the number of deleted files — logging is the caller's responsibility.
+# ---------------------------------------------------------------------------
+function Remove-OldPostJsonFiles {
+    param(
+        [string] $PostJsonDir,
+        [int]    $RetentionDays
+    )
+
+    if ($RetentionDays -le 0) { return 0 }
+
+    $cutoff  = (Get-Date).AddDays(-$RetentionDays)
+    $deleted = 0
+
+    Get-ChildItem -Path $PostJsonDir -Filter '*.json' -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -lt $cutoff } |
+        ForEach-Object {
+            try {
+                Remove-Item -LiteralPath $_.FullName -Force
+                $deleted++
+            } catch { }
+        }
+
+    return $deleted
+}
+
+# ---------------------------------------------------------------------------
+# Rate-limit table cleanup
+# Removes stale entries from the per-IP ConcurrentDictionary — IPs whose
+# penalty has expired AND whose rate-limit window has elapsed hold no useful
+# state and would grow the table indefinitely over long uptimes.
+# Called once at startup before the listener opens — no concurrent access.
+# Returns the number of removed entries — logging is the caller's responsibility.
+# ---------------------------------------------------------------------------
+function Remove-StaleRateLimitEntries {
+    param(
+        [System.Collections.Concurrent.ConcurrentDictionary[string,object]] $Table,
+        [int] $WindowSec,
+        [int] $PenaltySec
+    )
+
+    if ($Table.Count -eq 0) { return 0 }
+
+    $now     = [datetime]::UtcNow
+    $removed = 0
+
+    # @($Table.Keys) snapshots the key list — defensive against keys added by other
+    # threads. At startup there are no other threads, but the pattern is correct.
+    foreach ($key in @($Table.Keys)) {
+        $entry = $null
+        if (-not $Table.TryGetValue($key, [ref]$entry)) { continue }
+
+        # Ticks arithmetic — avoids [datetime] operator/method dispatch issues in
+        # runspace contexts (not relevant here at startup, but consistent with the
+        # rest of the codebase).
+        $penaltyExpired = $entry.PenaltyUntil.Ticks  -le $now.Ticks
+        $windowExpired  = (($now.Ticks - $entry.WindowStart.Ticks) / [timespan]::TicksPerSecond) -ge $WindowSec
+
+        if ($penaltyExpired -and $windowExpired) {
+            $out = $null
+            if ($Table.TryRemove($key, [ref]$out)) { $removed++ }
+        }
+    }
+
+    return $removed
+}
+
+# ---------------------------------------------------------------------------
 # Admin check
 # ---------------------------------------------------------------------------
 $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
@@ -276,7 +356,7 @@ Write-StartupLog "Web server starting. BaseDir=$baseDir  WebRoot=$($cfg.WebRoot)
 # ---------------------------------------------------------------------------
 # Ensure directories exist
 # ---------------------------------------------------------------------------
-foreach ($dir in @($cfg.WebRoot, $cfg.LogDir)) {
+foreach ($dir in @($cfg.WebRoot, $cfg.LogDir, $cfg.PostJsonDir)) {
     if (-not (Test-Path -LiteralPath $dir -PathType Container)) {
         $null = New-Item -ItemType Directory -Path $dir -Force
         Write-StartupLog "Directory created: $dir"
@@ -289,6 +369,31 @@ foreach ($dir in @($cfg.WebRoot, $cfg.LogDir)) {
 $deletedLogs = Remove-OldLogs -LogDir $cfg.LogDir -RetentionDays $cfg.LogRetentionDays
 if ($deletedLogs -gt 0) {
     Write-StartupLog "Log rotation: $deletedLogs file(s) older than $($cfg.LogRetentionDays) days deleted."
+}
+
+# ---------------------------------------------------------------------------
+# POST JSON file cleanup at startup
+# Deletes .json files in PostJsonDir older than PostJsonRetentionDays days.
+# Files are intentionally kept after processing for audit/debugging purposes.
+# ---------------------------------------------------------------------------
+$deletedPostJson = Remove-OldPostJsonFiles -PostJsonDir $cfg.PostJsonDir -RetentionDays $cfg.PostJsonRetentionDays
+if ($deletedPostJson -gt 0) {
+    Write-StartupLog "POST JSON cleanup: $deletedPostJson file(s) older than $($cfg.PostJsonRetentionDays) days deleted."
+}
+
+# ---------------------------------------------------------------------------
+# Rate-limit table cleanup at startup
+# The table starts empty on every fresh process start — this is a no-op on
+# first start. On restart after a crash or update the table retains no state
+# (in-memory only), so this is also always a no-op in practice. The call is
+# kept for correctness and future-proofing (e.g. if persistence is ever added).
+# ---------------------------------------------------------------------------
+if ($cfg.RateLimitRequests -gt 0) {
+    $cleanedEntries = Remove-StaleRateLimitEntries `
+        -Table      $script:rateLimitTable `
+        -WindowSec  $cfg.RateLimitWindowSec `
+        -PenaltySec $cfg.RateLimitPenaltySec
+    Write-StartupLog "Rate-limit table cleanup: $cleanedEntries stale entries removed."
 }
 
 # ---------------------------------------------------------------------------
@@ -361,16 +466,22 @@ function Send-Response {
     param(
         [System.Net.HttpListenerResponse] $Response,
         [int]    $StatusCode,
-        [string] $Body
+        [string] $Body,
+        [string] $RequestId = ''
     )
     try {
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($Body)
         $Response.StatusCode      = $StatusCode
         $Response.ContentType     = 'application/json; charset=utf-8'
         $Response.ContentLength64 = $bytes.Length
+        # X-Request-Id header allows clients to correlate requests to log entries.
+        if ($RequestId -ne '') { $Response.AddHeader('X-Request-Id', $RequestId) }
         $Response.OutputStream.Write($bytes, 0, $bytes.Length)
-    } catch { }
-    finally {
+    } catch {
+        # Connection may have been closed by the client before the response was sent.
+        # Log for diagnostics but do not propagate — a broken pipe must never kill the process.
+        Write-Log -ClientIP '-' -Request '-' -Status "SEND-ERROR: $_" -ExitCode '-'
+    } finally {
         try { $Response.OutputStream.Close() } catch { }
     }
 }
@@ -387,68 +498,96 @@ function Get-QueryParams {
 }
 
 function Get-BodyParams {
+    # Reads and validates the POST body.
+    # Returns PSCustomObject { Error [int]; RawJson [string] }.
+    #   Error = 0   → valid; RawJson contains the raw UTF-8 body string.
+    #   Error = 415 → wrong Content-Type (must be application/json).
+    #   Error = 413 → body exceeds MaxRequestBodyBytes.
+    #   Error = 400 → body is not valid JSON.
+    #
+    # No flat-structure validation — nested objects and arrays are fully supported.
+    # The raw JSON is written to a file by Save-PostJson; the script receives the
+    # file path via -JsonFilePath and reads/parses the JSON itself.
     param([System.Net.HttpListenerRequest] $Request)
 
     # Check Content-Type — must be application/json.
     # StartsWith allows variants like "application/json; charset=utf-8".
     $ct = $Request.ContentType
     if (-not $ct -or -not $ct.StartsWith('application/json', [System.StringComparison]::OrdinalIgnoreCase)) {
-        return [PSCustomObject]@{ Error = 415; Params = $null }
+        return [PSCustomObject]@{ Error = 415; RawJson = $null }
     }
 
     # Check body size before reading — ContentLength64 is -1 when no Content-Length header is set.
     # Only reject when size is known AND too large — unknown size is checked after reading.
     if ($Request.ContentLength64 -gt $script:cfg.MaxRequestBodyBytes) {
-        return [PSCustomObject]@{ Error = 413; Params = $null }
+        return [PSCustomObject]@{ Error = 413; RawJson = $null }
     }
 
-    # Read body — StreamReader is not disposed; InputStream belongs to the HttpListenerRequest.
-    $reader  = [System.IO.StreamReader]::new($Request.InputStream, [System.Text.Encoding]::UTF8)
-    $rawBody = $reader.ReadToEnd()
+    # Read body — leaveOpen=$true keeps InputStream alive (owned by HttpListenerRequest).
+    # The StreamReader wrapper itself is disposed explicitly after reading.
+    $reader = [System.IO.StreamReader]::new($Request.InputStream, [System.Text.Encoding]::UTF8, $true, -1, $true)
+    try {
+        $rawBody = $reader.ReadToEnd()
+    } finally {
+        $reader.Dispose()
+    }
 
     # Check size again in case Content-Length was missing.
     if ($rawBody.Length -gt $script:cfg.MaxRequestBodyBytes) {
-        return [PSCustomObject]@{ Error = 413; Params = $null }
+        return [PSCustomObject]@{ Error = 413; RawJson = $null }
     }
 
-    # Empty body is allowed — equivalent to a call with no parameters.
+    # Empty body — treat as empty JSON object so the script receives an empty file.
     if ([string]::IsNullOrWhiteSpace($rawBody)) {
-        return [PSCustomObject]@{ Error = 0; Params = @{} }
+        return [PSCustomObject]@{ Error = 0; RawJson = '{}' }
     }
 
-    # Parse JSON.
+    # Validate JSON syntax — reject syntactically invalid payloads early.
+    # Nested objects and arrays are intentionally allowed.
     try {
-        $parsed = $rawBody | ConvertFrom-Json -ErrorAction Stop
+        $null = $rawBody | ConvertFrom-Json -ErrorAction Stop
     } catch {
-        return [PSCustomObject]@{ Error = 400; Params = $null }
+        return [PSCustomObject]@{ Error = 400; RawJson = $null }
     }
 
-    # Validate flat structure — no arrays, no nested objects.
-    # ConvertFrom-Json returns a PSCustomObject — iterate its properties.
-    $params = @{}
-    foreach ($prop in $parsed.PSObject.Properties) {
-        $val = $prop.Value
-        if ($val -is [System.Management.Automation.PSCustomObject] -or $val -is [System.Object[]]) {
-            return [PSCustomObject]@{ Error = 400; Params = $null }
-        }
-        # Value as string — identical to query string handling in Get-QueryParams.
-        $params[$prop.Name] = if ($null -eq $val) { '' } else { [string]$val }
-    }
+    return [PSCustomObject]@{ Error = 0; RawJson = $rawBody }
+}
 
-    return [PSCustomObject]@{ Error = 0; Params = $params }
+# ---------------------------------------------------------------------------
+# Save-PostJson
+# Writes the raw POST body to a uniquely named .json file in PostJsonDir.
+# File name format: YYYYMMDD_HHmmss_<requestId>.json
+#   — date+time prefix: chronologically sortable
+#   — requestId suffix: unique, correlatable to log entry and X-Request-Id header
+# File is UTF-8, no BOM.
+# Returns the absolute file path — passed to the webroot script as -JsonFilePath.
+# Files are intentionally kept after processing for audit/debugging.
+# Cleanup is handled by Remove-OldPostJsonFiles at startup (PostJsonRetentionDays).
+# ---------------------------------------------------------------------------
+function Save-PostJson {
+    param(
+        [string] $RawJson,
+        [string] $RequestId
+    )
+
+    $fileName = '{0}_{1}.json' -f (Get-Date -Format 'yyyyMMdd_HHmmss'), $RequestId
+    $filePath = Join-Path $script:cfg.PostJsonDir $fileName
+    [System.IO.File]::WriteAllText($filePath, $RawJson, [System.Text.Encoding]::UTF8)
+    return $filePath
 }
 
 function Invoke-Script {
     param(
         [string]    $ScriptPath,
         [hashtable] $Params,
-        [int]       $TimeoutSec
+        [int]       $TimeoutSec,
+        [string]    $JsonFilePath = ''  # when set: passed as -JsonFilePath to the script (POST requests)
     )
 
     # pwsh.exe as a separate process — the only reliable method to:
     # 1. Read $proc.ExitCode correctly (exit 0 / exit 1 from webroot scripts)
     # 2. Enforce timeout via WaitForExit(ms) + Kill()
-    # 3. Avoid nested ThreadJob issues (Invoke-Script itself runs inside a ThreadJob)
+    # 3. Avoid running scripts directly in the Runspace where exit 1 is invisible
     # ReadToEndAsync BEFORE WaitForExit — no ScriptBlock delegate, no runspace needed, no deadlock.
 
     # Build parameters as separate entries in ArgumentList — no manual quoting needed.
@@ -464,9 +603,17 @@ function Invoke-Script {
     foreach ($arg in @('-NonInteractive', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $ScriptPath)) {
         $null = $psi.ArgumentList.Add($arg)
     }
+    # GET: pass query string key/value pairs as named arguments.
     foreach ($key in $Params.Keys) {
         $null = $psi.ArgumentList.Add("-$key")
         $null = $psi.ArgumentList.Add($Params[$key])
+    }
+    # POST: pass the JSON file path as -JsonFilePath — the script reads and parses it.
+    # No -Key Value pairs for POST: single file path is unambiguous and avoids
+    # ArgumentList length limits and quoting edge cases for large/complex payloads.
+    if ($JsonFilePath -ne '') {
+        $null = $psi.ArgumentList.Add('-JsonFilePath')
+        $null = $psi.ArgumentList.Add($JsonFilePath)
     }
 
     $proc = [System.Diagnostics.Process]::new()
@@ -554,7 +701,7 @@ function Get-ScriptIndex {
 #
 # Called from $requestHandler after the method check, before the auth check.
 # Reading $script:cfg and $script:rateLimitTable relies on the script: scope
-# injected in the ThreadJob — same pattern as Write-Log and Get-ScriptIndex.
+# injected in the RunspacePool Runspace — same pattern as Write-Log and Get-ScriptIndex.
 # ---------------------------------------------------------------------------
 function Test-RateLimit {
     param(
@@ -632,15 +779,16 @@ function Test-RateLimit {
 # each runspace via InitialSessionState.Variables before the runspace opens.
 # ---------------------------------------------------------------------------
 $shared = @{
-    Cfg             = $cfg
-    FnWriteLog      = ${function:Write-Log}
-    FnSendResp      = ${function:Send-Response}
-    FnNewJson       = ${function:New-JsonResponse}
-    FnGetParams     = ${function:Get-QueryParams}
-    FnGetBodyParams = ${function:Get-BodyParams}
-    FnInvScript     = ${function:Invoke-Script}
-    FnGetIndex      = ${function:Get-ScriptIndex}
-    FnRateLimit     = ${function:Test-RateLimit}
+    Cfg              = $cfg
+    FnWriteLog       = ${function:Write-Log}
+    FnSendResp       = ${function:Send-Response}
+    FnNewJson        = ${function:New-JsonResponse}
+    FnGetParams      = ${function:Get-QueryParams}
+    FnGetBodyParams  = ${function:Get-BodyParams}
+    FnSavePostJson   = ${function:Save-PostJson}
+    FnInvScript      = ${function:Invoke-Script}
+    FnGetIndex       = ${function:Get-ScriptIndex}
+    FnRateLimit      = ${function:Test-RateLimit}
 }
 
 # ---------------------------------------------------------------------------
@@ -663,6 +811,7 @@ $requestHandler = {
     ${function:New-JsonResponse} = $shared.FnNewJson
     ${function:Get-QueryParams}  = $shared.FnGetParams
     ${function:Get-BodyParams}   = $shared.FnGetBodyParams
+    ${function:Save-PostJson}    = $shared.FnSavePostJson
     ${function:Invoke-Script}    = $shared.FnInvScript
     ${function:Get-ScriptIndex}  = $shared.FnGetIndex
     ${function:Test-RateLimit}   = $shared.FnRateLimit
@@ -684,14 +833,18 @@ $requestHandler = {
         $urlPath     = $req.Url.AbsolutePath
         $requestLine = '{0} {1}' -f $req.HttpMethod, $req.Url.PathAndQuery
 
+        # Unique 8-character hex ID per request — correlates log entries to X-Request-Id response header.
+        # Substring(0,8) of a GUID gives 32^8 combinations — sufficient for automation-scale traffic.
+        $requestId = [Guid]::NewGuid().ToString('N').Substring(0, 8)
+
         # --------------------------------------------------------------
         # Only GET and POST are allowed — all other methods are rejected.
         # --------------------------------------------------------------
         if ($req.HttpMethod -ne 'GET' -and $req.HttpMethod -ne 'POST') {
             $body = New-JsonResponse -ExitCode 405 -Output '' -Err "Method not allowed: $($req.HttpMethod). Only GET and POST are supported."
             $resp.AddHeader('Allow', 'GET, POST')
-            Send-Response -Response $resp -StatusCode 405 -Body $body
-            Write-Log -ClientIP $clientIP -Request $requestLine -Status 'METHOD NOT ALLOWED' -ExitCode '-'
+            Send-Response -Response $resp -StatusCode 405 -Body $body -RequestId $requestId
+            Write-Log -ClientIP $clientIP -Request $requestLine -Status 'METHOD NOT ALLOWED' -ExitCode '-' -RequestId $requestId
             return
         }
 
@@ -711,7 +864,7 @@ $requestHandler = {
             if (-not $rl.Allowed -and $script:cfg.RateLimitMode -eq 'queue') {
                 # Queue mode: poll until the window resets or timeout expires.
                 # Use Ticks arithmetic — [datetime] comparison operators (op_LessThan) and
-                # .AddSeconds() fail in ThreadJob runspace contexts on PS 7.x.
+                # .AddSeconds() fail in RunspacePool Runspace contexts on PS 7.x.
                 $queueDeadlineTicks = [datetime]::UtcNow.Ticks + ($script:cfg.RateLimitQueueTimeoutSec * [timespan]::TicksPerSecond)
                 while (-not $rl.Allowed -and [datetime]::UtcNow.Ticks -lt $queueDeadlineTicks) {
                     Start-Sleep -Milliseconds 200
@@ -722,8 +875,8 @@ $requestHandler = {
             if (-not $rl.Allowed) {
                 $body = New-JsonResponse -ExitCode 429 -Output '' -Err 'Too many requests. Please slow down.'
                 $resp.AddHeader('Retry-After', [string]$rl.RetryAfterSec)
-                Send-Response -Response $resp -StatusCode 429 -Body $body
-                Write-Log -ClientIP $clientIP -Request $requestLine -Status 'RATE LIMITED' -ExitCode '-'
+                Send-Response -Response $resp -StatusCode 429 -Body $body -RequestId $requestId
+                Write-Log -ClientIP $clientIP -Request $requestLine -Status 'RATE LIMITED' -ExitCode '-' -RequestId $requestId
                 $null = [System.Threading.Interlocked]::Increment($script:rateLimitedTotal)
                 return
             }
@@ -731,16 +884,17 @@ $requestHandler = {
 
         # --------------------------------------------------------------
         # API key authentication
-        # /health is intentionally open (monitoring without key is possible).
+        # /health and /metrics are intentionally open — monitoring and metrics
+        # endpoints must be reachable without credentials.
         # All other routes require the X-Api-Key header.
         # Same response for missing and incorrect key — no hint which case applies.
         # --------------------------------------------------------------
-        if ($urlPath -ne '/health') {
+        if ($urlPath -ne '/health' -and $urlPath -ne '/metrics') {
             $providedKey = $req.Headers['X-Api-Key']
             if ($providedKey -ne $script:cfg.ApiKey) {
                 $body = New-JsonResponse -ExitCode 401 -Output '' -Err 'Unauthorized.'
-                Send-Response -Response $resp -StatusCode 401 -Body $body
-                Write-Log -ClientIP $clientIP -Request $requestLine -Status 'UNAUTHORIZED' -ExitCode '-'
+                Send-Response -Response $resp -StatusCode 401 -Body $body -RequestId $requestId
+                Write-Log -ClientIP $clientIP -Request $requestLine -Status 'UNAUTHORIZED' -ExitCode '-' -RequestId $requestId
                 return
             }
         }
@@ -750,8 +904,8 @@ $requestHandler = {
         # --------------------------------------------------------------
         if ($urlPath -eq '/') {
             $json = Get-ScriptIndex
-            Send-Response -Response $resp -StatusCode 200 -Body $json
-            Write-Log -ClientIP $clientIP -Request $requestLine -Status 'INDEX' -ExitCode '-'
+            Send-Response -Response $resp -StatusCode 200 -Body $json -RequestId $requestId
+            Write-Log -ClientIP $clientIP -Request $requestLine -Status 'INDEX' -ExitCode '-' -RequestId $requestId
             return
         }
 
@@ -771,8 +925,33 @@ $requestHandler = {
                 uptime        = $uptimeStr
                 requestsTotal = $total
             } | ConvertTo-Json -Compress
-            Send-Response -Response $resp -StatusCode 200 -Body $body
-            Write-Log -ClientIP $clientIP -Request $requestLine -Status 'HEALTH' -ExitCode '-'
+            Send-Response -Response $resp -StatusCode 200 -Body $body -RequestId $requestId
+            Write-Log -ClientIP $clientIP -Request $requestLine -Status 'HEALTH' -ExitCode '-' -RequestId $requestId
+            return
+        }
+
+        # --------------------------------------------------------------
+        # GET /metrics -> server metrics (auth required)
+        # rateLimitedTotal counts per-IP rate-limit rejections (HTTP 429 from
+        # the Runspace) — global-throttle 429s (MinRequestIntervalSec, main
+        # thread) are intentionally excluded, consistent with the no-logging
+        # decision for burst-traffic main-thread rejections.
+        # --------------------------------------------------------------
+        if ($urlPath -eq '/metrics') {
+            $uptimeSec   = [long] $startTime.Elapsed.TotalSeconds
+            $h           = [int]($uptimeSec / 3600)
+            $m           = [int](($uptimeSec % 3600) / 60)
+            $s           = $uptimeSec % 60
+            $uptimeStr   = '{0}h {1}m {2}s' -f $h, $m, $s
+            $total       = [System.Threading.Interlocked]::Read($requestsTotal)
+            $rateLimited = [System.Threading.Interlocked]::Read($script:rateLimitedTotal)
+            $body        = [ordered]@{
+                uptime           = $uptimeStr
+                requestsTotal    = $total
+                rateLimitedTotal = $rateLimited
+            } | ConvertTo-Json -Compress
+            Send-Response -Response $resp -StatusCode 200 -Body $body -RequestId $requestId
+            Write-Log -ClientIP $clientIP -Request $requestLine -Status 'METRICS' -ExitCode '-' -RequestId $requestId
             return
         }
 
@@ -781,8 +960,8 @@ $requestHandler = {
         # --------------------------------------------------------------
         if (-not $urlPath.EndsWith('.ps1', [System.StringComparison]::OrdinalIgnoreCase)) {
             $body = New-JsonResponse -ExitCode 400 -Output '' -Err "Only .ps1 files are allowed. Requested: $urlPath"
-            Send-Response -Response $resp -StatusCode 400 -Body $body
-            Write-Log -ClientIP $clientIP -Request $requestLine -Status 'BAD REQUEST' -ExitCode '-'
+            Send-Response -Response $resp -StatusCode 400 -Body $body -RequestId $requestId
+            Write-Log -ClientIP $clientIP -Request $requestLine -Status 'BAD REQUEST' -ExitCode '-' -RequestId $requestId
             return
         }
 
@@ -796,8 +975,8 @@ $requestHandler = {
 
         if (-not $resolvedPath.StartsWith($webrootFull + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
             $body = New-JsonResponse -ExitCode 403 -Output '' -Err 'Access denied.'
-            Send-Response -Response $resp -StatusCode 403 -Body $body
-            Write-Log -ClientIP $clientIP -Request $requestLine -Status 'FORBIDDEN' -ExitCode '-'
+            Send-Response -Response $resp -StatusCode 403 -Body $body -RequestId $requestId
+            Write-Log -ClientIP $clientIP -Request $requestLine -Status 'FORBIDDEN' -ExitCode '-' -RequestId $requestId
             return
         }
 
@@ -806,41 +985,54 @@ $requestHandler = {
         # --------------------------------------------------------------
         if (-not (Test-Path -LiteralPath $resolvedPath -PathType Leaf)) {
             $body = New-JsonResponse -ExitCode 404 -Output '' -Err "Script not found: $urlPath"
-            Send-Response -Response $resp -StatusCode 404 -Body $body
-            Write-Log -ClientIP $clientIP -Request $requestLine -Status 'NOT FOUND' -ExitCode '-'
+            Send-Response -Response $resp -StatusCode 404 -Body $body -RequestId $requestId
+            Write-Log -ClientIP $clientIP -Request $requestLine -Status 'NOT FOUND' -ExitCode '-' -RequestId $requestId
             return
         }
 
         # --------------------------------------------------------------
         # Assemble parameters and execute the script.
-        # GET: query string parameters are passed as named arguments.
-        # POST: JSON body keys are passed as named arguments.
-        #       On name collision, body wins (query keys are overwritten).
+        # GET:  query string parameters are passed as named -Key Value arguments.
+        # POST: the JSON body is written to a file in PostJsonDir; the script
+        #       receives the absolute file path via -JsonFilePath and reads/
+        #       parses the JSON itself. No -Key Value pairs for POST — query
+        #       string parameters at POST are rejected (HTTP 400) to enforce a
+        #       single, unambiguous input channel.
         # Invoke-Script blocks until the script finishes or the timeout
         # (ScriptTimeoutSec) elapses — the client waits accordingly.
         # --------------------------------------------------------------
-        $scriptParams = Get-QueryParams -QueryString $req.QueryString
-
         if ($req.HttpMethod -eq 'POST') {
+            # Reject query string parameters on POST — all input must be in the JSON body.
+            $queryKeys = @($req.QueryString.AllKeys | Where-Object { $null -ne $_ -and $_ -ne '' })
+            if ($queryKeys.Count -gt 0) {
+                $body = New-JsonResponse -ExitCode 400 -Output '' -Err 'Query string parameters are not allowed on POST requests. Pass all input in the JSON body.'
+                Send-Response -Response $resp -StatusCode 400 -Body $body -RequestId $requestId
+                Write-Log -ClientIP $clientIP -Request $requestLine -Status 'BAD REQUEST' -ExitCode '-' -RequestId $requestId
+                return
+            }
+
             $bodyResult = Get-BodyParams -Request $req
             if ($bodyResult.Error -ne 0) {
                 $errMsg = switch ($bodyResult.Error) {
-                    413 { 'Request body too large. Maximum size: {0} MB.' -f [math]::Round($script:cfg.MaxRequestBodyBytes / 1MB) }
-                    415 { 'Content-Type must be application/json.' }
-                    400 { 'Invalid JSON body. Only flat key-value objects are supported — no nested objects or arrays.' }
+                    413     { 'Request body too large. Maximum size: {0} MB.' -f [math]::Round($script:cfg.MaxRequestBodyBytes / 1MB) }
+                    415     { 'Content-Type must be application/json.' }
+                    400     { 'Invalid JSON body.' }
+                    default { 'Request error.' }
                 }
                 $body = New-JsonResponse -ExitCode $bodyResult.Error -Output '' -Err $errMsg
-                Send-Response -Response $resp -StatusCode $bodyResult.Error -Body $body
-                Write-Log -ClientIP $clientIP -Request $requestLine -Status "HTTP $($bodyResult.Error)" -ExitCode '-'
+                Send-Response -Response $resp -StatusCode $bodyResult.Error -Body $body -RequestId $requestId
+                Write-Log -ClientIP $clientIP -Request $requestLine -Status "HTTP $($bodyResult.Error)" -ExitCode '-' -RequestId $requestId
                 return
             }
-            # Merge body keys into scriptParams — body keys overwrite query keys on collision.
-            foreach ($key in $bodyResult.Params.Keys) {
-                $scriptParams[$key] = $bodyResult.Params[$key]
-            }
-        }
 
-        $result = Invoke-Script -ScriptPath $resolvedPath -Params $scriptParams -TimeoutSec $script:cfg.ScriptTimeoutSec
+            # Write body to file — script receives path via -JsonFilePath.
+            $jsonFilePath = Save-PostJson -RawJson $bodyResult.RawJson -RequestId $requestId
+            $result = Invoke-Script -ScriptPath $resolvedPath -Params @{} -TimeoutSec $script:cfg.ScriptTimeoutSec -JsonFilePath $jsonFilePath
+        } else {
+            # GET: pass query string key/value pairs as named arguments.
+            $scriptParams = Get-QueryParams -QueryString $req.QueryString
+            $result = Invoke-Script -ScriptPath $resolvedPath -Params $scriptParams -TimeoutSec $script:cfg.ScriptTimeoutSec
+        }
 
         # Script request completed — increment counter atomically (thread-safe).
         $null = [System.Threading.Interlocked]::Increment($requestsTotal)
@@ -850,12 +1042,12 @@ $requestHandler = {
                       else                            { 500 }
         $body       = New-JsonResponse -ExitCode $result.ExitCode -Output $result.Output -Err $result.Error
 
-        Send-Response -Response $resp -StatusCode $httpStatus -Body $body
+        Send-Response -Response $resp -StatusCode $httpStatus -Body $body -RequestId $requestId
 
         $statusText = if     ($result.TimedOut)       { 'TIMEOUT' }
                       elseif ($result.ExitCode -eq 0) { 'OK' }
                       else                            { 'ERROR' }
-        Write-Log -ClientIP $clientIP -Request $requestLine -Status $statusText -ExitCode "$($result.ExitCode)"
+        Write-Log -ClientIP $clientIP -Request $requestLine -Status $statusText -ExitCode "$($result.ExitCode)" -RequestId $requestId
 
     } catch {
         # Error in request processing — log and continue.
@@ -961,22 +1153,79 @@ try {
             }
         }
 
+        # ---------------------------------------------------------------------------
+        # IP filter — checked in the main thread before the global throttle.
+        # /health is always exempt so monitoring tools are never blocked.
+        # BlockedIPs is checked first — an IP on both lists is always blocked.
+        # AllowedIPs empty = all IPs pass; non-empty = only listed IPs pass.
+        # Direct [System.IO.File]::AppendAllText for logging — Write-Log lives in
+        # the Runspace scope and is not available in the main thread.
+        # ---------------------------------------------------------------------------
+        $reqUrlPath = $context.Request.Url.AbsolutePath
+        if ($reqUrlPath -ne '/health' -and
+            ($cfg.BlockedIPs.Count -gt 0 -or $cfg.AllowedIPs.Count -gt 0)) {
+
+            $reqClientIP = $context.Request.RemoteEndPoint.Address.ToString()
+            $ipDenied    = $false
+            $ipStatus    = ''
+
+            if ($cfg.BlockedIPs -contains $reqClientIP) {
+                $ipDenied = $true
+                $ipStatus = 'IP BLOCKED'
+            } elseif ($cfg.AllowedIPs.Count -gt 0 -and $cfg.AllowedIPs -notcontains $reqClientIP) {
+                $ipDenied = $true
+                $ipStatus = 'IP NOT ALLOWED'
+            }
+
+            if ($ipDenied) {
+                $ipReqId   = [Guid]::NewGuid().ToString('N').Substring(0, 8)
+                $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes(
+                    '{"exitCode":403,"output":"","error":"Access denied."}'
+                )
+                $resp403 = $context.Response
+                $resp403.StatusCode      = 403
+                $resp403.ContentType     = 'application/json; charset=utf-8'
+                $resp403.ContentLength64 = $bodyBytes.Length
+                $resp403.AddHeader('X-Request-Id', $ipReqId)
+                try { $resp403.OutputStream.Write($bodyBytes, 0, $bodyBytes.Length) } catch { }
+                try { $resp403.OutputStream.Close()                                  } catch { }
+                $ipLogLine = '{0} | {1} | {2} | EXIT:{3} | {4} | {5}' -f `
+                    (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'),
+                    $reqClientIP.PadRight(15),
+                    ('{0} {1}' -f $context.Request.HttpMethod, $context.Request.Url.PathAndQuery).PadRight(60),
+                    '-   ',
+                    $ipStatus.PadRight(13),
+                    $ipReqId
+                $ipLogFile = Join-Path $cfg.LogDir ((Get-Date -Format 'yyyy-MM-dd') + '.log')
+                try {
+                    if (-not (Test-Path -LiteralPath $cfg.LogDir -PathType Container)) {
+                        $null = New-Item -ItemType Directory -Path $cfg.LogDir -Force
+                    }
+                    [System.IO.File]::AppendAllText($ipLogFile, $ipLogLine + [System.Environment]::NewLine, [System.Text.Encoding]::UTF8)
+                } catch { }
+                Write-Output $ipLogLine
+                continue
+            }
+        }
+
         # Global throttle — enforce MinRequestIntervalSec between dispatched requests.
         # Checked in the main thread before any runspace is started — RunspacePool stays cold.
-        # /health is always exempt so monitoring is never blocked.
+        # /health and /metrics are always exempt so monitoring endpoints are never blocked.
         # Stopwatch::GetTimestamp() / Frequency gives elapsed seconds as a plain long division —
         # no [datetime] operators, no .NET method dispatch issues.
         # $lastDispatchTick is only updated when the request is allowed through —
         # a 429 response must not reset the clock (a burst would otherwise push the deadline
         # forward indefinitely and block all subsequent legitimate requests).
         if ($cfg.MinRequestIntervalSec -gt 0 -and
-            $context.Request.Url.AbsolutePath -ne '/health') {
+            $reqUrlPath -ne '/health' -and
+            $reqUrlPath -ne '/metrics') {
 
             $nowTick    = [System.Diagnostics.Stopwatch]::GetTimestamp()
             $elapsedSec = ($nowTick - $lastDispatchTick) / [System.Diagnostics.Stopwatch]::Frequency
             if ($elapsedSec -lt $cfg.MinRequestIntervalSec) {
-                $retryAfter  = [math]::Ceiling($cfg.MinRequestIntervalSec - $elapsedSec)
-                $bodyBytes   = [System.Text.Encoding]::UTF8.GetBytes(
+                $retryAfter     = [math]::Ceiling($cfg.MinRequestIntervalSec - $elapsedSec)
+                $throttleReqId  = [Guid]::NewGuid().ToString('N').Substring(0, 8)
+                $bodyBytes      = [System.Text.Encoding]::UTF8.GetBytes(
                     '{"exitCode":429,"output":"","error":"Request rate too high. Maximum 1 request per second."}'
                 )
                 $resp429 = $context.Response
@@ -984,6 +1233,7 @@ try {
                 $resp429.ContentType     = 'application/json; charset=utf-8'
                 $resp429.ContentLength64 = $bodyBytes.Length
                 $resp429.AddHeader('Retry-After', [string]$retryAfter)
+                $resp429.AddHeader('X-Request-Id', $throttleReqId)
                 try { $resp429.OutputStream.Write($bodyBytes, 0, $bodyBytes.Length) } catch { }
                 try { $resp429.OutputStream.Close()                                  } catch { }
                 continue
@@ -994,6 +1244,7 @@ try {
         # Semaphore: check immediately without waiting (timeout 0ms).
         # Under overload, return 503 immediately — no runspace needed.
         if (-not $semaphore.Wait(0)) {
+            $overloadReqId = [Guid]::NewGuid().ToString('N').Substring(0, 8)
             $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes(
                 '{"exitCode":503,"output":"","error":"Server busy. Please try again later."}'
             )
@@ -1001,6 +1252,7 @@ try {
             $resp503.StatusCode      = 503
             $resp503.ContentType     = 'application/json; charset=utf-8'
             $resp503.ContentLength64 = $bodyBytes.Length
+            $resp503.AddHeader('X-Request-Id', $overloadReqId)
             try { $resp503.OutputStream.Write($bodyBytes, 0, $bodyBytes.Length) } catch { }
             try { $resp503.OutputStream.Close()                                  } catch { }
             continue

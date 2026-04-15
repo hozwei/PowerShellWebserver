@@ -9,6 +9,7 @@ Place a `.ps1` file in `webroot\` — it is immediately reachable as an HTTP end
 - [Overview](./docs/overview.md) — What posh is and the problem it solves
 - [Setup](./docs/setup.md) — Installation and prerequisites
 - [Usage](./docs/usage.md) — How to call endpoints and interpret responses
+- [POST JSON File Passthrough](./docs/post-json.md) — How POST bodies are passed to scripts
 - [Architecture](./docs/architecture.md) — System design and key components
 - [Configuration](./docs/configuration.md) — All configuration options
 - [Contributing](./docs/contributing.md) — Development workflow, conventions, and adding new endpoints
@@ -17,12 +18,16 @@ Place a `.ps1` file in `webroot\` — it is immediately reachable as an HTTP end
 ## Features
 
 - **URL-to-script routing** — every `.ps1` file in `webroot\` is an HTTP endpoint; subdirectories map to URL path segments.
-- **GET and POST support** — URL query parameters (GET) and flat JSON body keys (POST) are passed as named PowerShell arguments to the target script. Body keys take precedence when names collide.
+- **GET and POST support** — GET passes URL query parameters as named PowerShell arguments. POST writes the JSON body to a file and passes the path via `-JsonFilePath` — supports nested objects, arrays, and large payloads. See [POST JSON File Passthrough](./docs/post-json.md).
 - **JSON response envelope** — all responses follow `{ "exitCode", "output", "error" }`, regardless of which script ran.
 - **HTTPS support** — optional TLS on a configurable port. Certificate creation, `netsh` binding, and firewall rules are handled automatically by `Register-ScheduledTask.ps1`.
-- **API key authentication** — all endpoints except `GET /health` require an `X-Api-Key` header. The key is configured via the `POSH_API_KEY` system environment variable.
-- **Concurrent request handling** — up to `MaxConcurrent` (default: 10) requests are processed in parallel using `Start-ThreadJob`. Requests beyond the limit receive HTTP 503 immediately.
-- **Script timeout enforcement** — scripts exceeding `ScriptTimeoutSec` (default: 900 s) are terminated and the caller receives HTTP 504.
+- **API key authentication** — all endpoints except `GET /health` and `GET /metrics` require an `X-Api-Key` header. The key is configured via the `POSH_API_KEY` system environment variable.
+- **Concurrent request handling** — up to `MaxConcurrent` (default: 10) requests are processed in parallel using `RunspacePool` + `[PowerShell]::Create()` + `BeginInvoke()`. Requests beyond the limit receive HTTP 503 immediately.
+- **Rate limiting** — per-IP Fixed Window rate limiter (`RateLimitRequests` per `RateLimitWindowSec`). Violations receive HTTP 429 with a `Retry-After` header and trigger a flat penalty period (`RateLimitPenaltySec`). Supports `'reject'` (immediate) and `'queue'` modes. Configurable exempt paths.
+- **Global throttle** — enforces a minimum interval between dispatched requests (`MinRequestIntervalSec`, default: 1s) in the main thread before any runspace is started. `GET /health` and `GET /metrics` are always exempt.
+- **IP filter** — optional `AllowedIPs` allowlist and `BlockedIPs` blocklist, checked in the main thread before any runspace is started. `GET /health` is always exempt.
+- **Request tracing** — every response includes an `X-Request-Id` header (8-character hex) that matches the corresponding log line, allowing clients to correlate responses to log entries.
+- **Script timeout enforcement** — scripts exceeding `ScriptTimeoutSec` (default: 300 s) are terminated and the caller receives HTTP 504.
 - **Log rotation** — daily log files in `logs\`; files older than `LogRetentionDays` days are deleted at startup.
 - **Built-in health endpoint** — `GET /health` returns server status, uptime, and total request count without authentication.
 - **Windows Scheduled Task** — `Register-ScheduledTask.ps1` installs the server as an auto-starting task in one command.
@@ -56,7 +61,7 @@ For the full installation guide including HTTPS setup, see [Setup](./docs/setup.
 
 ## Calling an Endpoint
 
-Every `.ps1` file in `webroot\` is immediately callable via HTTP GET or POST. Include the `X-Api-Key` header and pass script parameters as URL query parameters (GET) or as a flat JSON body (POST).
+Every `.ps1` file in `webroot\` is immediately callable via HTTP GET or POST. Include the `X-Api-Key` header.
 
 **GET — parameters as query string:**
 
@@ -65,25 +70,25 @@ Invoke-RestMethod -Uri 'http://localhost/script1.ps1?ComputerName=WORKSTATION&De
     -Headers @{ 'X-Api-Key' = 'your-api-key' }
 ```
 
-**POST — parameters as JSON body:**
+**POST — JSON body as file:**
+
+POST bodies are not passed as command-line parameters. Instead, the server writes the JSON body to a file and passes the absolute path as `-JsonFilePath`. The script reads and parses the file itself — nested objects, arrays, and large payloads are fully supported.
 
 ```powershell
-Invoke-RestMethod -Uri 'http://localhost/script1.ps1' `
-    -Method Post `
+$body = @{
+    firstName  = 'Anna'
+    department = @{ name = 'IT'; costCenter = '4200' }
+    roles      = @('admin', 'user')
+} | ConvertTo-Json -Depth 5
+
+Invoke-RestMethod -Uri 'http://localhost/post-example.ps1' `
+    -Method      Post `
     -ContentType 'application/json' `
-    -Body '{"ComputerName":"WORKSTATION","Detail":"true"}' `
-    -Headers @{ 'X-Api-Key' = 'your-api-key' }
+    -Headers     @{ 'X-Api-Key' = 'your-api-key' } `
+    -Body        $body
 ```
 
-Both calls produce the same result:
-
-```json
-{
-  "exitCode": 0,
-  "output": "=== System Information ===\nHostname    : WORKSTATION\n...",
-  "error": ""
-}
-```
+The script receives `-JsonFilePath "C:\posh\postjson\20260415_143000_a1b2c3d4.json"` and reads the file directly. For the full pattern and test examples, see [POST JSON File Passthrough](./docs/post-json.md).
 
 Scripts in subdirectories are reachable by path:
 
@@ -105,7 +110,7 @@ Invoke-RestMethod -Uri 'https://localhost/script1.ps1' `
 Create a `.ps1` file anywhere inside `webroot\` — it is reachable immediately, no server restart needed:
 
 ```powershell
-# webroot\my-script.ps1
+# webroot\script1.ps1
 #Requires -Version 7.0
 param(
     [string] $Name = 'World'
@@ -117,24 +122,25 @@ Write-Output "Hello, $Name!"
 Call it:
 
 ```powershell
-Invoke-RestMethod -Uri 'http://localhost/my-script.ps1?Name=Max' `
+Invoke-RestMethod -Uri 'http://localhost/script1.ps1?Name=Max' `
     -Headers @{ 'X-Api-Key' = 'your-api-key' }
 ```
 
-Rules for webroot scripts: use `Write-Output` for normal output, `Write-Error` for errors, `exit 1` to signal HTTP 500, `exit 0` (or no explicit exit) for HTTP 200. All query parameters and POST body parameters arrive as `string` — cast explicitly when needed. See [Contributing](./docs/contributing.md) for the full rules.
+Rules for webroot scripts: use `Write-Output` for normal output, `Write-Error` for errors, `exit 1` to signal HTTP 500, `exit 0` (or no explicit exit) for HTTP 200. GET query parameters arrive as `string` — cast explicitly when needed. POST scripts receive `-JsonFilePath` and must read the file themselves. See [Contributing](./docs/contributing.md) for the full rules.
 
 ## HTTP Status Codes
 
 | Code | Meaning |
 |---|---|
 | `200` | Script exited with code `0` |
-| `400` | Request path does not end in `.ps1`, or POST body is not valid flat JSON |
+| `400` | Request path does not end in `.ps1`, POST body is not valid JSON, or query string parameters were included on a POST request |
 | `401` | `X-Api-Key` header missing or incorrect |
-| `403` | Path-traversal attempt detected |
+| `403` | Path-traversal attempt detected — or client IP is in `BlockedIPs` — or `AllowedIPs` is non-empty and client IP is not listed |
 | `404` | Script file not found in `webroot\` |
 | `405` | HTTP method not allowed — only GET and POST are accepted |
 | `413` | POST body exceeds `MaxRequestBodyBytes` |
 | `415` | POST request `Content-Type` is not `application/json` |
+| `429` | Rate limit exceeded (`RateLimitRequests` per `RateLimitWindowSec`) — or global throttle (`MinRequestIntervalSec`) exceeded — `Retry-After` header included in both cases |
 | `500` | Script exited with a non-zero exit code |
 | `503` | Server is at maximum concurrent request capacity |
 | `504` | Script exceeded `ScriptTimeoutSec` and was terminated |
@@ -151,10 +157,21 @@ All configuration is inline in `Start-WebServer.ps1` as the `$cfg` hashtable. Th
 | `WebRoot` | `C:\posh\webroot` | Directory containing the `.ps1` endpoint scripts |
 | `LogDir` | `C:\posh\logs` | Directory for daily log files |
 | `ApiKey` | `$env:POSH_API_KEY` | API key — always read from the environment variable |
-| `ScriptTimeoutSec` | `900` | Seconds before a running script is killed and HTTP 504 is returned |
+| `ScriptTimeoutSec` | `300` | Seconds before a running script is killed and HTTP 504 is returned |
 | `MaxConcurrent` | `10` | Maximum parallel requests — excess requests receive HTTP 503 |
 | `LogRetentionDays` | `180` | Days to keep log files; `0` disables rotation |
+| `PostJsonDir` | `C:\posh\postjson` | Directory where POST body JSON files are stored |
+| `PostJsonRetentionDays` | `30` | Days to keep POST JSON files; `0` disables cleanup |
 | `MaxRequestBodyBytes` | `20971520` (20 MB) | Maximum POST body size in bytes |
+| `RateLimitRequests` | `100` | Maximum requests per IP per window; `0` disables rate limiting |
+| `RateLimitWindowSec` | `600` | Fixed window size in seconds (10 minutes) |
+| `RateLimitPenaltySec` | `1800` | Penalty duration after first HTTP 429 (30 minutes) |
+| `RateLimitMode` | `'reject'` | `'reject'` = immediate HTTP 429; `'queue'` = wait up to `RateLimitQueueTimeoutSec` |
+| `RateLimitQueueTimeoutSec` | `10` | Max seconds to wait in queue mode before HTTP 429 |
+| `RateLimitExemptPaths` | `@('/health', '/metrics')` | Paths excluded from per-IP rate limiting |
+| `MinRequestIntervalSec` | `1` | Minimum seconds between dispatched requests globally; `0` disables; `/health` and `/metrics` always exempt |
+| `AllowedIPs` | `@()` | IP allowlist — empty = all IPs allowed; non-empty = only listed IPs pass |
+| `BlockedIPs` | `@()` | IP blocklist — listed IPs always receive HTTP 403 |
 
 For the full options reference, see [Configuration](./docs/configuration.md).
 
@@ -163,17 +180,23 @@ For the full options reference, see [Configuration](./docs/configuration.md).
 ```
 Client
   │  GET /subdir/script2.ps1?Path=C:\Temp   X-Api-Key: <key>
+  │  POST /post-example.ps1   body: { "name": "Anna", ... }
   ▼
 HttpListener  ──  http://+:80/  https://+:443/
   │  Main Loop (GetContext)
-  │  SemaphoreSlim: full → HTTP 503
-  │  Start-ThreadJob { $requestHandler }
+  │  IP filter:       BlockedIPs / AllowedIPs → HTTP 403   (/health exempt)
+  │  Global throttle: MinRequestIntervalSec   → HTTP 429   (/health and /metrics exempt)
+  │  SemaphoreSlim:   full                    → HTTP 503
+  │  [PowerShell]::Create() + BeginInvoke() via RunspacePool
   ▼
-$requestHandler (ThreadJob)
-  │  Auth · Method · Path validation
+$requestHandler (RunspacePool Runspace)
+  │  Method check · Rate limit · Auth · Path validation
+  │  GET:  Get-QueryParams → -Key Value arguments
+  │  POST: Get-BodyParams → Save-PostJson → C:\posh\postjson\YYYYMMDD_HHmmss_<id>.json
   │  Invoke-Script
   ▼
-pwsh.exe -File webroot\subdir\script2.ps1 -Path "C:\Temp"
+GET:  pwsh.exe -File webroot\subdir\script2.ps1 -Path "C:\Temp"
+POST: pwsh.exe -File webroot\post-example.ps1 -JsonFilePath "C:\posh\postjson\..."
   │  stdout + stderr via ReadToEndAsync()
   │  $proc.ExitCode → HTTP 200 / 500 / 504
   ▼

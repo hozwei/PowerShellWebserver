@@ -19,17 +19,21 @@ $cfg = @{
     LogDir                   = Join-Path $baseDir 'logs'
     PwshExe                  = (Get-Process -Id $PID).MainModule.FileName
     ApiKey                   = $env:POSH_API_KEY
-    ScriptTimeoutSec         = 900
+    ScriptTimeoutSec         = 300
     MaxConcurrent            = 10
     LogRetentionDays         = 180
+    PostJsonDir              = Join-Path $baseDir 'postjson'
+    PostJsonRetentionDays    = 30
     MaxRequestBodyBytes      = 20MB
     RateLimitRequests        = 100
     RateLimitWindowSec       = 600
     RateLimitPenaltySec      = 1800
     RateLimitMode            = 'reject'
     RateLimitQueueTimeoutSec = 10
-    RateLimitExemptPaths     = @('/health')
+    RateLimitExemptPaths     = @('/health', '/metrics')
     MinRequestIntervalSec    = 1
+    AllowedIPs               = @()
+    BlockedIPs               = @()
 }
 ```
 
@@ -49,14 +53,18 @@ $cfg = @{
     ScriptTimeoutSec         = 300
     MaxConcurrent            = 5
     LogRetentionDays         = 30
+    PostJsonDir              = Join-Path $baseDir 'postjson'
+    PostJsonRetentionDays    = 14
     MaxRequestBodyBytes      = 5MB
     RateLimitRequests        = 30
     RateLimitWindowSec       = 600
     RateLimitPenaltySec      = 3600
     RateLimitMode            = 'queue'
     RateLimitQueueTimeoutSec = 5
-    RateLimitExemptPaths     = @('/health')
+    RateLimitExemptPaths     = @('/health', '/metrics')
     MinRequestIntervalSec    = 1
+    AllowedIPs               = @('192.168.1.0', '192.168.1.1', '10.0.0.5')
+    BlockedIPs               = @()
 }
 ```
 
@@ -93,7 +101,7 @@ These are passed on the command line when starting the server. `Register-Schedul
 
 ### Start-WebServer.ps1 — $cfg Hashtable
 
-> **`$baseDir`** (line 58 in `Start-WebServer.ps1`, not part of `$cfg`): Hardcoded deployment path (`"C:\posh"`). Change this single line to relocate the entire server. Used as the base path for `WebRoot` and `LogDir`.
+> **`$baseDir`** (line 60 in `Start-WebServer.ps1`, not part of `$cfg`): Hardcoded deployment path (`"C:\posh"`). Change this single line to relocate the entire server. Used as the base path for `WebRoot` and `LogDir`.
 
 | Option | Type | Default | Description |
 |---|---|---|---|
@@ -101,17 +109,21 @@ These are passed on the command line when starting the server. `Register-Schedul
 | `LogDir` | `string` | `"C:\posh\logs"` | Absolute path to the directory where daily log files are written. Created automatically at startup if it does not exist. |
 | `PwshExe` | `string` | `(Get-Process -Id $PID).MainModule.FileName` | Absolute path to `pwsh.exe` used to execute webroot scripts. Resolved from the currently running process — no hardcoded path. |
 | `ApiKey` | `string` | `$env:POSH_API_KEY` | API key value checked against the `X-Api-Key` request header. Always sourced from the `POSH_API_KEY` environment variable — do not hardcode a value here. |
-| `ScriptTimeoutSec` | `integer` | `900` | Maximum number of seconds a webroot script may run before it is forcibly terminated. The caller receives HTTP 504 when this limit is exceeded. |
+| `ScriptTimeoutSec` | `integer` | `300` | Maximum number of seconds a webroot script may run before it is forcibly terminated. The caller receives HTTP 504 when this limit is exceeded. |
 | `MaxConcurrent` | `integer` | `10` | Maximum number of requests processed simultaneously. Requests that arrive when all slots are occupied immediately receive HTTP 503. |
 | `LogRetentionDays` | `integer` | `180` | Number of days to retain log files in `LogDir`. Log files older than this value are deleted at startup. Set to `0` to disable log rotation entirely. |
+| `PostJsonDir` | `string` | `"C:\posh\postjson"` | Absolute path to the directory where POST body JSON files are stored. Created automatically at startup if it does not exist. Files are kept after script execution for audit and debugging. See [POST JSON File Passthrough](./post-json.md). |
+| `PostJsonRetentionDays` | `integer` | `30` | Number of days to retain POST JSON files in `PostJsonDir`. Files older than this value are deleted at startup. Set to `0` to disable cleanup entirely. |
 | `MaxRequestBodyBytes` | `integer` | `20971520` (20 MB) | Maximum allowed size of a POST request body in bytes. Requests exceeding this limit receive HTTP 413 immediately. Use PowerShell byte literals for readability: `5MB`, `10MB`. |
 | `RateLimitRequests` | `integer` | `100` | Maximum number of requests allowed per client IP per window (`RateLimitWindowSec`). Requests exceeding this limit receive HTTP 429 with a `Retry-After` header. Set to `0` to disable rate limiting entirely. |
 | `RateLimitWindowSec` | `integer` | `600` (10 min) | Duration in seconds of the Fixed Window used for rate limiting. The request counter resets when the window expires. |
 | `RateLimitPenaltySec` | `integer` | `1800` (30 min) | Duration in seconds for which a client IP is fully blocked after the first HTTP 429. The `Retry-After` header reflects the remaining penalty time. Set to `0` to fall back to window-end behaviour (no flat penalty). |
 | `RateLimitMode` | `string` | `'reject'` | Behaviour when a client exceeds the rate limit. `'reject'`: return HTTP 429 immediately. `'queue'`: wait up to `RateLimitQueueTimeoutSec` seconds for the window to reset before returning HTTP 429. |
 | `RateLimitQueueTimeoutSec` | `integer` | `10` | Maximum seconds a request waits in queue mode before receiving HTTP 429. Only evaluated when `RateLimitMode = 'queue'`. |
-| `RateLimitExemptPaths` | `string[]` | `@('/health')` | URL paths excluded from rate limiting. Must be an array even if only one path is exempt. Comparison is case-insensitive. |
-| `MinRequestIntervalSec` | `integer` | `1` | Minimum number of seconds that must elapse between two dispatched requests, globally across all clients. Requests arriving before this interval elapses receive HTTP 429 with a `Retry-After` header. Enforced in the main thread before any runspace is started — the RunspacePool is never touched for throttled requests. `GET /health` is always exempt regardless of this setting. Set to `0` to disable. |
+| `RateLimitExemptPaths` | `string[]` | `@('/health', '/metrics')` | URL paths excluded from rate limiting. Must be an array even if only one path is exempt. Comparison is case-insensitive. |
+| `MinRequestIntervalSec` | `integer` | `1` | Minimum number of seconds that must elapse between two dispatched requests, globally across all clients. Requests arriving before this interval elapses receive HTTP 429 with a `Retry-After` header. Enforced in the main thread before any runspace is started — the RunspacePool is never touched for throttled requests. `GET /health` and `GET /metrics` are always exempt regardless of this setting. Set to `0` to disable. |
+| `AllowedIPs` | `string[]` | `@()` | IP address allowlist. Empty array = all client IPs are allowed (default). Non-empty = only the listed IP addresses may send requests. Checked in the main thread after the IP blocklist. `GET /health` is always exempt. Use exact IP strings (e.g. `'192.168.1.10'`). |
+| `BlockedIPs` | `string[]` | `@()` | IP address blocklist. Listed IPs are always rejected with HTTP 403, regardless of `AllowedIPs`. Checked in the main thread before `AllowedIPs`. `GET /health` is always exempt. Empty array = no IPs blocked (default). |
 
 ### Register-ScheduledTask.ps1 — Scheduled Task Options
 
