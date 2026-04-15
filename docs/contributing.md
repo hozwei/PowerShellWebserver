@@ -89,7 +89,7 @@ An empty result means no syntax errors were detected.
 Create a new `.ps1` file anywhere inside `webroot\`. It is immediately reachable via HTTP — no registration or server restart required.
 
 ```powershell
-# webroot\my-script.ps1
+# webroot\script1.ps1
 #Requires -Version 7.0
 <#
 .SYNOPSIS
@@ -107,28 +107,35 @@ Write-Output "Hello, $Name!"
 Call via GET:
 
 ```powershell
-Invoke-RestMethod -Uri 'http://localhost/my-script.ps1?Name=Max' `
+Invoke-RestMethod -Uri 'http://localhost/script1.ps1?Name=Max' `
     -Headers @{ 'X-Api-Key' = 'your-api-key' }
 ```
 
-Call via POST:
+Call via POST — the script receives `-JsonFilePath` and reads the file itself:
 
 ```powershell
-Invoke-RestMethod -Uri 'http://localhost/my-script.ps1' `
-    -Method Post `
+# Script must declare param([string] $JsonFilePath = '')
+# and read the file with Get-Content | ConvertFrom-Json -Depth 10
+$body = @{ Name = 'Max' } | ConvertTo-Json
+
+Invoke-RestMethod -Uri 'http://localhost/script1.ps1' `
+    -Method      Post `
     -ContentType 'application/json' `
-    -Body '{"Name":"Max"}' `
-    -Headers @{ 'X-Api-Key' = 'your-api-key' }
+    -Body        $body `
+    -Headers     @{ 'X-Api-Key' = 'your-api-key' }
 ```
+
+See [POST JSON File Passthrough](./post-json.md) for the full script pattern.
 
 **Rules for webroot scripts:**
 
 - Start with `#Requires -Version 7.0`
-- Use `$ErrorActionPreference = 'Continue'` (the server sets this context; do not set it to `Stop`)
+- Use `$ErrorActionPreference = 'Stop'` (recommended for webroot scripts to surface errors clearly)
 - Write normal output to `Write-Output` — it appears in `response.output`
 - Write errors to `Write-Error` — they appear in `response.error`
 - Signal failure with `exit 1` → HTTP 500; success with `exit 0` or no explicit exit → HTTP 200
-- All query parameters and POST body parameters arrive as `string` — cast explicitly when another type is needed
+- **GET:** all query parameters arrive as `string` — cast explicitly when another type is needed
+- **POST:** the script receives `-JsonFilePath` (absolute path to a UTF-8 JSON file); read and parse the file with `Get-Content -LiteralPath $JsonFilePath -Raw -Encoding UTF8 | ConvertFrom-Json -Depth 10`; field types are preserved by `ConvertFrom-Json` (booleans, numbers, nested objects, and arrays work natively)
 - No access to `$cfg`, server internals, or other scope variables
 
 ## Code Style

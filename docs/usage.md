@@ -64,6 +64,32 @@ Expected result:
 
 ---
 
+### Checking server metrics
+
+Retrieve counters and uptime for operational monitoring. Requires the `X-Api-Key` header.
+
+```powershell
+Invoke-RestMethod -Uri 'http://localhost/metrics' -Headers @{ 'X-Api-Key' = 'your-api-key' }
+```
+
+Expected result:
+
+```json
+{
+  "uptime":           "2h 14m 37s",
+  "requestsTotal":    42,
+  "rateLimitedTotal": 3
+}
+```
+
+| Field | Description |
+|---|---|
+| `uptime` | Time elapsed since the server process started |
+| `requestsTotal` | Completed script executions (exit-code-independent; excludes `/`, `/health`, `/metrics`, and error responses) |
+| `rateLimitedTotal` | Per-IP rate-limit rejections (HTTP 429 from `Test-RateLimit`). Global-throttle 429s (`MinRequestIntervalSec`, main thread) are intentionally not counted. |
+
+---
+
 ### Calling a script with query parameters
 
 Pass named arguments to a script by appending them as URL query parameters. Each parameter name must match a `param()` argument in the target script.
@@ -108,32 +134,49 @@ Expected result:
 
 ### Calling a script via POST
 
-Pass parameters as a flat JSON object in the request body. The `Content-Type` header must be `application/json`. Body keys and query parameters can be combined — body keys take precedence when names collide.
+POST request bodies are not passed as command-line parameters. Instead, the server writes the full JSON body to a file in `C:\posh\postjson\` and passes the absolute file path to the script as `-JsonFilePath`. The script reads and parses the file itself.
 
-Use POST instead of GET when:
-- Parameter values contain special characters (`&`, `=`, `+`, spaces) that would need URL encoding in a query string
-- Parameter values are long (paths, tokens, multi-word strings)
-- Parameters should not appear in server logs or browser history
+This approach works with any JSON structure — nested objects, arrays, large payloads, and values containing special characters.
 
 ```powershell
+$body = @{
+    firstName  = 'Anna'
+    department = @{ name = 'IT'; costCenter = '4200' }
+    roles      = @('admin', 'user')
+} | ConvertTo-Json -Depth 5
+
 Invoke-RestMethod -Uri 'http://localhost/script1.ps1' `
-    -Method Post `
+    -Method      Post `
     -ContentType 'application/json' `
-    -Body '{"ComputerName":"WORKSTATION","Detail":"true"}' `
-    -Headers @{ 'X-Api-Key' = 'your-api-key' }
+    -Body        $body `
+    -Headers     @{ 'X-Api-Key' = 'your-api-key' }
 ```
 
-Expected result:
+The target script receives `-JsonFilePath "C:\posh\postjson\20260415_143000_a1b2c3d4.json"` and reads the file:
 
-```json
-{
-  "exitCode": 0,
-  "output": "=== System Information ===\nHostname    : WORKSTATION\n...\n=== Details ===\n...\nDone.",
-  "error": ""
-}
+```powershell
+$data = Get-Content -LiteralPath $JsonFilePath -Raw -Encoding UTF8 | ConvertFrom-Json -Depth 10
+$firstName  = $data.firstName
+$deptName   = $data.department.name   # nested object
+$roles      = $data.roles             # array
 ```
 
-The script receives POST body parameters identically to query string parameters — both arrive as `string` values via the `param()` block.
+**Rules for POST requests:**
+- `Content-Type` must be `application/json`
+- Query string parameters (`?key=val`) are not allowed on POST requests — the server returns HTTP 400
+- An empty body (`{}` or whitespace) is valid — the script receives an empty JSON object file
+- The JSON file is kept after execution for audit and debugging purposes
+
+For the full pattern including validation, error handling, and test examples, see [POST JSON File Passthrough](./post-json.md).
+
+**POST via curl:**
+
+```bash
+curl -X POST http://localhost/script1.ps1 \
+    -H "X-Api-Key: your-api-key" \
+    -H "Content-Type: application/json" \
+    -d '{"firstName":"Anna","department":{"name":"IT","costCenter":"4200"},"roles":["admin","user"]}'
+```
 
 ---
 
@@ -147,24 +190,24 @@ The server accepts HTTP GET and POST requests. Use any HTTP client:
 curl -H "X-Api-Key: your-api-key" "http://localhost/script1.ps1?Detail=true"
 ```
 
-**POST:**
+**POST** (the script receives `-JsonFilePath` — see [POST JSON File Passthrough](./post-json.md)):
 
 ```bash
 curl -X POST http://localhost/script1.ps1 \
     -H "X-Api-Key: your-api-key" \
     -H "Content-Type: application/json" \
-    -d '{"ComputerName":"WORKSTATION","Detail":"true"}'
+    -d '{"firstName":"Anna","department":{"name":"IT","costCenter":"4200"},"roles":["admin","user"]}'
 ```
 
 Expected result:
 
 ```json
-{"exitCode":0,"output":"=== System Information ===\n...","error":""}
+{"exitCode":0,"output":"...","error":""}
 ```
 
 ## Tips & Tricks
 
-- **HTTP status codes carry semantic meaning.** A `200` response guarantees `exitCode` is `0`. A `500` means the script called `exit 1` or encountered a terminating error — inspect the `error` field. A `504` means the script exceeded `ScriptTimeoutSec` and was forcibly terminated. A `401` means the `X-Api-Key` header is missing or incorrect. A `400` on a POST request means the body is not valid flat JSON. A `413` means the body exceeded `MaxRequestBodyBytes`. A `415` means `Content-Type` was not `application/json`.
+- **HTTP status codes carry semantic meaning.** A `200` response guarantees `exitCode` is `0`. A `500` means the script called `exit 1` or encountered a terminating error — inspect the `error` field. A `504` means the script exceeded `ScriptTimeoutSec` and was forcibly terminated. A `401` means the `X-Api-Key` header is missing or incorrect. A `400` on a POST request means the body is not valid JSON or query string parameters were included. A `413` means the body exceeded `MaxRequestBodyBytes`. A `415` means `Content-Type` was not `application/json`.
 - **Maximum 1 request per second.** posh is designed for infrequent, manually-triggered or scheduled automation calls — not for high-frequency polling. Sending requests faster than `MinRequestIntervalSec` (default: 1s) triggers an immediate HTTP 429 with a `Retry-After` header. Add a `Start-Sleep -Seconds 1` between calls in any loop, or honour the `Retry-After` header. `GET /health` is always exempt from this limit.
 - **Scripts are hot-reloaded automatically.** There is no cache and no restart required. Saving a new or updated `.ps1` file to `webroot\` makes it immediately available at the corresponding URL.
-- **Boolean parameters must be passed as strings.** PowerShell's `param()` block receives all values — whether from query parameters or a JSON body — as strings. Write `?Detail=true` or `{"Detail":"true"}` and cast inside the script with `-eq 'true'` rather than using `[bool]` parameter types.
+- **GET query parameters arrive as strings.** PowerShell's `param()` block receives all GET query parameter values as strings. Write `?Detail=true` and cast inside the script with `-eq 'true'` rather than using `[bool]` parameter types. POST scripts receive `-JsonFilePath` and parse the JSON themselves — field types are preserved by `ConvertFrom-Json` (strings stay strings, numbers become integers, booleans become `[bool]`).
