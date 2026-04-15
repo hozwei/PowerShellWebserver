@@ -3,6 +3,16 @@
 ## [Unreleased]
 
 ### Added
+- Global request throttle (`MinRequestIntervalSec = 1`): requests arriving faster than 1 per second receive HTTP 429 with a `Retry-After` header. Enforced in the main thread before any runspace is started — the RunspacePool is never touched for throttled requests. `GET /health` is always exempt.
+
+### Fixed
+- `InitialSessionState::CreateDefault()` replaced with `CreateDefault2()` — eliminates auto-module-loading and shared module state contention under rapid RunspacePool load in PS 7.6. Under sustained burst traffic, `CreateDefault()` caused worker runspaces to start silently without executing any code, and eventually corrupted the main runspace's cmdlet registry.
+- `Start-WebServer.ps1`: `$baseDir` moved before the PowerShell version check — the early-exit log path now uses `Join-Path $baseDir 'logs'` instead of a separate hardcoded `'C:\posh\logs'` string, eliminating a duplicate deployment path definition.
+- `Register-ScheduledTask.ps1`: `$input` (PowerShell automatic variable) renamed to `$raw` in `Read-HostWithDefault` and `Read-YesNo` — removes `PSAvoidAssignmentToAutomaticVariable` PSScriptAnalyzer warning.
+- `webroot\script1.ps1`: `Get-CimInstance Win32_OperatingSystem` and `Get-CimInstance Win32_Processor` now pass `-ComputerName $ComputerName` — previously both always queried the local machine regardless of the parameter value passed to the script.
+- `webroot\script1.ps1` + `webroot\subdir\script2.ps1`: All German strings, comments, and output messages translated to English.
+
+### Added
 - HTTPS support via `System.Net.HttpListener` with `https://+:<port>/` prefix. Enabled with `-HttpsEnabled` switch; requires a `netsh http sslcert` binding for the configured port.
 - `Register-ScheduledTask.ps1` HTTPS setup flow: interactive prompts for certificate source (new self-signed, existing thumbprint, or PFX import), `netsh http add sslcert` binding, optional Windows Firewall rules, and optional HTTP disable.
 - Self-signed certificate creation with full SAN support: machine hostname, `localhost`, `127.0.0.1`, and all local IPv4 addresses included automatically via `-TextExtension`.

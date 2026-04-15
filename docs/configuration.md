@@ -12,17 +12,24 @@ There is no external configuration file. All configuration is defined inline in 
 $baseDir = 'C:\posh'
 
 $cfg = @{
-    HttpsEnabled        = $HttpsEnabled.IsPresent
-    HttpPort            = $HttpPort
-    HttpsPort           = $HttpsPort
-    WebRoot             = Join-Path $baseDir 'webroot'
-    LogDir              = Join-Path $baseDir 'logs'
-    PwshExe             = (Get-Process -Id $PID).MainModule.FileName
-    ApiKey              = $env:POSH_API_KEY
-    ScriptTimeoutSec    = 900
-    MaxConcurrent       = 10
-    LogRetentionDays    = 180
-    MaxRequestBodyBytes = 20MB
+    HttpsEnabled             = $HttpsEnabled.IsPresent
+    HttpPort                 = $HttpPort
+    HttpsPort                = $HttpsPort
+    WebRoot                  = Join-Path $baseDir 'webroot'
+    LogDir                   = Join-Path $baseDir 'logs'
+    PwshExe                  = (Get-Process -Id $PID).MainModule.FileName
+    ApiKey                   = $env:POSH_API_KEY
+    ScriptTimeoutSec         = 900
+    MaxConcurrent            = 10
+    LogRetentionDays         = 180
+    MaxRequestBodyBytes      = 20MB
+    RateLimitRequests        = 100
+    RateLimitWindowSec       = 600
+    RateLimitPenaltySec      = 1800
+    RateLimitMode            = 'reject'
+    RateLimitQueueTimeoutSec = 10
+    RateLimitExemptPaths     = @('/health')
+    MinRequestIntervalSec    = 1
 }
 ```
 
@@ -32,17 +39,24 @@ $cfg = @{
 $baseDir = 'D:\automation\posh'
 
 $cfg = @{
-    HttpsEnabled        = $HttpsEnabled.IsPresent
-    HttpPort            = $HttpPort
-    HttpsPort           = $HttpsPort
-    WebRoot             = Join-Path $baseDir 'webroot'
-    LogDir              = Join-Path $baseDir 'logs'
-    PwshExe             = (Get-Process -Id $PID).MainModule.FileName
-    ApiKey              = $env:POSH_API_KEY
-    ScriptTimeoutSec    = 300
-    MaxConcurrent       = 5
-    LogRetentionDays    = 30
-    MaxRequestBodyBytes = 5MB
+    HttpsEnabled             = $HttpsEnabled.IsPresent
+    HttpPort                 = $HttpPort
+    HttpsPort                = $HttpsPort
+    WebRoot                  = Join-Path $baseDir 'webroot'
+    LogDir                   = Join-Path $baseDir 'logs'
+    PwshExe                  = (Get-Process -Id $PID).MainModule.FileName
+    ApiKey                   = $env:POSH_API_KEY
+    ScriptTimeoutSec         = 300
+    MaxConcurrent            = 5
+    LogRetentionDays         = 30
+    MaxRequestBodyBytes      = 5MB
+    RateLimitRequests        = 30
+    RateLimitWindowSec       = 600
+    RateLimitPenaltySec      = 3600
+    RateLimitMode            = 'queue'
+    RateLimitQueueTimeoutSec = 5
+    RateLimitExemptPaths     = @('/health')
+    MinRequestIntervalSec    = 1
 }
 ```
 
@@ -79,7 +93,7 @@ These are passed on the command line when starting the server. `Register-Schedul
 
 ### Start-WebServer.ps1 — $cfg Hashtable
 
-> **`$baseDir`** (line 91 in `Start-WebServer.ps1`, not part of `$cfg`): Hardcoded deployment path (`"C:\posh"`). Change this single line to relocate the entire server. Used as the base path for `WebRoot` and `LogDir`.
+> **`$baseDir`** (line 58 in `Start-WebServer.ps1`, not part of `$cfg`): Hardcoded deployment path (`"C:\posh"`). Change this single line to relocate the entire server. Used as the base path for `WebRoot` and `LogDir`.
 
 | Option | Type | Default | Description |
 |---|---|---|---|
@@ -91,6 +105,13 @@ These are passed on the command line when starting the server. `Register-Schedul
 | `MaxConcurrent` | `integer` | `10` | Maximum number of requests processed simultaneously. Requests that arrive when all slots are occupied immediately receive HTTP 503. |
 | `LogRetentionDays` | `integer` | `180` | Number of days to retain log files in `LogDir`. Log files older than this value are deleted at startup. Set to `0` to disable log rotation entirely. |
 | `MaxRequestBodyBytes` | `integer` | `20971520` (20 MB) | Maximum allowed size of a POST request body in bytes. Requests exceeding this limit receive HTTP 413 immediately. Use PowerShell byte literals for readability: `5MB`, `10MB`. |
+| `RateLimitRequests` | `integer` | `100` | Maximum number of requests allowed per client IP per window (`RateLimitWindowSec`). Requests exceeding this limit receive HTTP 429 with a `Retry-After` header. Set to `0` to disable rate limiting entirely. |
+| `RateLimitWindowSec` | `integer` | `600` (10 min) | Duration in seconds of the Fixed Window used for rate limiting. The request counter resets when the window expires. |
+| `RateLimitPenaltySec` | `integer` | `1800` (30 min) | Duration in seconds for which a client IP is fully blocked after the first HTTP 429. The `Retry-After` header reflects the remaining penalty time. Set to `0` to fall back to window-end behaviour (no flat penalty). |
+| `RateLimitMode` | `string` | `'reject'` | Behaviour when a client exceeds the rate limit. `'reject'`: return HTTP 429 immediately. `'queue'`: wait up to `RateLimitQueueTimeoutSec` seconds for the window to reset before returning HTTP 429. |
+| `RateLimitQueueTimeoutSec` | `integer` | `10` | Maximum seconds a request waits in queue mode before receiving HTTP 429. Only evaluated when `RateLimitMode = 'queue'`. |
+| `RateLimitExemptPaths` | `string[]` | `@('/health')` | URL paths excluded from rate limiting. Must be an array even if only one path is exempt. Comparison is case-insensitive. |
+| `MinRequestIntervalSec` | `integer` | `1` | Minimum number of seconds that must elapse between two dispatched requests, globally across all clients. Requests arriving before this interval elapses receive HTTP 429 with a `Retry-After` header. Enforced in the main thread before any runspace is started — the RunspacePool is never touched for throttled requests. `GET /health` is always exempt regardless of this setting. Set to `0` to disable. |
 
 ### Register-ScheduledTask.ps1 — Scheduled Task Options
 

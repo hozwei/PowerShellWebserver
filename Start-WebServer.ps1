@@ -75,17 +75,6 @@ if ($PSVersionTable.PSEdition -ne 'Core') {
 }
 
 # ---------------------------------------------------------------------------
-# Ensure Start-ThreadJob is available — already built into PS 7 via
-# Microsoft.PowerShell.ThreadJob. The separate module is only installed
-# when the command is genuinely missing.
-# ---------------------------------------------------------------------------
-if (-not (Get-Command Start-ThreadJob -ErrorAction SilentlyContinue)) {
-    Write-Output 'Start-ThreadJob not available — installing...'
-    Install-Module -Name ThreadJob -Scope AllUsers -Force -AllowClobber -ErrorAction Stop
-    Import-Module ThreadJob -ErrorAction Stop
-}
-
-# ---------------------------------------------------------------------------
 # Do NOT set ErrorActionPreference to Stop — the process runs indefinitely.
 # Errors are handled per request, never globally.
 # ---------------------------------------------------------------------------
@@ -127,10 +116,17 @@ $cfg = @{
     LogDir              = Join-Path $baseDir 'logs'
     PwshExe             = (Get-Process -Id $PID).MainModule.FileName # pwsh.exe of the running process — no hardcoded path
     ApiKey              = $apiKey                                    # from $env:POSH_API_KEY — already checked for empty string
-    ScriptTimeoutSec    = 900    # 15 minutes — scripts running longer are terminated (HTTP 504)
-    MaxConcurrent       = 10     # maximum parallel requests — excess requests receive HTTP 503
-    LogRetentionDays    = 180    # log files older than N days are deleted at startup (0 = disabled)
-    MaxRequestBodyBytes = 20MB   # maximum POST body size in bytes — larger requests: HTTP 413
+    ScriptTimeoutSec         = 900    # 15 minutes — scripts running longer are terminated (HTTP 504)
+    MaxConcurrent            = 10     # maximum parallel requests — excess requests receive HTTP 503
+    LogRetentionDays         = 180    # log files older than N days are deleted at startup (0 = disabled)
+    MaxRequestBodyBytes      = 20MB   # maximum POST body size in bytes — larger requests: HTTP 413
+    RateLimitRequests        = 100    # maximum requests per IP per window — excess requests: HTTP 429 (0 = disabled)
+    RateLimitWindowSec       = 600    # fixed window size in seconds (10 minutes)
+    RateLimitPenaltySec      = 1800   # penalty duration after first 429 in seconds (30 minutes)
+    RateLimitMode            = 'reject' # 'reject' = immediate HTTP 429 | 'queue' = wait up to RateLimitQueueTimeoutSec
+    RateLimitQueueTimeoutSec = 10     # 'queue' mode only: seconds to wait before returning HTTP 429
+    RateLimitExemptPaths     = @('/health') # paths excluded from rate limiting — always an array
+    MinRequestIntervalSec    = 1      # minimum seconds between dispatched requests, globally — 0 = disabled. /health is always exempt.
 }
 
 # Runtime measurement from server start — used for health check uptime.
@@ -139,6 +135,14 @@ $startTime = [System.Diagnostics.Stopwatch]::StartNew()
 # Counts completed script requests (exit-code-independent).
 # [ref] + Interlocked::Increment guarantees thread safety without a mutex.
 $script:requestsTotal = [ref] 0L
+
+# Counts requests rejected by rate limiting (HTTP 429).
+# Kept separate from requestsTotal — used by the future /metrics endpoint.
+$script:rateLimitedTotal = [ref] 0L
+
+# Per-IP rate limit state — ConcurrentDictionary for lock-free access from ThreadJobs.
+# Key: client IP string. Value: PSCustomObject { Count [ref]; WindowStart [datetime]; PenaltyUntil [datetime] }.
+$script:rateLimitTable = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
 
 # Mutex serializes concurrent write access to the log file.
 # Global\ makes the mutex unique across process boundaries.
@@ -488,12 +492,22 @@ function Invoke-Script {
         }
     }
 
-    # Second WaitForExit() without timeout — ensures all buffered stream data is flushed
-    # before GetAwaiter().GetResult() is called.
-    $proc.WaitForExit()
+    # Second WaitForExit() ensures all buffered stream data is flushed before
+    # reading the stream tasks. Under load, many pwsh.exe processes start
+    # simultaneously and contend on Windows-internal process-creation locks —
+    # startup can take 3-10s instead of the normal ~0.4s. A 10s timeout gives
+    # enough headroom without risking an infinite block.
+    $null = $proc.WaitForExit(10000)
     $exitCode = $proc.ExitCode
-    $stdout   = $stdoutTask.GetAwaiter().GetResult()
-    $stderr   = $stderrTask.GetAwaiter().GetResult()
+
+    # Read stdout/stderr with a hard timeout — never block forever.
+    # Task.WaitAll(..., ms) returns false if the timeout expires before all
+    # tasks complete — in that case we return whatever was captured so far.
+    # GetAwaiter().GetResult() on an incomplete task would block indefinitely,
+    # so we only call it when IsCompleted is true.
+    $null = [System.Threading.Tasks.Task]::WaitAll(@($stdoutTask, $stderrTask), 5000)
+    $stdout = if ($stdoutTask.IsCompleted) { $stdoutTask.GetAwaiter().GetResult() } else { '' }
+    $stderr = if ($stderrTask.IsCompleted) { $stderrTask.GetAwaiter().GetResult() } else { '' }
     $proc.Dispose()
 
     return [PSCustomObject]@{
@@ -517,31 +531,123 @@ function Get-ScriptIndex {
 }
 
 # ---------------------------------------------------------------------------
-# $shared: bundles all values needed inside ThreadJob instances.
-# ThreadJobs have no access to the main script's scope — everything must be
-# passed explicitly. Functions are exported as ScriptBlocks and injected
-# into the job via ${function:Name} = $shared.FnName.
+# Rate limiting — Fixed Window per client IP with penalty on violation.
+#
+# Returns PSCustomObject { Allowed [bool]; RetryAfterSec [int] }.
+#
+# Algorithm:
+#   Each IP entry holds three fields:
+#     Count       — atomic request counter for the current window ([ref] long)
+#     WindowStart — UTC start of the current Fixed Window ([datetime])
+#     PenaltyUntil — UTC time until which the IP is fully blocked ([datetime])
+#
+#   Per request:
+#     1. PenaltyUntil set and not yet expired? → reject immediately, Retry-After = remaining penalty
+#     2. Window expired (UtcNow >= WindowStart + RateLimitWindowSec)? → reset Count and WindowStart
+#     3. Increment Count atomically via Interlocked::Increment
+#     4. Count > RateLimitRequests? → set PenaltyUntil = UtcNow + RateLimitPenaltySec → reject
+#     5. Otherwise → allow
+#
+#   Penalty starts on the FIRST rejected request and runs for RateLimitPenaltySec seconds
+#   regardless of when in the window the limit was hit. Every subsequent request during
+#   the penalty period receives a fresh Retry-After based on the remaining penalty time.
+#
+# Called from $requestHandler after the method check, before the auth check.
+# Reading $script:cfg and $script:rateLimitTable relies on the script: scope
+# injected in the ThreadJob — same pattern as Write-Log and Get-ScriptIndex.
+# ---------------------------------------------------------------------------
+function Test-RateLimit {
+    param(
+        [string] $ClientIP,
+        [string] $Path
+    )
+
+    # Rate limiting disabled — 0 means no limit.
+    if ($script:cfg.RateLimitRequests -le 0) {
+        return [PSCustomObject]@{ Allowed = $true; RetryAfterSec = 0 }
+    }
+
+    # Exempt paths bypass rate limiting entirely.
+    if ($script:cfg.RateLimitExemptPaths -contains $Path) {
+        return [PSCustomObject]@{ Allowed = $true; RetryAfterSec = 0 }
+    }
+
+    # Retrieve or create entry for this IP.
+    # GetOrAdd requires a direct value — a ScriptBlock is stored as-is, not invoked.
+    # Two threads may create $newEntry simultaneously, but GetOrAdd guarantees only one
+    # is stored; both callers receive the same winner object.
+    $newEntry = [PSCustomObject]@{
+        Count        = [ref] 0L
+        WindowStart  = [datetime]::UtcNow
+        PenaltyUntil = [datetime]::MinValue   # MinValue = no active penalty
+    }
+    $entry = $script:rateLimitTable.GetOrAdd($ClientIP, $newEntry)
+
+    # --- Step 1: active penalty check ---
+    # Read PenaltyUntil once to avoid a race between the comparison and the calculation.
+    # Use Ticks arithmetic instead of operator (-) or .Subtract() — both fail to resolve
+    # in ThreadJob runspace contexts on PS 7.x due to Value-Type method dispatch issues.
+    # Ticks are a plain [long] — no operator or method lookup required.
+    $penaltyUntil = $entry.PenaltyUntil
+    $nowTicks     = [datetime]::UtcNow.Ticks
+    if ($penaltyUntil.Ticks -gt $nowTicks) {
+        $remainingSec  = [math]::Max(1, [math]::Ceiling(($penaltyUntil.Ticks - $nowTicks) / [timespan]::TicksPerSecond))
+        return [PSCustomObject]@{ Allowed = $false; RetryAfterSec = [int]$remainingSec }
+    }
+
+    # --- Step 2: window reset if expired ---
+    # Ticks arithmetic for the same reason as above.
+    # Value types ([datetime]) on 64-bit .NET are read/written atomically for aligned fields —
+    # safe on all supported PS7 platforms (x64 Windows).
+    $elapsedSec = ($nowTicks - $entry.WindowStart.Ticks) / [timespan]::TicksPerSecond
+    if ($elapsedSec -ge $script:cfg.RateLimitWindowSec) {
+        $entry.WindowStart = [datetime]::UtcNow
+        $null = [System.Threading.Interlocked]::Exchange($entry.Count, 0L)
+    }
+
+    # --- Step 3: increment atomically ---
+    $count = [System.Threading.Interlocked]::Increment($entry.Count)
+
+    # --- Step 4: limit exceeded → start penalty ---
+    if ($count -gt $script:cfg.RateLimitRequests) {
+        # Only set PenaltyUntil if it is not already active (avoids continuously pushing
+        # the deadline forward when multiple threads hit the limit simultaneously).
+        if ($entry.PenaltyUntil.Ticks -le $nowTicks) {
+            $entry.PenaltyUntil = [datetime]::UtcNow.AddSeconds($script:cfg.RateLimitPenaltySec)
+        }
+        $remainingSec  = [math]::Max(1, [math]::Ceiling(($entry.PenaltyUntil.Ticks - [datetime]::UtcNow.Ticks) / [timespan]::TicksPerSecond))
+        return [PSCustomObject]@{ Allowed = $false; RetryAfterSec = [int]$remainingSec }
+    }
+
+    # --- Step 5: allowed ---
+    return [PSCustomObject]@{ Allowed = $true; RetryAfterSec = 0 }
+}
+
+# ---------------------------------------------------------------------------
+# $shared: serialisable values passed to every runspace via -ArgumentList.
+# Functions are exported as ScriptBlocks and injected via ${function:Name}.
+#
+# Live .NET objects (SemaphoreSlim, Mutex, Stopwatch, ConcurrentDictionary,
+# [ref] counters) are NOT included here — they are injected directly into
+# each runspace via InitialSessionState.Variables before the runspace opens.
 # ---------------------------------------------------------------------------
 $shared = @{
-    Cfg              = $cfg
-    LogMutex         = $script:logMutex
-    Semaphore        = $semaphore
-    StartTime        = $startTime
-    RequestsTotal    = $script:requestsTotal
-    FnWriteLog       = ${function:Write-Log}
-    FnSendResp       = ${function:Send-Response}
-    FnNewJson        = ${function:New-JsonResponse}
-    FnGetParams      = ${function:Get-QueryParams}
-    FnGetBodyParams  = ${function:Get-BodyParams}
-    FnInvScript      = ${function:Invoke-Script}
-    FnGetIndex       = ${function:Get-ScriptIndex}
+    Cfg             = $cfg
+    FnWriteLog      = ${function:Write-Log}
+    FnSendResp      = ${function:Send-Response}
+    FnNewJson       = ${function:New-JsonResponse}
+    FnGetParams     = ${function:Get-QueryParams}
+    FnGetBodyParams = ${function:Get-BodyParams}
+    FnInvScript     = ${function:Invoke-Script}
+    FnGetIndex      = ${function:Get-ScriptIndex}
+    FnRateLimit     = ${function:Test-RateLimit}
 }
 
 # ---------------------------------------------------------------------------
 # $requestHandler: complete request processing logic as a ScriptBlock.
-# Executed per request inside its own Start-ThreadJob.
-# Sends the response to the client only after Invoke-Script returns
-# (whether OK, ERROR, or TIMEOUT after ScriptTimeoutSec seconds).
+# Executed per request in its own Runspace (via RunspacePool + PowerShell::Create).
+# Live objects ($semaphore, $script:logMutex, etc.) are available directly —
+# they were injected into the runspace via InitialSessionState.Variables.
 # ---------------------------------------------------------------------------
 $requestHandler = {
     param(
@@ -550,8 +656,8 @@ $requestHandler = {
     )
 
     # Inject functions and configuration from $shared into the local scope.
-    # $script:cfg and $script:logMutex — the script: scope makes them visible
-    # in all injected functions (Write-Log, Get-ScriptIndex).
+    # $script: scope makes them visible in all injected functions (Write-Log,
+    # Get-ScriptIndex, Test-RateLimit).
     ${function:Write-Log}        = $shared.FnWriteLog
     ${function:Send-Response}    = $shared.FnSendResp
     ${function:New-JsonResponse} = $shared.FnNewJson
@@ -559,8 +665,16 @@ $requestHandler = {
     ${function:Get-BodyParams}   = $shared.FnGetBodyParams
     ${function:Invoke-Script}    = $shared.FnInvScript
     ${function:Get-ScriptIndex}  = $shared.FnGetIndex
-    $script:cfg      = $shared.Cfg
-    $script:logMutex = $shared.LogMutex
+    ${function:Test-RateLimit}   = $shared.FnRateLimit
+    $script:cfg              = $shared.Cfg
+
+    # Live .NET objects were injected via InitialSessionState.Variables — plain names.
+    # Map them to $script: scope so injected functions (Write-Log, Test-RateLimit, etc.)
+    # can access them via $script:logMutex / $script:rateLimitTable etc.
+    $script:logMutex         = $logMutex
+    $script:rateLimitTable   = $rateLimitTable
+    $script:rateLimitedTotal = $rateLimitedTotal
+    # $semaphore, $startTime, $requestsTotal are used directly (no $script: needed)
 
     try {
         $req  = $context.Request
@@ -579,6 +693,40 @@ $requestHandler = {
             Send-Response -Response $resp -StatusCode 405 -Body $body
             Write-Log -ClientIP $clientIP -Request $requestLine -Status 'METHOD NOT ALLOWED' -ExitCode '-'
             return
+        }
+
+        # --------------------------------------------------------------
+        # Rate limiting — Fixed Window per client IP.
+        # Checked before auth so brute-force attempts on the API key are
+        # also throttled. /health and other exempt paths are skipped inside
+        # Test-RateLimit via RateLimitExemptPaths.
+        # In 'queue' mode the thread sleeps in a loop until the window clears
+        # or RateLimitQueueTimeoutSec elapses — the semaphore slot is held
+        # during the entire wait, so the effective queue depth equals
+        # MaxConcurrent. New arrivals beyond that receive HTTP 503 as usual.
+        # --------------------------------------------------------------
+        if ($script:cfg.RateLimitRequests -gt 0) {
+            $rl = Test-RateLimit -ClientIP $clientIP -Path $urlPath
+
+            if (-not $rl.Allowed -and $script:cfg.RateLimitMode -eq 'queue') {
+                # Queue mode: poll until the window resets or timeout expires.
+                # Use Ticks arithmetic — [datetime] comparison operators (op_LessThan) and
+                # .AddSeconds() fail in ThreadJob runspace contexts on PS 7.x.
+                $queueDeadlineTicks = [datetime]::UtcNow.Ticks + ($script:cfg.RateLimitQueueTimeoutSec * [timespan]::TicksPerSecond)
+                while (-not $rl.Allowed -and [datetime]::UtcNow.Ticks -lt $queueDeadlineTicks) {
+                    Start-Sleep -Milliseconds 200
+                    $rl = Test-RateLimit -ClientIP $clientIP -Path $urlPath
+                }
+            }
+
+            if (-not $rl.Allowed) {
+                $body = New-JsonResponse -ExitCode 429 -Output '' -Err 'Too many requests. Please slow down.'
+                $resp.AddHeader('Retry-After', [string]$rl.RetryAfterSec)
+                Send-Response -Response $resp -StatusCode 429 -Body $body
+                Write-Log -ClientIP $clientIP -Request $requestLine -Status 'RATE LIMITED' -ExitCode '-'
+                $null = [System.Threading.Interlocked]::Increment($script:rateLimitedTotal)
+                return
+            }
         }
 
         # --------------------------------------------------------------
@@ -612,12 +760,12 @@ $requestHandler = {
         # Uptime as a human-readable string, requestsTotal counts script requests only.
         # --------------------------------------------------------------
         if ($urlPath -eq '/health') {
-            $uptimeSec = [long] $shared.StartTime.Elapsed.TotalSeconds
+            $uptimeSec = [long] $startTime.Elapsed.TotalSeconds
             $h         = [int]($uptimeSec / 3600)
             $m         = [int](($uptimeSec % 3600) / 60)
             $s         = $uptimeSec % 60
             $uptimeStr = '{0}h {1}m {2}s' -f $h, $m, $s
-            $total     = [System.Threading.Interlocked]::Read($shared.RequestsTotal)
+            $total     = [System.Threading.Interlocked]::Read($requestsTotal)
             $body      = [ordered]@{
                 status        = 'ok'
                 uptime        = $uptimeStr
@@ -695,7 +843,7 @@ $requestHandler = {
         $result = Invoke-Script -ScriptPath $resolvedPath -Params $scriptParams -TimeoutSec $script:cfg.ScriptTimeoutSec
 
         # Script request completed — increment counter atomically (thread-safe).
-        $null = [System.Threading.Interlocked]::Increment($shared.RequestsTotal)
+        $null = [System.Threading.Interlocked]::Increment($requestsTotal)
 
         $httpStatus = if     ($result.TimedOut)       { 504 }
                       elseif ($result.ExitCode -eq 0) { 200 }
@@ -719,20 +867,78 @@ $requestHandler = {
         } catch { }
     } finally {
         # Always release the semaphore slot — even on error or timeout.
-        try { $shared.Semaphore.Release() } catch { }
+        try { $null = $semaphore.Release() } catch { }
     }
 }
 
 # ---------------------------------------------------------------------------
+# RunspacePool — replaces Start-ThreadJob entirely.
+#
+# Why not Start-ThreadJob:
+#   Start-ThreadJob relies on Microsoft.PowerShell.ThreadJob's JobSourceAdapter.
+#   Under sustained load in PS 7.6 the adapter becomes unregistered after a
+#   varying number of calls — Start-ThreadJob then throws "not recognized" and
+#   the server crashes. Root causes identified:
+#     1. -ArgumentList serialises all arguments; .NET sync objects
+#        (SemaphoreSlim, Mutex, ConcurrentDictionary, [ref]) become dead
+#        Deserialized.* snapshots — semaphore.Release() silently fails.
+#     2. $using: on ScriptBlock-variables (not literal ScriptBlocks) is
+#        unreliable in PS 7.6 — variables resolve to $null.
+#     3. The JobSourceAdapter itself degrades under repeated rapid invocations.
+#
+# RunspacePool + [PowerShell]::Create() + BeginInvoke() is the correct
+# .NET-native solution:
+#   - No JobSourceAdapter, no module dependency, no serialisation.
+#   - Live objects injected directly via InitialSessionState.Variables —
+#     every runspace gets the real reference, not a snapshot.
+#   - BeginInvoke() is non-blocking; the main thread returns to GetContext()
+#     immediately.
+#   - Concurrency is bounded by the RunspacePool max size (= MaxConcurrent).
+#     The SemaphoreSlim is still used for the 503 fast-path before BeginInvoke.
+# ---------------------------------------------------------------------------
+$iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault2()
+
+# Inject live .NET objects as session variables — direct reference, no serialisation.
+# Plain variable names only — no scope qualifiers in SessionStateVariableEntry names.
+# The requestHandler maps them to $script: scope explicitly after startup.
+foreach ($entry in @(
+    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('semaphore',        $semaphore,                  $null),
+    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('startTime',        $startTime,                  $null),
+    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('requestsTotal',    $script:requestsTotal,       $null),
+    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('logMutex',         $script:logMutex,            $null),
+    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('rateLimitTable',   $script:rateLimitTable,      $null),
+    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('rateLimitedTotal', $script:rateLimitedTotal,    $null)
+)) { $iss.Variables.Add($entry) }
+
+# RunspacePool max = MaxConcurrent * 2.
+# The SemaphoreSlim limits real parallelism to MaxConcurrent — the pool needs
+# extra headroom because RunspacePool slots are only released when EndInvoke()+
+# Dispose() is called in the main loop (next iteration). Between semaphore.Release()
+# in the handler's finally and Dispose() in the main loop, the slot is still counted
+# as occupied by the pool. Without extra headroom BeginInvoke() blocks the main
+# thread when the pool is full — GetContext() is never called — the server hangs.
+$runspacePool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, ($cfg.MaxConcurrent * 2), $iss, $Host)
+$runspacePool.Open()
+
+# ---------------------------------------------------------------------------
 # Main loop
 # GetContext() blocks synchronously until a request arrives.
-# A Start-ThreadJob is started per request — the main thread returns
-# immediately to accept the next request.
+# A PowerShell instance is started per request via the RunspacePool —
+# the main thread returns immediately to accept the next request.
 # Shutdown: $listener.Stop() throws an exception in GetContext() — the
 # IsListening check exits the loop cleanly.
 # ---------------------------------------------------------------------------
 try {
     Write-Output 'Web server running. Waiting for requests...'
+
+    # Tracks active [PowerShell] instances so EndInvoke()+Dispose() can be called
+    # once completed — prevents RunspacePool slot leaks.
+    $psInstances = [System.Collections.Generic.List[object]]::new()
+
+    # Tracks the Stopwatch timestamp of the last dispatched request.
+    # Used for global throttling (MinRequestIntervalSec).
+    # Initialized to 0 — first request is always allowed.
+    $lastDispatchTick = 0L
 
     while ($listener.IsListening) {
         # Blocks until a request arrives or the listener is stopped.
@@ -744,11 +950,49 @@ try {
             continue
         }
 
-        # Clean up completed jobs — non-blocking, once per loop iteration.
-        Get-Job -State Completed -ErrorAction SilentlyContinue | Remove-Job -Force
+        # Dispose completed [PowerShell] instances — releases RunspacePool slots.
+        # Iterate backwards so RemoveAt() does not shift unvisited indices.
+        for ($i = $psInstances.Count - 1; $i -ge 0; $i--) {
+            $item = $psInstances[$i]
+            if ($item.Handle.IsCompleted) {
+                try { $item.Ps.EndInvoke($item.Handle) } catch { }
+                try { $item.Ps.Dispose()               } catch { }
+                $psInstances.RemoveAt($i)
+            }
+        }
+
+        # Global throttle — enforce MinRequestIntervalSec between dispatched requests.
+        # Checked in the main thread before any runspace is started — RunspacePool stays cold.
+        # /health is always exempt so monitoring is never blocked.
+        # Stopwatch::GetTimestamp() / Frequency gives elapsed seconds as a plain long division —
+        # no [datetime] operators, no .NET method dispatch issues.
+        # $lastDispatchTick is only updated when the request is allowed through —
+        # a 429 response must not reset the clock (a burst would otherwise push the deadline
+        # forward indefinitely and block all subsequent legitimate requests).
+        if ($cfg.MinRequestIntervalSec -gt 0 -and
+            $context.Request.Url.AbsolutePath -ne '/health') {
+
+            $nowTick    = [System.Diagnostics.Stopwatch]::GetTimestamp()
+            $elapsedSec = ($nowTick - $lastDispatchTick) / [System.Diagnostics.Stopwatch]::Frequency
+            if ($elapsedSec -lt $cfg.MinRequestIntervalSec) {
+                $retryAfter  = [math]::Ceiling($cfg.MinRequestIntervalSec - $elapsedSec)
+                $bodyBytes   = [System.Text.Encoding]::UTF8.GetBytes(
+                    '{"exitCode":429,"output":"","error":"Request rate too high. Maximum 1 request per second."}'
+                )
+                $resp429 = $context.Response
+                $resp429.StatusCode      = 429
+                $resp429.ContentType     = 'application/json; charset=utf-8'
+                $resp429.ContentLength64 = $bodyBytes.Length
+                $resp429.AddHeader('Retry-After', [string]$retryAfter)
+                try { $resp429.OutputStream.Write($bodyBytes, 0, $bodyBytes.Length) } catch { }
+                try { $resp429.OutputStream.Close()                                  } catch { }
+                continue
+            }
+            $lastDispatchTick = $nowTick
+        }
 
         # Semaphore: check immediately without waiting (timeout 0ms).
-        # Under overload, return 503 immediately — no job needed.
+        # Under overload, return 503 immediately — no runspace needed.
         if (-not $semaphore.Wait(0)) {
             $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes(
                 '{"exitCode":503,"output":"","error":"Server busy. Please try again later."}'
@@ -762,25 +1006,41 @@ try {
             continue
         }
 
-        # Start ThreadJob — runs in parallel, main thread returns immediately.
-        $null = Start-ThreadJob -ScriptBlock $requestHandler -ArgumentList $context, $shared
+        # Dispatch request to RunspacePool — non-blocking.
+        # Semaphore is released inside $requestHandler's finally block.
+        $ps     = [System.Management.Automation.PowerShell]::Create()
+        $ps.RunspacePool = $runspacePool
+        $null   = $ps.AddScript($requestHandler).AddArgument($context).AddArgument($shared)
+        $handle = $ps.BeginInvoke()
+        $psInstances.Add([PSCustomObject]@{ Ps = $ps; Handle = $handle })
     }
 
 } finally {
     # Always executed — regardless of normal exit, Ctrl+C, or crash.
     # Order is critical:
     #   1. Stop listener — interrupts running GetContext() immediately
-    #   2. Wait 5s — gives running jobs time to finish cleanly
+    #   2. Wait 5s — gives running runspaces time to finish cleanly
     #   3. Release remaining resources
-    Write-StartupLog 'Shutdown initiated — waiting for in-flight requests (max. 5s)...'
-
+    # Every call is individually wrapped in try/catch — a degraded runspace
+    # state during forced shutdown (e.g. taskkill, session end) must never
+    # prevent the remaining cleanup steps from running.
+    try { Write-StartupLog 'Shutdown initiated — waiting for in-flight requests (max. 5s)...' } catch { }
     try { if ($listener.IsListening) { $listener.Stop() } } catch { }
-    Start-Sleep -Seconds 5
+    try { Start-Sleep -Seconds 5                          } catch { }
     try { $listener.Close()                               } catch { }
-    try { Get-Job | Remove-Job -Force                     } catch { }
+    # Dispose any remaining tracked [PowerShell] instances.
+    try {
+        if ($null -ne $psInstances) {
+            foreach ($item in $psInstances) {
+                try { $item.Ps.EndInvoke($item.Handle) } catch { }
+                try { $item.Ps.Dispose()               } catch { }
+            }
+        }
+    } catch { }
+    try { $runspacePool.Close()                           } catch { }
+    try { $runspacePool.Dispose()                         } catch { }
     try { $semaphore.Dispose()                            } catch { }
     try { $script:logMutex.Dispose()                      } catch { }
-
-    Write-StartupLog 'Web server stopped.'
-    Write-Output 'Web server stopped.'
+    try { Write-StartupLog 'Web server stopped.'          } catch { }
+    try { Write-Output 'Web server stopped.'              } catch { }
 }

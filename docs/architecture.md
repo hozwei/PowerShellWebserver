@@ -39,20 +39,23 @@ C:\posh\
 
 **Responsibilities:**
 - Calls `GetContext()` synchronously — blocks at near-zero CPU cost until a request arrives
+- Enforces `MinRequestIntervalSec` (default: 1s) via `$lastDispatchTick` + `Stopwatch::GetTimestamp()` / `Frequency` — requests arriving too fast receive HTTP 429 + `Retry-After` immediately, before any runspace is started; `GET /health` is always exempt
 - Checks `SemaphoreSlim.Wait(0)` immediately: if all slots are occupied, returns HTTP 503 directly without starting a job
-- Starts a `Start-ThreadJob` per accepted request, passing `$context` and `$shared`
-- Cleans up completed jobs (`Get-Job -State Completed | Remove-Job -Force`) once per loop iteration
+- Starts a `[PowerShell]::Create()` + `BeginInvoke()` per accepted request via `RunspacePool`, passing `$context` and `$shared`
+- Cleans up completed `[PowerShell]` instances (`EndInvoke()` + `Dispose()`) once per loop iteration to release RunspacePool slots
 
 **Dependencies on other components:**
 - `$semaphore` (capacity check)
-- `$requestHandler` ScriptBlock (executed inside each ThreadJob)
-- `$shared` hashtable (carries all configuration and function references into the job)
+- `$lastDispatchTick` (global throttle — `MinRequestIntervalSec`)
+- `$requestHandler` ScriptBlock (executed inside each Runspace)
+- `$shared` hashtable (carries all configuration and function references into the Runspace)
+- `$psInstances` list (tracks active `[PowerShell]` instances for cleanup)
 
 ---
 
 ### Request Handler (`$requestHandler`)
 
-**Purpose:** Processes a single HTTP request inside a ThreadJob.
+**Purpose:** Processes a single HTTP request inside a RunspacePool Runspace.
 
 **Responsibilities:**
 - Validates HTTP method — rejects non-GET and non-POST requests with HTTP 405
