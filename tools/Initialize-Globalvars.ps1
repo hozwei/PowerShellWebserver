@@ -22,6 +22,8 @@
     .\tools\Initialize-Globalvars.ps1
 #>
 [CmdletBinding(SupportsShouldProcess)]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '',
+    Justification = 'Interactive setup tool — coloured Write-Host output is intended.')]
 param(
     [string] $GlobalvarsFile = '',
     [switch] $Force
@@ -65,9 +67,13 @@ $bytes = [byte[]]::new(32)
 $rng   = [System.Security.Cryptography.RandomNumberGenerator]::Create()
 try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
 
+# Detect the file's dominant line ending so the replacement does not
+# leave mixed CRLF/LF in the file. Default to CRLF on Windows.
+$newline = if ($content.Contains("`r`n")) { "`r`n" } else { "`n" }
+
 # Build the replacement block. Indentation matches the rest of the file.
 $keyArrayText = '$key = @(' + (($bytes | ForEach-Object { '{0}' -f $_ }) -join ', ') + ')'
-$newBlock = "$startMarker`n$keyArrayText`n$endMarker"
+$newBlock = $startMarker + $newline + $keyArrayText + $newline + $endMarker
 $newContent = $content.Substring(0, $startIx) + $newBlock + $content.Substring($endIx + $endMarker.Length)
 
 if ($PSCmdlet.ShouldProcess($GlobalvarsFile, 'Write new $key block')) {

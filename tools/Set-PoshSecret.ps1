@@ -27,6 +27,8 @@
     .\tools\Set-PoshSecret.ps1 -Label 'ad_adsread'
 #>
 [CmdletBinding(SupportsShouldProcess)]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '',
+    Justification = 'Interactive setup tool — coloured Write-Host output is intended.')]
 param(
     [Parameter(Mandatory)]
     [ValidatePattern('^[A-Za-z0-9_-]+$')]

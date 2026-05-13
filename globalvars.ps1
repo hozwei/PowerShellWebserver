@@ -27,7 +27,15 @@
         $cipher = (Get-Content -LiteralPath (Join-Path $PoshEncryptedDir 'encryptedString_ad_adsread.txt') -Raw).Trim()
         $secStr = ConvertTo-SecureString -String $cipher -Key $key
         $cred   = [PSCredential]::new('DOMAIN\reader', $secStr)
+
+    Variables in this file are CONSUMED by every script that dot-sources
+    it. PSScriptAnalyzer's "assigned but never used" warning is therefore
+    suppressed below.
 #>
+
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseDeclaredVarsMoreThanAssignments', '',
+    Justification = 'Variables are consumed by every script that dot-sources this file.')]
+param()
 
 
 # ===========================================================================
