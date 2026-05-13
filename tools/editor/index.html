@@ -576,6 +576,56 @@
         search:   '',      // active search query (case-insensitive substring match)
     };
 
+    // Modal accessibility:
+    //   - openModal stores the element that had focus before the modal
+    //     was shown so we can return focus on close (matches what native
+    //     <dialog> does, but we can't use <dialog> because of the legacy
+    //     .modal-bg / .modal markup).
+    //   - The keydown handler on the modal traps Tab and Shift+Tab so
+    //     focus cycles between the modal's focusable descendants instead
+    //     of escaping back into the page behind the overlay.
+    const FOCUSABLE_SELECTOR = 'a[href], button:not([disabled]), input:not([disabled]):not([type=hidden]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+    const modalFocusReturns = new WeakMap();
+    const trapKeydown = (e) => {
+        if (e.key !== 'Tab') return;
+        const modal = e.currentTarget;
+        const focusables = Array.from(modal.querySelectorAll(FOCUSABLE_SELECTOR))
+            .filter(el => el.offsetParent !== null);
+        if (focusables.length === 0) { e.preventDefault(); return; }
+        const first = focusables[0];
+        const last  = focusables[focusables.length - 1];
+        if (e.shiftKey && document.activeElement === first) {
+            last.focus();
+            e.preventDefault();
+        } else if (!e.shiftKey && document.activeElement === last) {
+            first.focus();
+            e.preventDefault();
+        }
+    };
+    const openModal = (modalEl, focusEl) => {
+        modalFocusReturns.set(modalEl, document.activeElement);
+        modalEl.classList.add('shown');
+        modalEl.addEventListener('keydown', trapKeydown);
+        // Defer focus assignment so the show transition has applied
+        // (otherwise some browsers refuse to focus an offscreen node).
+        setTimeout(() => {
+            const target = focusEl || modalEl.querySelector(FOCUSABLE_SELECTOR);
+            if (target) target.focus();
+        }, 30);
+    };
+    const closeModal = (modalEl) => {
+        modalEl.classList.remove('shown');
+        modalEl.removeEventListener('keydown', trapKeydown);
+        const opener = modalFocusReturns.get(modalEl);
+        modalFocusReturns.delete(modalEl);
+        // Return focus to the trigger if it's still in the DOM and still
+        // visible — guards against the opener having been replaced (e.g.
+        // by a renderGroup pass after a save).
+        if (opener && document.contains(opener) && typeof opener.focus === 'function') {
+            try { opener.focus(); } catch (e) { /* element no longer focusable */ }
+        }
+    };
+
     // Promise-based confirm. Replaces window.confirm() so all confirmation
     // UI stays in the editor's visual language and doesn't show the
     // browser-chrome dialog (which on some Chromium builds focuses oddly
@@ -594,19 +644,21 @@
             okBtn.textContent     = opts.okLabel     || 'Confirm';
             cancelBtn.textContent = opts.cancelLabel || 'Cancel';
             okBtn.classList.toggle('btn-danger', Boolean(opts.danger));
+            okBtn.classList.toggle('btn-primary', !opts.danger);
             const cleanup = (result) => {
-                modal.classList.remove('shown');
+                closeModal(modal);
                 okBtn.removeEventListener('click', onOk);
                 cancelBtn.removeEventListener('click', onCancel);
+                modal.removeEventListener('keydown', onEsc);
                 resolve(result);
             };
             const onOk     = () => cleanup(true);
             const onCancel = () => cleanup(false);
+            const onEsc    = (e) => { if (e.key === 'Escape') { e.preventDefault(); cleanup(false); } };
             okBtn.addEventListener('click', onOk);
             cancelBtn.addEventListener('click', onCancel);
-            modal.classList.add('shown');
-            // Move focus to the affirmative button so Enter confirms.
-            setTimeout(() => okBtn.focus(), 30);
+            modal.addEventListener('keydown', onEsc);
+            openModal(modal, okBtn);
         });
     };
 
@@ -643,6 +695,43 @@
             }
         }
         return e && e.message ? e.message : String(e);
+    };
+
+    // Decorate the field rows with per-field server validation errors
+    // (e.g. cross-field rules that the client doesn't enforce). If the
+    // first error is on a field that's in a different tab, switch to
+    // that tab so the operator sees it without hunting.
+    const showServerErrors = (fieldsErrors) => {
+        if (!fieldsErrors || typeof fieldsErrors !== 'object') return;
+        const names = Object.keys(fieldsErrors);
+        if (names.length === 0) return;
+        // Find a target tab — prefer one we're already on.
+        let targetTab = state.active;
+        const firstName = names[0];
+        const firstField = state.schema && state.schema.Fields.find(f => f.Name === firstName);
+        if (firstField && firstField.Group !== state.active) {
+            targetTab = firstField.Group;
+            state.active = targetTab;
+            renderTabs();
+            renderGroup(targetTab);
+        }
+        // Mark every error field that's currently rendered. Fields on
+        // other tabs are unreachable in one shot; the operator can fix
+        // the one on this tab and re-save to see the next.
+        for (const [name, msg] of Object.entries(fieldsErrors)) {
+            const row = document.querySelector('.field[data-name="' + name + '"]');
+            if (!row) continue;
+            const vmsg = row.querySelector('.validator-msg');
+            if (vmsg) {
+                vmsg.textContent = msg;
+                vmsg.style.display = 'block';
+            }
+            const focusable = row.querySelector('input, select, textarea');
+            if (focusable) focusable.classList.add('invalid');
+            row.classList.add('dirty'); // make the discard-changes button visible
+            // Scroll the first one into view.
+            if (name === firstName) row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
     };
 
     const api = async (method, path, body) => {
@@ -1370,6 +1459,7 @@
             res = await api('POST', '/api/diff', { values });
         } catch (e) {
             toast(formatApiError(e), 'err');
+            if (e && e.payload && e.payload.fields) showServerErrors(e.payload.fields);
             return;
         }
         const body = $('#diff-body');
@@ -1388,7 +1478,7 @@
                 body.appendChild(row);
             }
         }
-        $('#diff-modal').classList.add('shown');
+        openModal($('#diff-modal'), $('#diff-confirm'));
         $('#diff-confirm').dataset.values = JSON.stringify(values);
     };
 
@@ -1399,11 +1489,15 @@
             res = await api('POST', '/api/save', { values });
         } catch (e) {
             toast(formatApiError(e), 'err');
+            if (e && e.payload && e.payload.fields) {
+                closeModal($('#diff-modal'));
+                showServerErrors(e.payload.fields);
+            }
             return;
         }
         const bk = (res.backups || []).join(', ');
         toast('Saved. Backups: ' + (bk || '(none — no file to back up)'));
-        $('#diff-modal').classList.remove('shown');
+        closeModal($('#diff-modal'));
         await loadAll();
         renderGroup(state.active);
     };
@@ -1457,12 +1551,11 @@
         $('#addvar-type').value = 'string';
         $('#addvar-value').value = '';
         syncAddVarValueShape();
-        $('#addvar-modal').classList.add('shown');
-        setTimeout(() => $('#addvar-name').focus(), 50);
+        openModal($('#addvar-modal'), $('#addvar-name'));
     };
 
     const closeAddVarModal = () => {
-        $('#addvar-modal').classList.remove('shown');
+        closeModal($('#addvar-modal'));
     };
 
     const confirmAddVar = async () => {
@@ -1520,7 +1613,7 @@
     };
 
     const init = async () => {
-        $('#diff-cancel').addEventListener('click', () => $('#diff-modal').classList.remove('shown'));
+        $('#diff-cancel').addEventListener('click', () => closeModal($('#diff-modal')));
         $('#diff-confirm').addEventListener('click', confirmDiffSave);
         $('#save-btn').addEventListener('click', openDiffModal);
         $('#addvar-btn').addEventListener('click', openAddVarModal);
@@ -1538,7 +1631,7 @@
             if (e.key === 'Escape') {
                 const open = $$('.modal-bg.shown');
                 if (open.length > 0) {
-                    open[open.length - 1].classList.remove('shown');
+                    closeModal(open[open.length - 1]);
                     e.preventDefault();
                     return;
                 }

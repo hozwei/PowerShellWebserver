@@ -458,7 +458,13 @@ function ConvertTo-PoshLiteral {
     [OutputType([string])]
     param(
         $Value,
-        [Parameter(Mandatory)] [string] $Type
+        [Parameter(Mandatory)] [string] $Type,
+        # Number of spaces the surrounding line is indented. Only relevant
+        # for multi-line literals (keymap) so the nested entries and the
+        # closing brace align with the surrounding hashtable layout.
+        # 0 means "no surrounding indent" (e.g. building a literal for a
+        # standalone assignment).
+        [int] $IndentSpaces = 0
     )
     switch ($Type) {
         'string'       { return "'" + ([string]$Value -replace "'", "''") + "'" }
@@ -487,19 +493,24 @@ function ConvertTo-PoshLiteral {
         'keymap' {
             # label -> key hashtable. Emitted multi-line for readability so
             # `git diff` on config.psd1 shows clean per-row changes when
-            # rotating individual keys.
+            # rotating individual keys. Indent matches the caller-supplied
+            # IndentSpaces (the outer line's indent) so the closing brace
+            # aligns with the key name and nested entries sit one level
+            # deeper.
             if ($null -eq $Value) { return '@{}' }
-            $pairs = @()
             $coerced = if ($Value -is [hashtable]) { $Value } else { @{} }
-            foreach ($k in @($coerced.Keys | Sort-Object)) {
+            if ($coerced.Count -eq 0) { return '@{}' }
+            $outerPad = ' ' * $IndentSpaces
+            $innerPad = ' ' * ($IndentSpaces + 4)
+            $maxLabelLen = (@($coerced.Keys | ForEach-Object { ([string]$_).Length + 2 }) | Measure-Object -Maximum).Maximum
+            $pairs = foreach ($k in @($coerced.Keys | Sort-Object)) {
                 $label = [string]$k
                 $val   = [string]$coerced[$k]
                 $keyQuoted = "'" + ($label -replace "'", "''") + "'"
                 $valQuoted = "'" + ($val -replace "'", "''") + "'"
-                $pairs += ("            {0,-20} = {1}" -f $keyQuoted, $valQuoted)
+                ("{0}{1,-$maxLabelLen} = {2}" -f $innerPad, $keyQuoted, $valQuoted)
             }
-            if ($pairs.Count -eq 0) { return '@{}' }
-            return ("@{`r`n" + ($pairs -join "`r`n") + "`r`n        }")
+            return ("@{`r`n" + ($pairs -join "`r`n") + "`r`n$outerPad}")
         }
         default { throw "Unknown type for serialization: $Type" }
     }
@@ -818,7 +829,6 @@ function Set-PoshConfigKey {
     )
     $s = Get-PoshIoState
     Assert-PoshIoTarget -Path $s.ConfigPsd1
-    $literal = ConvertTo-PoshLiteral -Value $Value -Type $Type
 
     $errs = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseFile($s.ConfigPsd1, [ref]$null, [ref]$errs)
@@ -838,6 +848,21 @@ function Set-PoshConfigKey {
     }
     $extent  = $pair.Item2.Extent
     $content = [System.IO.File]::ReadAllText($s.ConfigPsd1)
+
+    # Detect the indent of the line containing the key so multi-line
+    # literals (keymap) align with the surrounding @{} block instead of
+    # using a hardcoded 12-space indent.
+    $keyStart = $pair.Item1.Extent.StartOffset
+    $indent = 0
+    $scan = $keyStart - 1
+    while ($scan -ge 0 -and $content[$scan] -ne "`n") {
+        if ($content[$scan] -eq ' ') { $indent++ }
+        elseif ($content[$scan] -eq "`t") { $indent += 4 }
+        else { $indent = 0 }  # non-whitespace before newline -> line starts with code, not pure indent
+        $scan--
+    }
+
+    $literal = ConvertTo-PoshLiteral -Value $Value -Type $Type -IndentSpaces $indent
     $newContent = $content.Substring(0, $extent.StartOffset) + $literal + $content.Substring($extent.EndOffset)
 
     if ($PSCmdlet.ShouldProcess($s.ConfigPsd1, "Update '$Key'")) {
@@ -897,10 +922,17 @@ function Save-PoshFieldChanges {
         foreach ($entry in $byFile[$file]) {
             $field   = $entry.Field
             $typed   = ConvertTo-PoshTypedValue -Field $field -RawValue $entry.Value
-            if ($file -eq 'globalvars.ps1') {
-                Set-PoshGlobalvar -Name $field.Name -Value $typed -Type $field.Type
-            } else {
-                Set-PoshConfigKey -Key $field.Name -Value $typed -Type $field.Type
+            try {
+                if ($file -eq 'globalvars.ps1') {
+                    Set-PoshGlobalvar -Name $field.Name -Value $typed -Type $field.Type
+                } else {
+                    Set-PoshConfigKey -Key $field.Name -Value $typed -Type $field.Type
+                }
+            } catch {
+                # Wrap with the file + key so the editor's toast tells the
+                # operator exactly where the save broke instead of just
+                # "Save failed: <inner exception>".
+                throw ("{0}: writing '{1}' failed -> {2}" -f $file, $field.Name, $_.Exception.Message)
             }
         }
     }
