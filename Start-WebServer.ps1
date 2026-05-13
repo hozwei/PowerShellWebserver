@@ -240,6 +240,9 @@ $cfg = @{
         '.posh'  = 'text/html; charset=utf-8'          # raw stdout passed through as HTML
         '.psapi' = 'application/xml; charset=utf-8'    # raw stdout passed through as XML — legacy PoSH 'API' endpoint type
     }
+    PhpCgiEnabled            = $false  # serve .php files via an external PHP CGI binary (path = PhpCgiPath). Off by default.
+    PhpCgiPath               = ''      # absolute path to php-cgi.exe — required when PhpCgiEnabled = $true
+    PhpCgiTimeoutSec         = 60      # max seconds a PHP-CGI process may run before it is killed and HTTP 504 is returned
 }
 
 # StaticRoot fallback — empty string means: reuse WebRoot. Resolved here rather than at
@@ -604,6 +607,20 @@ if ($cfg.AuthMode -ne 'ApiKey') {
         exit 1
     }
     Write-StartupLog "Auth validation OK: AuthMode = '$($cfg.AuthMode)', Basic credentials present."
+}
+
+# ---------------------------------------------------------------------------
+# PHP-CGI validation — when enabled, the binary must exist on disk.
+# ---------------------------------------------------------------------------
+if ($cfg.PhpCgiEnabled) {
+    if ([string]::IsNullOrWhiteSpace($cfg.PhpCgiPath) -or -not (Test-Path -LiteralPath $cfg.PhpCgiPath -PathType Leaf)) {
+        Write-StartupLog "ERROR: PhpCgiEnabled = `$true but PhpCgiPath does not point at an existing file: '$($cfg.PhpCgiPath)'."
+        Write-Output ''
+        Write-Output 'ERROR: PHP-CGI enabled but php-cgi.exe was not found.'
+        Write-Output "Set `$cfg.PhpCgiPath in Start-WebServer.ps1 to an absolute path of php-cgi.exe."
+        exit 1
+    }
+    Write-StartupLog "PHP-CGI validation OK: PhpCgiPath = '$($cfg.PhpCgiPath)'."
 }
 
 # ---------------------------------------------------------------------------
@@ -1366,6 +1383,192 @@ function Invoke-ScriptInProcess {
     }
 }
 
+# ---------------------------------------------------------------------------
+# Invoke-PhpCgi
+# Runs a .php file through an external php-cgi.exe and returns the parsed
+# response so the caller can map it to an HttpListenerResponse.
+#
+# CGI/1.1 contract (simplified):
+#   - Server sets GATEWAY_INTERFACE, REQUEST_METHOD, SCRIPT_FILENAME, QUERY_STRING,
+#     CONTENT_LENGTH, CONTENT_TYPE, HTTP_* (all request headers prefixed with HTTP_,
+#     dashes converted to underscores, uppercased).
+#   - POST body is written to php-cgi's stdin.
+#   - php-cgi writes response headers (one per line) terminated by an empty line,
+#     followed by the response body. We parse the header block, pick out Status,
+#     Content-Type, Location, etc., and forward the body verbatim.
+#
+# Returns PSCustomObject {
+#   StatusCode [int]; ContentType [string]; Headers [hashtable]; Body [byte[]]; TimedOut [bool]; Error [string]
+# }.
+# Caller is responsible for writing headers + body to the HttpListenerResponse.
+# ---------------------------------------------------------------------------
+function Invoke-PhpCgi {
+    param(
+        [System.Net.HttpListenerRequest] $Request,
+        [string]                         $ScriptPath,
+        [int]                            $TimeoutSec
+    )
+
+    if ([string]::IsNullOrEmpty($script:cfg.PhpCgiPath) -or -not (Test-Path -LiteralPath $script:cfg.PhpCgiPath -PathType Leaf)) {
+        return [PSCustomObject]@{
+            StatusCode = 500; ContentType = 'text/plain; charset=utf-8'; Headers = @{}
+            Body = [System.Text.Encoding]::UTF8.GetBytes('PHP-CGI is enabled but php-cgi.exe is not configured correctly.')
+            TimedOut = $false; Error = 'PhpCgiPath misconfigured'
+        }
+    }
+
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName               = $script:cfg.PhpCgiPath
+    $psi.UseShellExecute        = $false
+    $psi.RedirectStandardInput  = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError  = $true
+    $psi.CreateNoWindow         = $true
+    # Working directory = directory of the PHP file. Many PHP apps assume relative includes.
+    try { $psi.WorkingDirectory = [System.IO.Path]::GetDirectoryName($ScriptPath) } catch { }
+
+    # CGI/1.1 environment variables.
+    $psi.Environment['GATEWAY_INTERFACE'] = 'CGI/1.1'
+    $psi.Environment['REDIRECT_STATUS']   = '200'                       # required by PHP since 5.1 — refuses to run as CGI otherwise
+    $psi.Environment['SERVER_PROTOCOL']   = 'HTTP/1.1'
+    $psi.Environment['SERVER_SOFTWARE']   = 'posh-webserver'
+    $psi.Environment['SCRIPT_FILENAME']   = $ScriptPath
+    $psi.Environment['SCRIPT_NAME']       = $Request.Url.AbsolutePath
+    $psi.Environment['REQUEST_URI']       = $Request.Url.PathAndQuery
+    $psi.Environment['REQUEST_METHOD']    = $Request.HttpMethod
+    $psi.Environment['QUERY_STRING']      = if ($Request.Url.Query) { $Request.Url.Query.TrimStart('?') } else { '' }
+    $psi.Environment['REMOTE_ADDR']       = $Request.RemoteEndPoint.Address.ToString()
+    $psi.Environment['REMOTE_PORT']       = [string]$Request.RemoteEndPoint.Port
+    $psi.Environment['SERVER_NAME']       = if ($Request.Url.Host) { $Request.Url.Host } else { 'localhost' }
+    $psi.Environment['SERVER_PORT']       = [string]$Request.Url.Port
+
+    if ($null -ne $Request.ContentLength64 -and $Request.ContentLength64 -ge 0) {
+        $psi.Environment['CONTENT_LENGTH'] = [string]$Request.ContentLength64
+    }
+    if ($Request.ContentType) {
+        $psi.Environment['CONTENT_TYPE'] = $Request.ContentType
+    }
+
+    foreach ($h in $Request.Headers.AllKeys) {
+        if ([string]::IsNullOrEmpty($h)) { continue }
+        $envName = 'HTTP_' + $h.ToUpperInvariant().Replace('-', '_')
+        $psi.Environment[$envName] = $Request.Headers[$h]
+    }
+
+    $proc = [System.Diagnostics.Process]::new()
+    $proc.StartInfo = $psi
+    $null = $proc.Start()
+
+    # Pipe the request body to php-cgi's stdin — must be raw bytes (not the parsed body).
+    try {
+        if ($Request.HasEntityBody) {
+            $buffer = [byte[]]::new(65536)
+            $stdin  = $proc.StandardInput.BaseStream
+            while ($true) {
+                $read = $Request.InputStream.Read($buffer, 0, $buffer.Length)
+                if ($read -le 0) { break }
+                $stdin.Write($buffer, 0, $read)
+            }
+            $stdin.Flush()
+        }
+    } catch { } finally {
+        try { $proc.StandardInput.Close() } catch { }
+    }
+
+    # Read php-cgi output as bytes — we need the raw stdout so we can split the header
+    # block (text) from the body (potentially binary, e.g. PHP-generated images).
+    # CopyToAsync runs concurrently with the process; the awaited Task completes once
+    # the stream reaches EOF, which happens when php-cgi exits.
+    $outMs   = [System.IO.MemoryStream]::new()
+    $errMs   = [System.IO.MemoryStream]::new()
+    $copyOut = $proc.StandardOutput.BaseStream.CopyToAsync($outMs)
+    $copyErr = $proc.StandardError.BaseStream.CopyToAsync($errMs)
+
+    $finished = $proc.WaitForExit($TimeoutSec * 1000)
+    if (-not $finished) {
+        try { $proc.Kill() } catch { }
+        $proc.Dispose()
+        return [PSCustomObject]@{
+            StatusCode = 504; ContentType = 'text/plain; charset=utf-8'; Headers = @{}
+            Body = [System.Text.Encoding]::UTF8.GetBytes("PHP-CGI timeout after $TimeoutSec seconds.")
+            TimedOut = $true; Error = "PHP-CGI timeout after $TimeoutSec seconds"
+        }
+    }
+
+    $null = $proc.WaitForExit(5000)
+    $null = [System.Threading.Tasks.Task]::WaitAll(@($copyOut, $copyErr), 5000)
+    $exitCode = $proc.ExitCode
+    $proc.Dispose()
+
+    $outBytes = $outMs.ToArray()
+    $errBytes = $errMs.ToArray()
+    $outMs.Dispose(); $errMs.Dispose()
+
+    # Header / body split. CGI uses '\r\n\r\n' but Unix-style '\n\n' is also seen.
+    $sepIx = -1
+    $sepLen = 0
+    for ($i = 0; $i -lt ($outBytes.Length - 3); $i++) {
+        if ($outBytes[$i] -eq 0x0D -and $outBytes[$i + 1] -eq 0x0A -and $outBytes[$i + 2] -eq 0x0D -and $outBytes[$i + 3] -eq 0x0A) {
+            $sepIx = $i; $sepLen = 4; break
+        }
+    }
+    if ($sepIx -lt 0) {
+        for ($i = 0; $i -lt ($outBytes.Length - 1); $i++) {
+            if ($outBytes[$i] -eq 0x0A -and $outBytes[$i + 1] -eq 0x0A) {
+                $sepIx = $i; $sepLen = 2; break
+            }
+        }
+    }
+
+    $statusCode  = 200
+    $contentType = 'text/html; charset=utf-8'
+    $headers     = @{}
+    $bodyBytes   = $outBytes
+
+    if ($sepIx -ge 0) {
+        $headerText = [System.Text.Encoding]::UTF8.GetString($outBytes, 0, $sepIx)
+        $bodyOffset = $sepIx + $sepLen
+        $bodyLen    = $outBytes.Length - $bodyOffset
+        $bodyBytes  = [byte[]]::new([math]::Max(0, $bodyLen))
+        if ($bodyLen -gt 0) { [Array]::Copy($outBytes, $bodyOffset, $bodyBytes, 0, $bodyLen) }
+
+        foreach ($line in $headerText -split "(`r`n|`n)") {
+            $line = $line.Trim()
+            if ([string]::IsNullOrEmpty($line)) { continue }
+            $colon = $line.IndexOf(':')
+            if ($colon -lt 1) { continue }
+            $name  = $line.Substring(0, $colon).Trim()
+            $value = $line.Substring($colon + 1).Trim()
+
+            if ([string]::Equals($name, 'Status', [System.StringComparison]::OrdinalIgnoreCase)) {
+                # 'Status: 302 Found' → 302
+                $code = ($value -split ' ', 2)[0]
+                try { $statusCode = [int]$code } catch { }
+            } elseif ([string]::Equals($name, 'Content-Type', [System.StringComparison]::OrdinalIgnoreCase)) {
+                $contentType = $value
+            } else {
+                $headers[$name] = $value
+            }
+        }
+        # PHP 'Location:' without an explicit Status defaults to 302.
+        if ($headers.ContainsKey('Location') -and -not ($headerText -match '(?im)^\s*Status\s*:')) {
+            $statusCode = 302
+        }
+    }
+
+    $errText = if ($errBytes.Length -gt 0) { [System.Text.Encoding]::UTF8.GetString($errBytes) } else { '' }
+
+    return [PSCustomObject]@{
+        StatusCode  = $statusCode
+        ContentType = $contentType
+        Headers     = $headers
+        Body        = $bodyBytes
+        TimedOut    = $false
+        Error       = $errText
+        ExitCode    = $exitCode
+    }
+}
+
 function Invoke-Script {
     param(
         [string]    $ScriptPath,
@@ -1611,6 +1814,7 @@ $shared = @{
     FnIsScriptPath   = ${function:Test-IsScriptPath}
     FnScriptCT       = ${function:Get-ScriptContentType}
     FnInvScriptIP    = ${function:Invoke-ScriptInProcess}
+    FnInvPhpCgi      = ${function:Invoke-PhpCgi}
 }
 
 # ---------------------------------------------------------------------------
@@ -1644,6 +1848,7 @@ $requestHandler = {
     ${function:Test-IsScriptPath} = $shared.FnIsScriptPath
     ${function:Get-ScriptContentType} = $shared.FnScriptCT
     ${function:Invoke-ScriptInProcess} = $shared.FnInvScriptIP
+    ${function:Invoke-PhpCgi}    = $shared.FnInvPhpCgi
     $script:cfg              = $shared.Cfg
 
     # Live .NET objects were injected via InitialSessionState.Variables — plain names.
@@ -1868,6 +2073,67 @@ $requestHandler = {
             } | ConvertTo-Json -Compress
             Send-Response -Response $resp -StatusCode 200 -Body $body -RequestId $requestId
             Write-Log -ClientIP $clientIP -Request $requestLine -Status 'METRICS' -ExitCode '-' -RequestId $requestId
+            return
+        }
+
+        # --------------------------------------------------------------
+        # PHP-CGI branch (opt-in via PhpCgiEnabled).
+        # Routes URLs ending in .php to an external php-cgi.exe with the standard
+        # CGI/1.1 environment. POST bodies are streamed to PHP's stdin.
+        # Security: legacy PoSH refused PHP scripts under \Windows\ — kept here.
+        # --------------------------------------------------------------
+        if ($script:cfg.PhpCgiEnabled -and $urlPath.EndsWith('.php', [System.StringComparison]::OrdinalIgnoreCase)) {
+
+            if ($req.HttpMethod -ne 'GET' -and $req.HttpMethod -ne 'POST') {
+                $body = New-JsonResponse -ExitCode 405 -Output '' -Err 'PHP-CGI handlers accept only GET and POST.'
+                $resp.AddHeader('Allow', 'GET, POST')
+                Send-Response -Response $resp -StatusCode 405 -Body $body -RequestId $requestId
+                Write-Log -ClientIP $clientIP -Request $requestLine -Status 'METHOD NOT ALLOWED' -ExitCode '-' -RequestId $requestId
+                return
+            }
+
+            # Path-traversal — rooted at WebRoot (PHP shares the webroot with .ps1 endpoints).
+            $phpRel  = $urlPath.TrimStart('/').Replace('/', '\')
+            $phpFull = [System.IO.Path]::GetFullPath((Join-Path $script:cfg.WebRoot $phpRel))
+            $rootFull = [System.IO.Path]::GetFullPath($script:cfg.WebRoot)
+            if (-not ($phpFull -eq $rootFull -or $phpFull.StartsWith($rootFull + '\', [System.StringComparison]::OrdinalIgnoreCase))) {
+                $body = New-JsonResponse -ExitCode 403 -Output '' -Err 'Access denied.'
+                Send-Response -Response $resp -StatusCode 403 -Body $body -RequestId $requestId
+                Write-Log -ClientIP $clientIP -Request $requestLine -Status 'FORBIDDEN' -ExitCode '-' -RequestId $requestId
+                return
+            }
+
+            # Defense in depth: never execute PHP files that resolve under the Windows folder —
+            # this is the same hardening the legacy PoSH Server applied.
+            if ($phpFull -match '(?i)\\Windows\\') {
+                $body = New-JsonResponse -ExitCode 403 -Output '' -Err 'Access denied.'
+                Send-Response -Response $resp -StatusCode 403 -Body $body -RequestId $requestId
+                Write-Log -ClientIP $clientIP -Request $requestLine -Status 'FORBIDDEN' -ExitCode '-' -RequestId $requestId
+                return
+            }
+
+            if (-not (Test-Path -LiteralPath $phpFull -PathType Leaf)) {
+                $body = New-JsonResponse -ExitCode 404 -Output '' -Err "Script not found: $urlPath"
+                Send-Response -Response $resp -StatusCode 404 -Body $body -RequestId $requestId
+                Write-Log -ClientIP $clientIP -Request $requestLine -Status 'NOT FOUND' -ExitCode '-' -RequestId $requestId
+                return
+            }
+
+            $phpRes = Invoke-PhpCgi -Request $req -ScriptPath $phpFull -TimeoutSec $script:cfg.PhpCgiTimeoutSec
+            $null = [System.Threading.Interlocked]::Increment($requestsTotal)
+
+            $resp.StatusCode      = $phpRes.StatusCode
+            $resp.ContentType     = $phpRes.ContentType
+            $resp.ContentLength64 = $phpRes.Body.Length
+            foreach ($hk in $phpRes.Headers.Keys) {
+                try { $resp.AddHeader($hk, [string]$phpRes.Headers[$hk]) } catch { }
+            }
+            if ($requestId) { $resp.AddHeader('X-Request-Id', $requestId) }
+            try { $resp.OutputStream.Write($phpRes.Body, 0, $phpRes.Body.Length) } catch { }
+            try { $resp.OutputStream.Close() } catch { }
+
+            $statusText = if ($phpRes.TimedOut) { 'TIMEOUT' } elseif ($phpRes.StatusCode -ge 400) { 'ERROR' } else { 'OK PHP' }
+            Write-Log -ClientIP $clientIP -Request $requestLine -Status $statusText -ExitCode "$($phpRes.StatusCode)" -RequestId $requestId
             return
         }
 

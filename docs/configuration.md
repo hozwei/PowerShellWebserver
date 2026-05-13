@@ -61,6 +61,9 @@ $cfg = @{
     ExecutionMode            = 'Subprocess'
     InjectContextVars        = $false
     ScriptExtensionMap       = @{ '.ps1' = ''; '.psxml' = 'text/xml; charset=utf-8'; '.posh' = 'text/html; charset=utf-8'; '.psapi' = 'application/xml; charset=utf-8' }
+    PhpCgiEnabled            = $false
+    PhpCgiPath               = ''
+    PhpCgiTimeoutSec         = 60
 }
 ```
 
@@ -117,6 +120,9 @@ $cfg = @{
     BasicAuthRealm           = 'posh-admin'
     ExecutionMode            = 'InProcess'             # faster, less isolation — see PR-5 notes
     InjectContextVars        = $true                   # expose $PoSHQuery / $PoSHPost / $PoSHCookies / $PoSHHeaders to scripts
+    PhpCgiEnabled            = $true
+    PhpCgiPath               = 'C:\Program Files\PHP\v8.3\php-cgi.exe'
+    PhpCgiTimeoutSec         = 30
 }
 ```
 
@@ -205,6 +211,9 @@ These are passed on the command line when starting the server. `Register-Schedul
 | `ExecutionMode` | `string` | `'Subprocess'` | How webroot scripts are executed. `'Subprocess'` (default): each request spawns a new `pwsh.exe` process — slow startup but reliable exit codes (`exit 0` / `exit 1`) and hard timeout enforcement via `Process.Kill()`. `'InProcess'`: each request runs in a fresh runspace within the server process — ~400 ms faster but exit codes are best-effort (any error → `exitCode=1`), `Runspace.Stop()` may not interrupt native long-running calls immediately, and module state can leak between scripts. Default keeps the existing semantics. |
 | `InjectContextVars` | `bool` | `$false` | When `ExecutionMode = 'InProcess'`, expose `$PoSHQuery`, `$PoSHPost`, `$PoSHCookies`, `$PoSHHeaders` as variables in the script's runspace — legacy PoSH Server compatibility. Ignored when `ExecutionMode = 'Subprocess'`. |
 | `ScriptExtensionMap` | `hashtable` | `{ '.ps1' = ''; '.psxml' = 'text/xml; charset=utf-8'; '.posh' = 'text/html; charset=utf-8'; '.psapi' = 'application/xml; charset=utf-8' }` | File extensions that the server treats as executable webroot scripts, mapped to the Content-Type used for the response. Empty string = use the JSON envelope `{ exitCode, output, error }` (default for `.ps1`); a non-empty value means the script's stdout is passed through verbatim with that Content-Type. Add custom extensions by extending the hashtable. |
+| `PhpCgiEnabled` | `bool` | `$false` | Route `.php` URLs through an external `php-cgi.exe`. When enabled, `PhpCgiPath` must point at the binary. The server constructs the standard CGI/1.1 environment (`REQUEST_METHOD`, `SCRIPT_FILENAME`, `QUERY_STRING`, `HTTP_*`, …), streams POST bodies to PHP's stdin, parses the `Status:` / `Content-Type:` / `Location:` headers from PHP's stdout, and forwards the body as-is. PHP files resolving under `\Windows\` are refused (legacy PoSH hardening). |
+| `PhpCgiPath` | `string` | `''` | Absolute path to `php-cgi.exe`. Validated at startup when `PhpCgiEnabled = $true`. |
+| `PhpCgiTimeoutSec` | `integer` | `60` | Max seconds a PHP-CGI process may run. Long-running PHP scripts are killed and the caller receives HTTP 504 (analogous to `ScriptTimeoutSec` for `.ps1`). |
 
 ### Register-ScheduledTask.ps1 — Scheduled Task Options
 
