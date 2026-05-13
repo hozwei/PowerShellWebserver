@@ -4997,14 +4997,22 @@ try {
     # state during forced shutdown (e.g. taskkill, session end) must never
     # prevent the remaining cleanup steps from running.
     try { Write-StartupLog 'Shutdown initiated — waiting for in-flight requests (max. 5s)...' } catch { }
-    try { if ($listener.IsListening) { $listener.Stop() } } catch { }
+    # Critical-path failures (listener stop, runspace-pool close, bg-job stop)
+    # are surfaced via Write-StartupLog so operators can diagnose stuck-process
+    # exits. Disposal failures further down stay silent because by then the
+    # process is going away regardless.
+    try { if ($listener.IsListening) { $listener.Stop() } } catch {
+        try { Write-StartupLog "WARN: listener.Stop() threw during shutdown: $($_.Exception.Message)" } catch { }
+    }
     try { Start-Sleep -Seconds 5                          } catch { }
     try { $listener.Close()                               } catch { }
     # Stop background jobs — their script blocks loop forever, so Stop() is the only way out.
     try {
         if ($null -ne $bgJobInstances) {
             foreach ($bg in $bgJobInstances) {
-                try { $bg.Ps.Stop()        } catch { }
+                try { $bg.Ps.Stop() } catch {
+                    try { Write-StartupLog "WARN: bg-job '$($bg.Path)' Stop() threw: $($_.Exception.Message)" } catch { }
+                }
                 try { $bg.Ps.Dispose()     } catch { }
                 try { $bg.Rs.Dispose()     } catch { }
             }
@@ -5019,7 +5027,9 @@ try {
             }
         }
     } catch { }
-    try { $runspacePool.Close()                           } catch { }
+    try { $runspacePool.Close() } catch {
+        try { Write-StartupLog "WARN: runspacePool.Close() threw during shutdown: $($_.Exception.Message)" } catch { }
+    }
     try { $runspacePool.Dispose()                         } catch { }
     try { $semaphore.Dispose()                            } catch { }
     try { $script:logMutex.Dispose()                      } catch { }
