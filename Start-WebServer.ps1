@@ -1684,20 +1684,35 @@ function Get-RouteTable {
             return $false
         } |
         ForEach-Object {
-            $rel  = '/' + $_.FullName.Substring($script:cfg.WebRoot.Length).TrimStart('\').Replace('\','/')
+            $rel    = '/' + $_.FullName.Substring($script:cfg.WebRoot.Length).TrimStart('\').Replace('\','/')
+            $relExt = $_.Extension                                                # '.ps1', '.psxml', …
+            $relNoExt = $rel.Substring(0, $rel.Length - $relExt.Length)           # path without trailing '.ps1'
             $names    = [System.Collections.Generic.List[string]]::new()
-            # Escape literal regex chars first, then turn each escaped \[name\] into a named
+
+            # Escape literal regex chars first, then turn each escaped \[name] into a named
             # group (?<name>[^/]+) that captures one path segment.
-            $escaped = [regex]::Escape($rel)
-            $pattern = [regex]::Replace($escaped, '\\\[([^\[\]]+)\\\]', {
+            # IMPORTANT: [regex]::Escape escapes the opening '[' (special inside a char class)
+            # but NOT the closing ']' (literal outside a class) — so the replace pattern
+            # matches '\[name]', not '\[name\]'. Without this, placeholders never capture
+            # and every placeholder route literally matches its filename in the URL.
+            $escapedNoExt = [regex]::Escape($relNoExt)
+            # Non-greedy '[^/]+?' so '/users/42.ps1' captures id=42 (not '42.ps1') —
+            # the optional extension group on the outside consumes the trailing '.ps1'.
+            $patternNoExt = [regex]::Replace($escapedNoExt, '\\\[([^\[\]]+)\]', {
                 param($m)
                 $nm = $m.Groups[1].Value
                 $null = $names.Add($nm)
-                "(?<$nm>[^/]+)"
+                "(?<$nm>[^/]+?)"
             })
+
+            # The route regex matches the URL path WITH or WITHOUT the trailing script
+            # extension — `/users/123` and `/users/123.ps1` both resolve to the same
+            # webroot/users/[id].ps1 file. Without the optional extension group, a
+            # REST-style request that omits the extension would 404.
+            $escapedExt = [regex]::Escape($relExt)
             $entries += [PSCustomObject]@{
                 Pattern          = $rel
-                Regex            = '^' + $pattern + '$'
+                Regex            = '^' + $patternNoExt + '(?:' + $escapedExt + ')?$'
                 ScriptPath       = $_.FullName
                 PlaceholderNames = $names.ToArray()
             }
