@@ -245,6 +245,32 @@
             Validator = '^[\w\s\-\.]+$|^$'
         }
         @{
+            Name      = 'HstsEnabled'
+            File      = 'config.psd1'
+            Group     = 'auth'
+            Type      = 'bool'
+            Label     = 'HstsEnabled'
+            Help      = "Emit Strict-Transport-Security on HTTPS responses. WARNING: browsers cache the policy for HstsMaxAgeSec -- they cannot downgrade to HTTP until expiry. Only enable once HTTPS is verified working."
+        }
+        @{
+            Name      = 'HstsMaxAgeSec'
+            File      = 'config.psd1'
+            Group     = 'auth'
+            Type      = 'int'
+            Label     = 'HstsMaxAgeSec'
+            Help      = "HSTS max-age in seconds. 31536000 (1 year) is the HSTS preload baseline. Only consulted when HstsEnabled = true."
+            Min       = 0
+            Max       = 63072000
+        }
+        @{
+            Name      = 'HstsIncludeSubdomains'
+            File      = 'config.psd1'
+            Group     = 'auth'
+            Type      = 'bool'
+            Label     = 'HstsIncludeSubdomains'
+            Help      = "Add 'includeSubDomains' directive. Only safe when EVERY subdomain serves HTTPS (the policy locks the whole zone)."
+        }
+        @{
             Name      = 'ApiKeys'
             File      = 'config.psd1'
             Group     = 'auth'
@@ -271,6 +297,16 @@
             Help      = "RunspacePool max size = MaxConcurrent x this. Needs >= 2 to absorb the gap between semaphore.Release() and Dispose() under burst; raise for slow-request profiles. 1 = no headroom (risk of dispatch hang)."
             Min       = 1
             Max       = 16
+        }
+        @{
+            Name      = 'RunspacePoolMinSize'
+            File      = 'config.psd1'
+            Group     = 'auth'
+            Type      = 'int'
+            Label     = 'RunspacePoolMinSize'
+            Help      = "Minimum runspaces kept alive in the pool. Raise to MaxConcurrent for cold-start-sensitive deployments (avoids ~150ms warm-up on the first N requests). Default 1 = lazy."
+            Min       = 1
+            Max       = 10000
         }
         @{
             Name      = 'ScriptTimeoutSec'
@@ -662,6 +698,16 @@
             Type      = 'bool'
             Label     = 'StaticCacheHeaders'
             Help      = "Emit ETag + Last-Modified on static responses and honour If-None-Match / If-Modified-Since (HTTP 304)."
+        }
+        @{
+            Name      = 'StaticCacheMaxAgeSec'
+            File      = 'config.psd1'
+            Group     = 'static'
+            Type      = 'int'
+            Label     = 'StaticCacheMaxAgeSec'
+            Help      = "When > 0, emit Cache-Control: max-age=N on static responses. Common: 3600 (1h), 86400 (1d). 0 = no Cache-Control (validators only)."
+            Min       = 0
+            Max       = 31536000
         }
         @{
             Name      = 'BlockedMimeTypes'
