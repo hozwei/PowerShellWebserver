@@ -148,6 +148,7 @@ $cfg = @{
     BlockedIPs               = @()    # IP blocklist — always rejected before AllowedIPs check (except /health); empty = no blocks
     GzipEnabled              = $true  # GZIP response compression — only applied when client sent Accept-Encoding: gzip AND body >= GzipMinBytes AND Content-Type matches GzipMimeTypes
     GzipMinBytes             = 1024   # responses smaller than this byte count are never compressed (compression overhead exceeds savings)
+    GzipMaxBytes             = 10MB   # responses larger than this are streamed uncompressed instead of buffered in memory for gzip — guards against OOM on big text payloads
     GzipMimeTypes            = @(     # response Content-Types eligible for compression — checked via StartsWith, so 'application/json' covers 'application/json; charset=utf-8'
         'application/json',
         'application/xml',
@@ -1221,7 +1222,10 @@ function Send-StaticFile {
     # the issue and matches the behavior of most production servers.
     $compressBody = $null
     $useGzip      = $false
-    if (-not $isRange -and $script:cfg.GzipEnabled -and $contentLength -ge $script:cfg.GzipMinBytes) {
+    if (-not $isRange -and
+        $script:cfg.GzipEnabled -and
+        $contentLength -ge $script:cfg.GzipMinBytes -and
+        $contentLength -le $script:cfg.GzipMaxBytes) {
         $accept = $Request.Headers['Accept-Encoding']
         if ($accept -and $accept.IndexOf('gzip', [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
             foreach ($prefix in $script:cfg.GzipMimeTypes) {
