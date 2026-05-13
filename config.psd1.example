@@ -1,0 +1,62 @@
+# Example external configuration file for posh.
+#
+# Copy or rename this file to 'config.psd1' next to Start-WebServer.ps1
+# (default location: C:\posh\config.psd1) to have its hashtable entries
+# OVERRIDE the inline $cfg defaults at startup.
+#
+# Alternatively, pass an explicit path to Start-WebServer.ps1:
+#   .\Start-WebServer.ps1 -ConfigFile 'D:\posh\my-config.psd1'
+#
+# Import-PowerShellDataFile parses only static data — no script execution,
+# so this file is safe to keep in version control (as long as it contains
+# no secrets).
+#
+# All keys are OPTIONAL — anything not listed here keeps its inline default
+# from Start-WebServer.ps1. See docs/configuration.md for the full key list.
+
+@{
+    # -- Networking ----------------------------------------------------------
+    # HttpPort  = 8080                  # change the HTTP listen port
+    # HttpsPort = 8443
+    # Prefixes  = @(                    # explicit prefix list overrides the '+' wildcard
+    #     'https://api.internal.example.com:443/'
+    #     'https://localhost:443/'
+    # )
+
+    # -- Authentication ------------------------------------------------------
+    # ApiKeys = @{
+    #     'ci-pipeline' = 'replace-with-real-key-1'
+    #     'monitoring'  = 'replace-with-real-key-2'
+    #     'manual-ops'  = 'replace-with-real-key-3'
+    # }
+
+    # -- Rate limiting -------------------------------------------------------
+    # RateLimitRequests     = 50
+    # RateLimitWindowSec    = 60
+    # RateLimitPenaltySec   = 300        # 5-minute penalty (default 1800 = 30 min)
+    # RateLimitPerIdentity  = $true      # quota per API-key label instead of per client-IP
+
+    # -- Logging / observability --------------------------------------------
+    # LogSchedule            = 'Hourly'  # 'Daily' (default) or 'Hourly'
+    # LogFormat              = 'IIS-W3C' # 'Native' (default) or 'IIS-W3C'
+    # LogIntegrityHash       = $true     # write <logfile>.md5 next to each completed file
+    # AuditLogEnabled        = $true     # log AUTH_FAIL / IP_BLOCKED / RATE_LIMITED as NDJSON
+    # SlowRequestThresholdMs = 5000      # log requests >= 5s into slow.log
+
+    # -- Compression --------------------------------------------------------
+    # BrotliEnabled = $true              # Brotli alongside GZIP (default $true)
+    # GzipEnabled   = $true
+    # GzipMaxBytes  = 10MB
+
+    # -- Static serving / directory browsing --------------------------------
+    # StaticServingEnabled = $true
+    # StaticRoot           = 'D:\automation\posh\public'
+    # DirectoryBrowsing    = $false
+
+    # -- Routing ------------------------------------------------------------
+    # PathPlaceholders = $true           # enable webroot/users/[id].ps1 style routes
+
+    # -- IP filter (exact / CIDR / ~regex) ----------------------------------
+    # AllowedIPs = @('10.0.0.0/8', '~^192\.168\.')
+    # BlockedIPs = @('1.2.3.4')
+}

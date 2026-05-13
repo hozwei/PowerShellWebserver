@@ -1,10 +1,38 @@
 # Configuration
 
-## Configuration File
+## Configuration Sources
 
-There is no external configuration file. All configuration is defined inline in `Start-WebServer.ps1` as the `$cfg` hashtable and the `$baseDir` variable. To change any setting, edit the file directly.
+posh resolves its configuration from two sources, in order:
 
-**File location:** `C:\posh\Start-WebServer.ps1`
+1. **Inline defaults** in the `$cfg` hashtable inside `Start-WebServer.ps1` (this file is your source of truth for the full key list).
+2. **External `.psd1` file** (optional) — overrides any keys you set.
+
+### External Config File (PSD1)
+
+If a `config.psd1` is present next to `Start-WebServer.ps1` (default path: `C:\posh\config.psd1`), every key in the file's hashtable overrides the inline default for that key. Anything not listed keeps its default.
+
+```powershell
+# C:\posh\config.psd1
+@{
+    HttpPort               = 18080
+    LogRetentionDays       = 7
+    RateLimitPerIdentity   = $true
+    AuditLogEnabled        = $true
+    SlowRequestThresholdMs = 5000
+}
+```
+
+Override the path with the `-ConfigFile` parameter on the script:
+
+```powershell
+.\Start-WebServer.ps1 -ConfigFile 'D:\posh\custom.psd1'
+```
+
+`Import-PowerShellDataFile` parses only static data — no script execution, no `Invoke-Expression`. A syntactically broken `.psd1` causes a hard startup failure with a clear error message.
+
+A documented sample lives at `config.psd1.example` in the repository root.
+
+**Inline file location:** `C:\posh\Start-WebServer.ps1`
 
 **Minimal example (defaults as shipped):**
 
@@ -175,6 +203,7 @@ These are passed on the command line when starting the server. `Register-Schedul
 | `-HttpsEnabled` | `switch` | off | Enables HTTPS. Requires a valid `netsh http sslcert` binding for `-HttpsPort`. The server exits with an error if HTTPS is enabled but no binding exists. |
 | `-HttpPort` | `int` | `80` | HTTP listen port. Set to `0` to disable HTTP entirely (HTTPS-only mode). |
 | `-HttpsPort` | `int` | `443` | HTTPS listen port. Only evaluated when `-HttpsEnabled` is set. |
+| `-ConfigFile` | `string` | `''` (auto = `<baseDir>\config.psd1`) | Absolute path to an external PSD1 config file whose hashtable entries override the inline `$cfg` defaults. When empty, the standard path `<baseDir>\config.psd1` is auto-discovered. A malformed file aborts startup with a clear error. |
 
 ### Start-WebServer.ps1 — $cfg Hashtable
 

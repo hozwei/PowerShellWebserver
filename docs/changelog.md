@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Added (post-parity feature wave)
+- **External configuration file (`config.psd1`)** — opt-in override for the inline `$cfg` defaults. Default path: `<baseDir>\config.psd1`; override via the new `-ConfigFile` script parameter. Values from the file override defaults; missing keys keep their default. `Import-PowerShellDataFile` parses only static data (no script execution). Malformed files abort startup with a clear message. A documented sample lives at `config.psd1.example` in the repo root.
+
 ### Fixed (post-feature review pass)
 - **Auth bypass via case-insensitive credential comparison** — PowerShell's `-eq` is case-insensitive on strings. Both the `X-Api-Key` check and Basic-Auth username/password used `-eq`, so a configured key `Abc123` also accepted `aBC123`. Switched all three checks to `[string]::Equals` with `StringComparison.Ordinal`. Effective keyspace restored to byte-exact.
 - **Byte-range suffix `bytes=-N` returned wrong content** — `Send-StaticFile`'s range parser had unreachable suffix-range branch; `bytes=-100` was served as `bytes=0-100` (first 101 bytes) instead of the last 100. Rewritten as explicit if/else.

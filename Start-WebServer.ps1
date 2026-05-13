@@ -50,7 +50,10 @@ param(
     [ValidateRange(0, 65535)]
     [int]    $HttpPort  = 80,
     [ValidateRange(1, 65535)]
-    [int]    $HttpsPort = 443
+    [int]    $HttpsPort = 443,
+    # Optional path to a .psd1 file whose hashtable entries override the inline $cfg
+    # defaults. When empty, '<baseDir>\config.psd1' is auto-discovered if present.
+    [string] $ConfigFile = ''
 )
 
 # ---------------------------------------------------------------------------
@@ -251,6 +254,43 @@ $cfg = @{
     JobsLogFile              = ''      # absolute path to the jobs log file; empty = '<LogDir>\jobs.log'
     DirectoryBrowsing        = $false  # render an HTML index listing when a static directory has no DefaultDocuments match. Requires StaticServingEnabled.
     DirectoryBrowsingHidden  = @('_error', '.git', '.gitignore') # entries hidden from the directory listing (case-insensitive match on file/folder name)
+}
+
+# ---------------------------------------------------------------------------
+# External configuration file (PSD1) — applied BEFORE derived-field fallbacks
+# so values overridden in the file (e.g. WebRoot, LogDir) flow through into
+# StaticRoot / ErrorPagesRoot / JobsLogFile defaults correctly.
+#
+# Standard path: '<baseDir>\config.psd1'. Override via the -ConfigFile script
+# parameter. Import-PowerShellDataFile only parses static data — no script
+# execution, safer than dot-sourcing or Invoke-Expression.
+#
+# A malformed psd1 hard-exits so misconfigurations surface immediately at
+# startup instead of producing subtle later failures.
+# ---------------------------------------------------------------------------
+$resolvedConfigFile = if (-not [string]::IsNullOrEmpty($ConfigFile)) { $ConfigFile } else { Join-Path $baseDir 'config.psd1' }
+if (Test-Path -LiteralPath $resolvedConfigFile -PathType Leaf) {
+    $external = $null
+    try {
+        $external = Import-PowerShellDataFile -LiteralPath $resolvedConfigFile
+    } catch {
+        $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | STARTUP | ERROR: External config '$resolvedConfigFile' could not be parsed: $_"
+        try {
+            if (-not (Test-Path $baseDir)) { $null = New-Item -ItemType Directory -Path $baseDir -Force }
+            [System.IO.File]::AppendAllText((Join-Path $baseDir 'logs\startup.log'), $line + [System.Environment]::NewLine, [System.Text.Encoding]::UTF8)
+        } catch { }
+        Write-Output $line
+        Write-Output ''
+        Write-Output "ERROR: External config '$resolvedConfigFile' is not a valid PowerShell data file."
+        Write-Output 'Inspect the file and ensure it contains only a single hashtable: @{ Key = Value; ... }'
+        exit 1
+    }
+    if ($null -ne $external) {
+        foreach ($k in $external.Keys) { $cfg[$k] = $external[$k] }
+        # Stash the success line for Write-StartupLog further down (Write-StartupLog
+        # is not defined yet at this point; we want this in startup.log, not just Write-Output).
+        $script:externalConfigStartupNote = "External config loaded: $resolvedConfigFile ($($external.Count) key(s) overridden)"
+    }
 }
 
 # CustomErrorPages root fallback — empty string means '<WebRoot>\_error'. Resolved here so the
@@ -596,6 +636,12 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 # Silent fallback to HTTP would be dangerous — unencrypted communication
 # would occur without notice.
 # ---------------------------------------------------------------------------
+
+# Surface the external-config-loaded message now that Write-StartupLog is available.
+if (-not [string]::IsNullOrEmpty($script:externalConfigStartupNote)) {
+    Write-StartupLog $script:externalConfigStartupNote
+}
+
 if ($cfg.HttpsEnabled) {
     $netshOut = netsh http show sslcert "ipport=0.0.0.0:$($cfg.HttpsPort)" 2>&1
     if ($LASTEXITCODE -ne 0 -or ($netshOut -join '') -notmatch 'IP:Port') {
