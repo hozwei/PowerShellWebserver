@@ -261,6 +261,7 @@ $cfg = @{
     AuditLogFile             = ''      # absolute path to audit.log; empty = '<LogDir>\audit.log'
     SlowRequestThresholdMs   = 0       # F6: requests >= this many ms (after Invoke-Script returns) get an extra line in SlowLogFile. 0 = disabled.
     SlowLogFile              = ''      # absolute path to slow.log; empty = '<LogDir>\slow.log'
+    IndexShowMetadata        = $true   # F7: GET / returns enriched objects with synopsis + parameters parsed from each script's AST. Set $false to revert to the flat path list.
 }
 
 # ---------------------------------------------------------------------------
@@ -348,6 +349,11 @@ $script:rateLimitedTotal = [ref] 0L
 # Per-IP rate limit state — ConcurrentDictionary for lock-free access from RunspacePool Runspaces.
 # Key: client IP string. Value: PSCustomObject { Count [ref]; WindowStart [datetime]; PenaltyUntil [datetime] }.
 $script:rateLimitTable = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
+
+# F7: per-script metadata cache populated lazily by Get-ScriptMetadata.
+# Key: absolute script path. Value: PSCustomObject { Mtime [long]; Metadata [hashtable] }.
+# Mtime-keyed invalidation re-parses a file when its LastWriteTimeUtc changes.
+$script:metadataCache = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
 
 # Mutex serializes concurrent write access to the log file.
 # Global\ makes the mutex unique across process boundaries.
@@ -2153,31 +2159,126 @@ function Invoke-Script {
     }
 }
 
+# ---------------------------------------------------------------------------
+# Get-ScriptMetadata (F7)
+# AST-parses a webroot script and returns its declared parameters plus the
+# comment-based help block (.SYNOPSIS / .DESCRIPTION / .PARAMETER). Cached by
+# absolute path; entries invalidated when LastWriteTimeUtc changes so a script
+# edit shows up at the next request without restart.
+#
+# Returns [ordered] @{ synopsis; description; parameters = @[ @{ name; type; default; description } ] }
+# or $null on a parse error / missing file.
+# ---------------------------------------------------------------------------
+function Get-ScriptMetadata {
+    param([string] $ScriptPath)
+
+    $fi = [System.IO.FileInfo]::new($ScriptPath)
+    if (-not $fi.Exists) { return $null }
+    $currentMtime = $fi.LastWriteTimeUtc.Ticks
+
+    $cachedEntry = $null
+    if ($script:metadataCache.TryGetValue($ScriptPath, [ref]$cachedEntry) -and $cachedEntry.Mtime -eq $currentMtime) {
+        return $cachedEntry.Metadata
+    }
+
+    $errors = $null
+    $ast    = $null
+    try {
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($ScriptPath, [ref]$null, [ref]$errors)
+    } catch {
+        return $null
+    }
+    if ($null -eq $ast) { return $null }
+
+    $synopsis    = ''
+    $description = ''
+    $paramHelp   = @{}
+    try {
+        $helpComment = $ast.GetHelpContent()
+        if ($null -ne $helpComment) {
+            if ($helpComment.Synopsis)    { $synopsis    = $helpComment.Synopsis.Trim() }
+            if ($helpComment.Description) { $description = $helpComment.Description.Trim() }
+            if ($helpComment.Parameters)  { $paramHelp = $helpComment.Parameters }
+        }
+    } catch { }
+
+    $parameters = @()
+    try {
+        $paramBlock = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.ParamBlockAst] }, $true) | Select-Object -First 1
+        if ($null -ne $paramBlock) {
+            foreach ($p in $paramBlock.Parameters) {
+                $paramName = $p.Name.VariablePath.UserPath
+                $paramType = if ($null -ne $p.StaticType) { $p.StaticType.Name } else { 'object' }
+                $paramDefault = if ($null -ne $p.DefaultValue) { $p.DefaultValue.Extent.Text } else { $null }
+                $paramDescription = ''
+                # Comment-based help keys arrive uppercased in PS 7's GetHelpContent().
+                $upperName = $paramName.ToUpperInvariant()
+                if ($paramHelp -is [System.Collections.IDictionary] -and $paramHelp.Contains($upperName)) {
+                    $paramDescription = ([string]$paramHelp[$upperName]).Trim()
+                }
+                $parameters += [ordered]@{
+                    name        = $paramName
+                    type        = $paramType
+                    default     = $paramDefault
+                    description = $paramDescription
+                }
+            }
+        }
+    } catch { }
+
+    $metadata = [ordered]@{
+        synopsis    = $synopsis
+        description = $description
+        parameters  = $parameters
+    }
+    $script:metadataCache[$ScriptPath] = [PSCustomObject]@{ Mtime = $currentMtime; Metadata = $metadata }
+    return $metadata
+}
+
 function Get-ScriptIndex {
     # @() forces array serialisation even on an empty result — prevents $null instead of [].
     # Indexes every extension registered in ScriptExtensionMap (.ps1, .psxml, .posh, .psapi
     # by default), not just .ps1, so non-default aliases are discoverable too.
+    # F7: when IndexShowMetadata = $true, each entry is enriched with the parsed
+    # synopsis + parameters. When $false, the legacy flat string list is returned.
     $exts = @($script:cfg.ScriptExtensionMap.Keys)
-    $list = if (Test-Path -LiteralPath $script:cfg.WebRoot -PathType Container) {
-        Get-ChildItem -Path $script:cfg.WebRoot -Recurse -File |
-            Where-Object {
-                $itemExt = $_.Extension
-                $matched = $false
-                foreach ($e in $exts) {
-                    if ([string]::Equals($itemExt, $e, [System.StringComparison]::OrdinalIgnoreCase)) {
-                        $matched = $true
-                        break
-                    }
-                }
-                $matched
-            } |
-            ForEach-Object {
-                '/' + $_.FullName.Substring($script:cfg.WebRoot.Length).TrimStart('\').Replace('\','/')
-            }
-    } else {
-        @()
+    if (-not (Test-Path -LiteralPath $script:cfg.WebRoot -PathType Container)) {
+        return @() | ConvertTo-Json -Compress -Depth 5
     }
-    return @($list) | ConvertTo-Json -Compress -Depth 3
+    $files = Get-ChildItem -Path $script:cfg.WebRoot -Recurse -File | Where-Object {
+        $itemExt = $_.Extension
+        $matched = $false
+        foreach ($e in $exts) {
+            if ([string]::Equals($itemExt, $e, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $matched = $true; break
+            }
+        }
+        $matched
+    }
+    if (-not $script:cfg.IndexShowMetadata) {
+        $list = @($files | ForEach-Object {
+            '/' + $_.FullName.Substring($script:cfg.WebRoot.Length).TrimStart('\').Replace('\','/')
+        })
+        return @($list) | ConvertTo-Json -Compress -Depth 3
+    }
+    $entries = @()
+    foreach ($file in $files) {
+        $urlPath = '/' + $file.FullName.Substring($script:cfg.WebRoot.Length).TrimStart('\').Replace('\','/')
+        $meta = $null
+        try { $meta = Get-ScriptMetadata -ScriptPath $file.FullName } catch { }
+        $methods = if ($file.Extension -eq '.ps1') { @('GET', 'POST') } else { @('GET') }
+        $entry = [ordered]@{
+            path    = $urlPath
+            methods = $methods
+        }
+        if ($null -ne $meta) {
+            $entry.synopsis    = $meta.synopsis
+            $entry.description = $meta.description
+            $entry.parameters  = $meta.parameters
+        }
+        $entries += $entry
+    }
+    return @($entries) | ConvertTo-Json -Compress -Depth 5
 }
 
 # ---------------------------------------------------------------------------
@@ -2397,6 +2498,7 @@ $shared = @{
     FnAuthResolve    = ${function:Resolve-ApiKeyIdentity}
     FnAuditLog       = ${function:Write-AuditLog}
     FnSlowLog        = ${function:Write-SlowLog}
+    FnScriptMeta     = ${function:Get-ScriptMetadata}
     FnGetMime        = ${function:Get-MimeType}
     FnSendStatic     = ${function:Send-StaticFile}
     FnAddCors        = ${function:Add-CorsHeaders}
@@ -2437,6 +2539,7 @@ $requestHandler = {
     ${function:Resolve-ApiKeyIdentity} = $shared.FnAuthResolve
     ${function:Write-AuditLog}   = $shared.FnAuditLog
     ${function:Write-SlowLog}    = $shared.FnSlowLog
+    ${function:Get-ScriptMetadata} = $shared.FnScriptMeta
     ${function:Get-MimeType}     = $shared.FnGetMime
     ${function:Send-StaticFile}  = $shared.FnSendStatic
     ${function:Add-CorsHeaders}  = $shared.FnAddCors
@@ -2456,6 +2559,7 @@ $requestHandler = {
     $script:logMutex         = $logMutex
     $script:auditMutex       = $auditMutex
     $script:rateLimitTable   = $rateLimitTable
+    $script:metadataCache    = $metadataCache
     $script:rateLimitedTotal = $rateLimitedTotal
     # $semaphore, $startTime, $requestsTotal are used directly (no $script: needed)
 
@@ -3050,7 +3154,8 @@ foreach ($entry in @(
     [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('logMutex',         $script:logMutex,            $null),
     [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('auditMutex',       $script:auditMutex,          $null),
     [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('rateLimitTable',   $script:rateLimitTable,      $null),
-    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('rateLimitedTotal', $script:rateLimitedTotal,    $null)
+    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('rateLimitedTotal', $script:rateLimitedTotal,    $null),
+    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('metadataCache',    $script:metadataCache,       $null)
 )) { $iss.Variables.Add($entry) }
 
 # RunspacePool max = MaxConcurrent * 2.
