@@ -264,6 +264,7 @@ $cfg = @{
     StaticRoot               = ''     # static file root; empty string = use WebRoot (so static files live alongside .ps1 endpoints by default)
     DefaultDocuments         = @('index.html', 'index.htm')  # served when StaticServing handles a directory request (e.g. GET /docs/); PR-9 (DirectoryBrowsing) takes over when none of these exist
     StaticCacheHeaders       = $true  # emit ETag + Last-Modified on static responses and honor If-None-Match / If-Modified-Since with HTTP 304
+    StaticCacheMaxAgeSec     = 0      # when > 0, emit `Cache-Control: max-age=N` on static responses. 0 = no Cache-Control (validators only via ETag/Last-Modified). 3600 = 1h, 86400 = 1d, common for static assets behind a CDN.
     BlockedMimeTypes         = @()    # MIME-type blacklist for static responses — matched via StartsWith; entries trigger HTTP 403 (legacy PoSH content filter)
     MimeTypeMap              = @{
         # Extension keys are lowercased, with leading dot. Comparison is case-insensitive.
@@ -583,6 +584,7 @@ $numericBounds = @(
     @{ Key = 'RateLimitPenaltySec';       Min = 0;   Max = 86400 }   # 0 = no penalty (instant unblock), 24 h upper
     @{ Key = 'RunspacePoolMinSize';       Min = 1;   Max = 10000 }   # 1 = lazy start (cold-start latency on first req), higher = pre-warmed
     @{ Key = 'HstsMaxAgeSec';             Min = 0;   Max = 63072000 } # 0 .. 2 years
+    @{ Key = 'StaticCacheMaxAgeSec';      Min = 0;   Max = 31536000 } # 0 = no Cache-Control, 1 year upper
 )
 foreach ($b in $numericBounds) {
     $v = $cfg[$b.Key]
@@ -2460,6 +2462,9 @@ function Send-StaticFile {
     if ($script:cfg.StaticCacheHeaders) {
         $Response.AddHeader('ETag',          $etag)
         $Response.AddHeader('Last-Modified', $lastModifiedUtc.ToString('R'))
+        if ($script:cfg.StaticCacheMaxAgeSec -gt 0) {
+            $Response.AddHeader('Cache-Control', ("max-age={0}, public" -f $script:cfg.StaticCacheMaxAgeSec))
+        }
     }
     if ($isRange) {
         $Response.AddHeader('Content-Range', ('bytes {0}-{1}/{2}' -f $rangeStart, $rangeEnd, $fi.Length))
