@@ -352,6 +352,22 @@
         toast._t = setTimeout(() => t.classList.remove('shown'), 4500);
     };
 
+    // Format a thrown api() error for display: surface per-field
+    // validation errors from a 422 response so the user sees WHICH field
+    // tripped the validator, not just "Validation failed".
+    const formatApiError = (e) => {
+        if (e && e.payload && e.payload.fields && typeof e.payload.fields === 'object') {
+            const lines = [];
+            for (const [k, v] of Object.entries(e.payload.fields)) {
+                lines.push(k + ': ' + v);
+            }
+            if (lines.length > 0) {
+                return (e.message || 'Validation failed') + ' — ' + lines.join(' | ');
+            }
+        }
+        return e && e.message ? e.message : String(e);
+    };
+
     const api = async (method, path, body) => {
         const opts = {
             method,
@@ -406,10 +422,18 @@
     const validateField = (field, raw) => {
         if (field.Type === 'string' || field.Type === 'enum') {
             const s = String(raw ?? '');
-            if (field.Validator) { try { if (!new RegExp(field.Validator).test(s)) return 'Format passt nicht.'; } catch (e) { /* fallback to server */ } }
+            if (field.Validator) {
+                try {
+                    // PowerShell -match is case-insensitive by default — match that
+                    // here so the client doesn't flag valid input as bad just
+                    // because the operator wrote 'dc=foo' instead of 'DC=foo'.
+                    if (!new RegExp(field.Validator, 'i').test(s)) return 'Format passt nicht.';
+                } catch (e) { /* invalid regex on server side — let server adjudicate */ }
+            }
             return null;
         }
         if (field.Type === 'int') {
+            if (raw === '' || raw === null || raw === undefined) return 'Ganzzahl erwartet.';
             const n = Number(raw);
             if (!Number.isInteger(n)) return 'Ganzzahl erwartet.';
             if (field.Min !== undefined && n < field.Min) return 'Mindestens ' + field.Min + '.';
@@ -487,7 +511,10 @@
         } else {
             input = document.createElement('input');
             input.type = 'text';
-            if (field.Validator) input.pattern = field.Validator;
+            // No `pattern` attribute: HTML form validation is case-sensitive
+            // and has no `i` flag, so it would flag valid input that JS +
+            // server both accept (e.g. lowercase LDAP DNs). JS validateField()
+            // is authoritative on the client side; the server re-validates.
             input.value = initialStr;
         }
 
@@ -591,7 +618,7 @@
                 toast('Schlüssel gespeichert. Backup: ' + (r.backup || '(keines)'));
                 await loadAll();
                 renderSetup(main);
-            } catch (e) { toast(e.message, 'err'); }
+            } catch (e) { toast(formatApiError(e), 'err'); }
         });
 
         // Secret-Storage
@@ -623,7 +650,7 @@
                 $('#sec-force').checked = false;
                 await loadAll();
                 renderSetup(main);
-            } catch (e) { toast(e.message, 'err'); }
+            } catch (e) { toast(formatApiError(e), 'err'); }
         });
 
         // POSH_API_KEY
@@ -654,7 +681,7 @@
                     $('#env-val').value = '';
                     await loadAll();
                     renderSetup(main);
-                } catch (e) { toast(e.message, 'err'); }
+                } catch (e) { toast(formatApiError(e), 'err'); }
             });
         }
     };
@@ -708,7 +735,7 @@
         try {
             res = await api('POST', '/api/diff', { values });
         } catch (e) {
-            toast(e.message, 'err');
+            toast(formatApiError(e), 'err');
             return;
         }
         const body = $('#diff-body');
@@ -737,7 +764,7 @@
         try {
             res = await api('POST', '/api/save', { values });
         } catch (e) {
-            toast(e.message, 'err');
+            toast(formatApiError(e), 'err');
             return;
         }
         const bk = (res.backups || []).join(', ');
@@ -753,7 +780,7 @@
             await api('POST', '/api/globalvar/remove', { name });
             toast('$' + name + ' entfernt.');
         } catch (e) {
-            toast(e.message, 'err');
+            toast(formatApiError(e), 'err');
             return;
         }
         await loadAll();
@@ -801,7 +828,7 @@
             await api('POST', '/api/globalvar/add', { name, type, value });
             toast('$' + name + ' angelegt.');
         } catch (e) {
-            toast(e.message, 'err');
+            toast(formatApiError(e), 'err');
             return;
         }
         closeAddVarModal();

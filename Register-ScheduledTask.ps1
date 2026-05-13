@@ -629,17 +629,36 @@ try {
     if ($configReady) {
         # HttpPort 0 in config.psd1 means "HTTP disabled" — same convention as the CLI.
         $effectiveHttpPort = if ($httpsEnabled -and $httpDisabled) { 0 } else { $httpPort }
+
+        # One backup before the batch — so a manual recovery from a
+        # mid-batch failure has somewhere to roll back to.
+        $stamp     = Get-Date -Format 'yyyyMMdd-HHmmss'
+        $cfgBackup = "$configFile.bak.$stamp"
         try {
-            Update-PoshConfigKey -ConfigFile $configFile -Key 'HttpPort'     -Value $effectiveHttpPort -Type int
-            Update-PoshConfigKey -ConfigFile $configFile -Key 'HttpsPort'    -Value $httpsPort         -Type int
-            Update-PoshConfigKey -ConfigFile $configFile -Key 'HttpsEnabled' -Value ([bool]$httpsEnabled) -Type bool
-            Write-Output "  HttpPort     -> $effectiveHttpPort"
-            Write-Output "  HttpsPort    -> $httpsPort"
-            Write-Output "  HttpsEnabled -> $([bool]$httpsEnabled)"
+            Copy-Item -LiteralPath $configFile -Destination $cfgBackup -Force
+            Write-Output "  backed up to $cfgBackup"
         } catch {
             Write-Output ''
-            Write-Output "WARNING: could not update config.psd1: $_"
-            Write-Output '         Edit the file by hand or re-run tools\Edit-PoshSettings.ps1.'
+            Write-Output "WARNING: could not back up config.psd1 before update: $_"
+            Write-Output '         Continuing without a backup — abort here if you need a safety copy.'
+        }
+
+        # Each update runs in its own try so a single missing key (e.g. an
+        # operator manually removed it from config.psd1) doesn't skip the
+        # remaining ones.
+        $updates = @(
+            @{ Key = 'HttpPort';     Value = $effectiveHttpPort;     Type = 'int' }
+            @{ Key = 'HttpsPort';    Value = $httpsPort;             Type = 'int' }
+            @{ Key = 'HttpsEnabled'; Value = ([bool]$httpsEnabled);  Type = 'bool' }
+        )
+        foreach ($u in $updates) {
+            try {
+                Update-PoshConfigKey -ConfigFile $configFile -Key $u.Key -Value $u.Value -Type $u.Type
+                Write-Output ("  {0,-13} -> {1}" -f $u.Key, $u.Value)
+            } catch {
+                Write-Output ("  WARNING: {0} could not be updated: {1}" -f $u.Key, $_)
+                Write-Output '           Edit the file by hand or re-run tools\Edit-PoshSettings.ps1.'
+            }
         }
     }
     Write-Output ''

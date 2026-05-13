@@ -380,6 +380,21 @@ if ($PSBoundParameters.ContainsKey('HttpsPort'))    { $cfg.HttpsPort    = $Https
 if ($PSBoundParameters.ContainsKey('HttpsEnabled')) { $cfg.HttpsEnabled = $HttpsEnabled.IsPresent }
 
 # ---------------------------------------------------------------------------
+# Post-merge port-range validation. The param() decorators only cover values
+# arriving on the CLI. config.psd1 can set HttpPort to -1 or HttpsPort to 0
+# and the merge would happily forward those into HttpListener, which then
+# throws a confusing low-level error. Fail here with a clear message.
+# ---------------------------------------------------------------------------
+if ($cfg.HttpPort -lt 0 -or $cfg.HttpPort -gt 65535) {
+    Write-Output "ERROR: HttpPort=$($cfg.HttpPort) out of range (0-65535). Fix config.psd1 or pass -HttpPort."
+    exit 1
+}
+if ($cfg.HttpsPort -lt 1 -or $cfg.HttpsPort -gt 65535) {
+    Write-Output "ERROR: HttpsPort=$($cfg.HttpsPort) out of range (1-65535). Fix config.psd1 or pass -HttpsPort."
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
 # API-Keys BC fallback — if the operator did not populate ApiKeys via the
 # external config, lift the legacy single $cfg.ApiKey into ApiKeys under the
 # 'default' label so the auth path can use one uniform lookup.

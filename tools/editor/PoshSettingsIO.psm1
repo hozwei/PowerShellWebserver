@@ -287,9 +287,15 @@ function Add-PoshGlobalvar {
         }
     }
 
-    if ($PSCmdlet.ShouldProcess($s.Globalvars, "Add `$$Name = $literal")) {
+    # All validations passed — backup, then write. Doing the backup
+    # AFTER validation avoids littering disk with orphan .bak files
+    # for invalid add attempts (e.g. duplicate name).
+    $bk = $null
+    if ($PSCmdlet.ShouldProcess($s.Globalvars, "Backup + add `$$Name = $literal")) {
+        $bk = Backup-PoshFile -FilePath $s.Globalvars
         [System.IO.File]::WriteAllText($s.Globalvars, $newContent, [System.Text.UTF8Encoding]::new($false))
     }
+    return @{ Name = $Name; Backup = $bk }
 }
 
 # ---------------------------------------------------------------------------
@@ -310,15 +316,18 @@ function Remove-PoshGlobalvar {
     $ast = [System.Management.Automation.Language.Parser]::ParseFile($s.Globalvars, [ref]$null, [ref]$errs)
     if ($errs -and $errs.Count -gt 0) { throw 'globalvars.ps1 has parse errors — fix manually first.' }
 
-    $matches = @($ast.EndBlock.Statements | Where-Object {
+    # $matches is a PowerShell automatic variable — using $assignments
+    # avoids any future -match / -replace in this function silently
+    # overwriting the AST reference.
+    $assignments = @($ast.EndBlock.Statements | Where-Object {
         $_ -is [System.Management.Automation.Language.AssignmentStatementAst] -and
         $_.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and
         $_.Left.VariablePath.UserPath -eq $Name
     })
-    if ($matches.Count -eq 0) { throw "Variable '`$$Name' not found at top level of globalvars.ps1." }
-    if ($matches.Count -gt 1) { throw "Variable '`$$Name' has multiple assignments — refusing to guess which one to remove." }
+    if ($assignments.Count -eq 0) { throw "Variable '`$$Name' not found at top level of globalvars.ps1." }
+    if ($assignments.Count -gt 1) { throw "Variable '`$$Name' has multiple assignments — refusing to guess which one to remove." }
 
-    $stmt = $matches[0]
+    $stmt = $assignments[0]
     $info = Get-PoshRhsTypeInfo -RhsStatement $stmt.Right
     if (-not $info.IsLiteral) {
         throw "Variable '`$$Name' is computed (e.g. Join-Path or `$env:...). Edit globalvars.ps1 by hand if you really want to remove it."
@@ -336,9 +345,15 @@ function Remove-PoshGlobalvar {
 
     $newContent = $content.Substring(0, $start) + $content.Substring($end)
 
-    if ($PSCmdlet.ShouldProcess($s.Globalvars, "Remove `$$Name")) {
+    # All validations passed — backup, then write. Routes no longer back
+    # up separately, so a refused-to-remove call doesn't leave an orphan
+    # .bak file every time the user clicks the X on a computed field.
+    $bk = $null
+    if ($PSCmdlet.ShouldProcess($s.Globalvars, "Backup + remove `$$Name")) {
+        $bk = Backup-PoshFile -FilePath $s.Globalvars
         [System.IO.File]::WriteAllText($s.Globalvars, $newContent, [System.Text.UTF8Encoding]::new($false))
     }
+    return @{ Name = $Name; Backup = $bk }
 }
 
 # ---------------------------------------------------------------------------
@@ -475,10 +490,18 @@ function Test-PoshFieldValue {
         'enum' {
             $s = [string]$Value
             if (-not $Field.ContainsKey('Choices')) { return "Schema-Fehler: 'Choices' fehlt für $($Field.Name)" }
+            # -in is case-insensitive for strings in PowerShell. Match the
+            # server's tolerance for casing while still rejecting truly
+            # unknown values.
             if ($s -notin $Field.Choices) { return "Wert muss einer von '$($Field.Choices -join ", ")' sein" }
             return $null
         }
         'int' {
+            # Reject $null and bools explicitly so the coercer can hand us
+            # a sentinel for "user gave us nonsense" without us treating
+            # nonsense-coerced-to-0 as a valid value.
+            if ($null -eq $Value)   { return 'Ganzzahl erwartet' }
+            if ($Value -is [bool])  { return 'Ganzzahl erwartet (kein Bool)' }
             $n = 0L
             if (-not [long]::TryParse([string]$Value, [ref] $n)) { return 'Ganzzahl erwartet' }
             if ($Field.ContainsKey('Min') -and $n -lt [long]$Field.Min) { return "Mindestens $($Field.Min)" }
@@ -486,8 +509,8 @@ function Test-PoshFieldValue {
             return $null
         }
         'bool' {
-            if ($Value -is [bool]) { return $null }
-            if ([string]$Value -in @('true', 'false', 'True', 'False', '0', '1')) { return $null }
+            if ($null -eq $Value)   { return 'Bool erwartet ($true / $false)' }
+            if ($Value -is [bool])  { return $null }
             return 'Bool erwartet ($true / $false)'
         }
         'string-array' {
@@ -520,16 +543,26 @@ function ConvertTo-PoshTypedValue {
     switch ($Field.Type) {
         'string'       { if ($null -eq $RawValue) { return '' } else { return [string]$RawValue } }
         'enum'         { if ($null -eq $RawValue) { return '' } else { return [string]$RawValue } }
-        'int'          {
-            if ($null -eq $RawValue) { return 0L }
+        'int' {
+            # Return $null on bad input — the caller's Test-PoshFieldValue
+            # surfaces it as "Ganzzahl erwartet". Previously this silently
+            # mapped 'abc' to 0L, which then passed any Min=0 validator.
+            if ($null -eq $RawValue) { return $null }
+            if ($RawValue -is [bool]) { return $null }
             $n = 0L
             if ([long]::TryParse([string]$RawValue, [ref] $n)) { return $n }
-            return 0L
+            return $null
         }
         'bool' {
             if ($RawValue -is [bool]) { return $RawValue }
-            $s = [string]$RawValue
-            return ($s -in @('true', 'True', '1'))
+            if ($null -eq $RawValue)  { return $null }
+            # Accept a documented superset of spellings, then return $null
+            # for anything else so validation rejects it instead of
+            # silently coercing to $false.
+            $s = ([string]$RawValue).Trim()
+            if ($s -in @('true','True','TRUE','1','yes','Yes','YES'))   { return $true }
+            if ($s -in @('false','False','FALSE','0','no','No','NO','')) { return $false }
+            return $null
         }
         'string-array' {
             if ($null -eq $RawValue) { return @() }
@@ -698,6 +731,25 @@ function Save-PoshFieldChanges {
         [Parameter(Mandatory)] [hashtable]   $Proposed
     )
     $s = Get-PoshIoState
+
+    # Defense in depth: re-run validation here even though the route layer
+    # already did it. Anything that ever calls this function directly
+    # (tests, future automation) gets the same protection.
+    $errs = [System.Collections.Generic.List[string]]::new()
+    foreach ($field in $Schema) {
+        if (-not $Proposed.ContainsKey($field.Name)) { continue }
+        if ($field.ContainsKey('IsLiteral') -and -not $field.IsLiteral) {
+            $null = $errs.Add(("{0}: computed value, not editable" -f $field.Name))
+            continue
+        }
+        $typed = ConvertTo-PoshTypedValue -Field $field -RawValue $Proposed[$field.Name]
+        $err   = Test-PoshFieldValue -Field $field -Value $typed
+        if ($err) { $null = $errs.Add(("{0}: {1}" -f $field.Name, $err)) }
+    }
+    if ($errs.Count -gt 0) {
+        throw "Validation failed: $($errs -join '; ')"
+    }
+
     $byFile = @{}
     foreach ($field in $Schema) {
         if ($Proposed.ContainsKey($field.Name)) {
@@ -750,10 +802,14 @@ function New-PoshAesKey {
     if ($startIx -lt 0 -or $endIx -lt 0 -or $endIx -le $startIx) {
         throw "Marker block missing in globalvars.ps1 (expected $startMarker ... $endMarker)"
     }
-    $blockStart    = $startIx + $startMarker.Length
-    $existingBlock = $content.Substring($blockStart, $endIx - $blockStart)
-    $looksLikePlaceholder = $existingBlock -notmatch '\b[1-9]\d*\b'
-    if (-not $looksLikePlaceholder -and -not $Force) {
+    # Placeholder detection: dot-source the file and inspect the actual
+    # byte array. The previous regex on the text block matched any digit
+    # token (including digits in code comments), so a comment like
+    # "# 256 bytes" inside the markers was misread as "initialised".
+    $vars   = Get-PoshGlobalvarValues -Names @('key')
+    $bytes  = if ($vars.ContainsKey('key')) { @($vars['key']) } else { @() }
+    $isPlaceholder = ((@($bytes | Where-Object { $_ -ne 0 }).Count) -eq 0)
+    if (-not $isPlaceholder -and -not $Force) {
         throw '$key is already initialised. Re-running invalidates every encrypted_pw\encryptedString_*.txt under the current key. Pass -Force to proceed.'
     }
     $bytes = [byte[]]::new(32)
@@ -768,7 +824,7 @@ function New-PoshAesKey {
         $bk = Backup-PoshFile -FilePath $s.Globalvars
         [System.IO.File]::WriteAllText($s.Globalvars, $newContent, [System.Text.UTF8Encoding]::new($false))
         for ($i = 0; $i -lt $bytes.Length; $i++) { $bytes[$i] = 0 }
-        return @{ Replaced = (-not $looksLikePlaceholder); Backup = $bk }
+        return @{ Replaced = (-not $isPlaceholder); Backup = $bk }
     }
     return @{ Replaced = $false; Backup = $null }
 }

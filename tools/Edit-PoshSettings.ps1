@@ -411,13 +411,15 @@ function Invoke-RouteGlobalvarAdd {
         return
     }
     try {
-        $null = Backup-PoshFile -FilePath (Get-PoshIoState).Globalvars
-        Add-PoshGlobalvar -Name $name -Value $typed -Type $type
+        # Add-PoshGlobalvar backs up internally AFTER validation. Pre-
+        # validating + pre-backing-up here would leave orphan .bak files
+        # for refused calls (duplicate name, computed RHS, etc).
+        $result = Add-PoshGlobalvar -Name $name -Value $typed -Type $type
     } catch {
         Send-PoshErrorResponse -Response $Response -StatusCode 422 -Message ("$_")
         return
     }
-    Send-PoshJsonResponse -Response $Response -Payload @{ ok = $true; name = $name }
+    Send-PoshJsonResponse -Response $Response -Payload @{ ok = $true; name = $result.Name; backup = $result.Backup }
 }
 
 function Invoke-RouteGlobalvarRemove {
@@ -428,13 +430,13 @@ function Invoke-RouteGlobalvarRemove {
     }
     $name = [string]$Body['name']
     try {
-        $null = Backup-PoshFile -FilePath (Get-PoshIoState).Globalvars
-        Remove-PoshGlobalvar -Name $name
+        # Remove-PoshGlobalvar backs up internally AFTER validation.
+        $result = Remove-PoshGlobalvar -Name $name
     } catch {
         Send-PoshErrorResponse -Response $Response -StatusCode 422 -Message ("$_")
         return
     }
-    Send-PoshJsonResponse -Response $Response -Payload @{ ok = $true; name = $name }
+    Send-PoshJsonResponse -Response $Response -Payload @{ ok = $true; name = $result.Name; backup = $result.Backup }
 }
 
 function Invoke-RouteInitKey {
@@ -623,8 +625,21 @@ try {
                 }
             }
         } catch {
+            # Translate well-known error types to the right HTTP code.
+            # IOException from Read-PoshJsonBody = body over 256 KB cap.
+            # ArgumentException / InvalidOperationException on body cast
+            # (e.g. caller sent a JSON array where a hashtable was expected)
+            # is a client error, not a server error.
+            $code = 500
+            $exc  = $_.Exception
+            if ($exc -is [System.IO.IOException])              { $code = 413 }
+            elseif ($exc -is [System.ArgumentException] -or
+                    $exc -is [System.InvalidOperationException] -or
+                    $exc -is [System.Management.Automation.PSInvalidCastException]) {
+                $code = 400
+            }
             try {
-                Send-PoshErrorResponse -Response $response -StatusCode 500 -Message "Server error: $_"
+                Send-PoshErrorResponse -Response $response -StatusCode $code -Message ("$exc")
             } catch { $null = $_ }
             Write-Host "ERROR processing $method $path : $_" -ForegroundColor Red
         }

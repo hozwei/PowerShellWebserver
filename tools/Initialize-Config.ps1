@@ -261,13 +261,26 @@ $null = $lines.Add('')
 
 # ---------------------------------------------------------------------------
 # Backup an existing file and write the new one. UTF-8 without BOM matches
-# the convention from tools\Initialize-Globalvars.ps1.
+# the convention from tools\Initialize-Globalvars.ps1. Rotate so only the
+# last 5 backups stick around — otherwise repeated -Force runs leave a
+# growing trail of config.psd1.bak.* in the repo root.
 # ---------------------------------------------------------------------------
 if (Test-Path -LiteralPath $OutputFile -PathType Leaf) {
     $stamp  = Get-Date -Format 'yyyyMMdd-HHmmss'
     $backup = "$OutputFile.bak.$stamp"
     Move-Item -LiteralPath $OutputFile -Destination $backup -Force
     Write-Host "Existing config.psd1 backed up to $backup" -ForegroundColor Yellow
+
+    $dir     = Split-Path -Parent $OutputFile
+    $name    = Split-Path -Leaf   $OutputFile
+    $allBaks = @(Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -like "$name.bak.*" } |
+                Sort-Object Name -Descending)
+    if ($allBaks.Count -gt 5) {
+        foreach ($old in $allBaks | Select-Object -Skip 5) {
+            try { Remove-Item -LiteralPath $old.FullName -Force -ErrorAction Stop } catch { $null = $_ }
+        }
+    }
 }
 
 $body = ($lines -join [System.Environment]::NewLine)
