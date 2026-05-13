@@ -133,7 +133,8 @@ $cfg = @{
     WebRoot             = Join-Path $baseDir 'webroot'
     LogDir              = Join-Path $baseDir 'logs'
     PwshExe             = (Get-Process -Id $PID).MainModule.FileName # pwsh.exe of the running process — no hardcoded path
-    ApiKey              = $apiKey                                    # from $env:POSH_API_KEY — already checked for empty string
+    ApiKey              = $apiKey                                    # legacy single-key from $env:POSH_API_KEY — kept for BC; auto-merged into ApiKeys as 'default' when ApiKeys is empty
+    ApiKeys             = [ordered]@{}                               # multi-key map: label → key. Populate via config.psd1: @{ ApiKeys = @{ 'ci' = 'k1'; 'mon' = 'k2' } }
     ScriptTimeoutSec         = 300    # 5 minutes — scripts running longer are terminated (HTTP 504)
     MaxConcurrent            = 10     # maximum parallel requests — excess requests receive HTTP 503
     LogRetentionDays         = 180    # log files older than N days are deleted at startup (0 = disabled)
@@ -294,6 +295,17 @@ if (Test-Path -LiteralPath $resolvedConfigFile -PathType Leaf) {
     }
 }
 
+# ---------------------------------------------------------------------------
+# API-Keys BC fallback — if the operator did not populate ApiKeys via the
+# external config, lift the legacy single $cfg.ApiKey into ApiKeys under the
+# 'default' label so the auth path can use one uniform lookup.
+# ---------------------------------------------------------------------------
+if (-not $cfg.ApiKeys -or $cfg.ApiKeys.Count -eq 0) {
+    if (-not [string]::IsNullOrEmpty($cfg.ApiKey)) {
+        $cfg.ApiKeys = [ordered]@{ 'default' = $cfg.ApiKey }
+    }
+}
+
 # CustomErrorPages root fallback — empty string means '<WebRoot>\_error'. Resolved here so the
 # Send-Response helper can use the path without recomputing per request.
 if ([string]::IsNullOrEmpty($cfg.ErrorPagesRoot)) {
@@ -351,6 +363,12 @@ function Write-Log {
         [string] $Status     = '-',
         [string] $ExitCode   = '-',
         [string] $RequestId  = '-',
+        # F3: API-key label / 'basic:<user>' / 'anonymous' / '-'. When unset (default $null),
+        # the per-request $script:authIdentity stash is read so call sites need not change.
+        [AllowNull()]
+        [string] $Identity   = $null,
+        # F6: per-request duration in milliseconds (0 when unset / not measured).
+        [int]    $ElapsedMs  = 0,
         # W3C-only extras — ignored in Native format.
         [int]    $HttpStatus = 0,
         [string] $Method     = '',
@@ -358,6 +376,11 @@ function Write-Log {
         [string] $UriQuery   = '',
         [string] $UserAgent  = '-'
     )
+
+    if ($null -eq $Identity) {
+        try { $Identity = $script:authIdentity } catch { $Identity = '-' }
+        if ([string]::IsNullOrEmpty($Identity)) { $Identity = '-' }
+    }
 
     $now      = Get-Date
     $schedule = if ($script:cfg.LogSchedule -eq 'Hourly') { 'Hourly' } else { 'Daily' }
@@ -404,7 +427,8 @@ function Write-Log {
         # W3C requires UA without spaces — collapse whitespace to '+'.
         $UserAgent = ($UserAgent -replace '\s+', '+')
 
-        $line = '{0} {1} {2} {3} {4} {5} {6} {7} {8}' -f `
+        $timeTaken = if ($ElapsedMs -gt 0) { $ElapsedMs } else { '-' }
+        $line = '{0} {1} {2} {3} {4} {5} {6} {7} {8} {9} {10}' -f `
             $now.ToString('yyyy-MM-dd'),
             $now.ToString('HH:mm:ss'),
             $ClientIP,
@@ -413,14 +437,19 @@ function Write-Log {
             $UriQuery,
             $HttpStatus,
             $UserAgent,
+            $Identity,
+            $timeTaken,
             $RequestId
     } else {
-        $line = '{0} | {1} | {2} | EXIT:{3} | {4} | {5}' -f `
+        $elapsedCol = if ($ElapsedMs -gt 0) { "${ElapsedMs}ms" } else { '-' }
+        $line = '{0} | {1} | {2} | EXIT:{3} | {4} | {5} | {6} | {7}' -f `
             $now.ToString('yyyy-MM-dd HH:mm:ss'),
             $ClientIP.PadRight(15),
             $Request.PadRight(60),
             $ExitCode.PadRight(4),
             $Status.PadRight(13),
+            $Identity.PadRight(16),
+            $elapsedCol.PadRight(8),
             $RequestId
     }
 
@@ -438,7 +467,7 @@ function Write-Log {
                 '#Software: posh-webserver'
                 '#Version: 1.0'
                 ('#Date: {0}' -f $now.ToString('yyyy-MM-dd HH:mm:ss'))
-                '#Fields: date time c-ip cs-method cs-uri-stem cs-uri-query sc-status cs(User-Agent) x-request-id'
+                '#Fields: date time c-ip cs-method cs-uri-stem cs-uri-query sc-status cs(User-Agent) cs(identity) time-taken x-request-id'
             ) -join [System.Environment]::NewLine
             Add-Content -LiteralPath $logFile -Value $header -Encoding UTF8
         }
@@ -2056,6 +2085,28 @@ function Get-ScriptIndex {
 }
 
 # ---------------------------------------------------------------------------
+# Resolve-ApiKeyIdentity
+# Looks up an X-Api-Key value against $cfg.ApiKeys and returns the matching
+# label, or $null when the key does not match any configured entry.
+# Comparison is ordinal (case-sensitive byte-exact) — matches the Loop-3 fix
+# for the legacy single-key path.
+#
+# Returned label flows into $script:authIdentity and from there into the
+# request log, audit log, per-key rate-limit, and Prometheus metrics.
+# ---------------------------------------------------------------------------
+function Resolve-ApiKeyIdentity {
+    param([string] $ProvidedKey)
+    if ([string]::IsNullOrEmpty($ProvidedKey)) { return $null }
+    if (-not $script:cfg.ApiKeys -or $script:cfg.ApiKeys.Count -eq 0) { return $null }
+    foreach ($entry in $script:cfg.ApiKeys.GetEnumerator()) {
+        if ([string]::Equals($entry.Value, $ProvidedKey, [System.StringComparison]::Ordinal)) {
+            return $entry.Key
+        }
+    }
+    return $null
+}
+
+# ---------------------------------------------------------------------------
 # Test-IpMatch
 # Returns $true when $Ip matches any entry in $Patterns. Each pattern can be:
 #   - Exact match:  '192.168.1.10' (case-insensitive comparison).
@@ -2233,6 +2284,7 @@ $shared = @{
     FnInvScript      = ${function:Invoke-Script}
     FnGetIndex       = ${function:Get-ScriptIndex}
     FnRateLimit      = ${function:Test-RateLimit}
+    FnAuthResolve    = ${function:Resolve-ApiKeyIdentity}
     FnGetMime        = ${function:Get-MimeType}
     FnSendStatic     = ${function:Send-StaticFile}
     FnAddCors        = ${function:Add-CorsHeaders}
@@ -2270,6 +2322,7 @@ $requestHandler = {
     ${function:Invoke-Script}    = $shared.FnInvScript
     ${function:Get-ScriptIndex}  = $shared.FnGetIndex
     ${function:Test-RateLimit}   = $shared.FnRateLimit
+    ${function:Resolve-ApiKeyIdentity} = $shared.FnAuthResolve
     ${function:Get-MimeType}     = $shared.FnGetMime
     ${function:Send-StaticFile}  = $shared.FnSendStatic
     ${function:Add-CorsHeaders}  = $shared.FnAddCors
@@ -2304,6 +2357,10 @@ $requestHandler = {
         # whether to substitute a CustomErrorPages HTML response for 4xx/5xx envelopes.
         $script:acceptType = $req.Headers['Accept']
         if ($null -eq $script:acceptType) { $script:acceptType = '' }
+        # F3: per-request authentication identity. Default '-' (unknown/not-yet-resolved);
+        # the auth block below sets it to a key label, 'basic:<user>', or 'anonymous'
+        # for the auth-exempt routes. Flows into Write-Log, Test-RateLimit, Write-AuditLog.
+        $script:authIdentity = '-'
 
         $clientIP    = $req.RemoteEndPoint.Address.ToString()
         $urlPath     = $req.Url.AbsolutePath
@@ -2420,18 +2477,27 @@ $requestHandler = {
         # response does not leak which mechanism the server is actually checking.
         # WWW-Authenticate is added on Basic/Both so browsers display a login dialog.
         # --------------------------------------------------------------
-        if ($urlPath -ne '/health' -and $urlPath -ne '/metrics') {
+        if ($urlPath -eq '/health' -or $urlPath -eq '/metrics' -or $urlPath -eq '/metrics-prom' -or $urlPath -eq '/openapi.json') {
+            # Auth-exempt routes mark the identity as 'anonymous' so log + rate-limit
+            # downstream can still attribute the request meaningfully.
+            $script:authIdentity = 'anonymous'
+        } else {
             $authMode    = $script:cfg.AuthMode
             $authPassed  = $false
 
             # IMPORTANT: PowerShell's -eq operator on strings is case-INSENSITIVE by default.
-            # Credentials MUST be compared case-sensitively (otherwise an API key of 'Abc123'
-            # would also accept 'aBC123', cutting the effective keyspace dramatically).
-            # [string]::Equals with StringComparison.Ordinal is explicit and ordinal-binary.
+            # Credentials MUST be compared case-sensitively. [string]::Equals with
+            # StringComparison.Ordinal is explicit and ordinal-binary.
+            #
+            # Multi-key API auth (F3): Resolve-ApiKeyIdentity walks $cfg.ApiKeys and returns
+            # the matching label (or $null). Backward-compatible: when ApiKeys is empty,
+            # the BC fallback in startup populates it with @{ 'default' = $cfg.ApiKey }.
             if ($authMode -eq 'ApiKey' -or $authMode -eq 'Both') {
-                $providedKey = $req.Headers['X-Api-Key']
-                if ($null -ne $providedKey -and [string]::Equals($providedKey, $script:cfg.ApiKey, [System.StringComparison]::Ordinal)) {
+                $providedKey  = $req.Headers['X-Api-Key']
+                $matchedLabel = Resolve-ApiKeyIdentity -ProvidedKey $providedKey
+                if ($null -ne $matchedLabel) {
                     $authPassed = $true
+                    $script:authIdentity = $matchedLabel
                 }
             }
             if (-not $authPassed -and ($authMode -eq 'Basic' -or $authMode -eq 'Both')) {
@@ -2447,6 +2513,8 @@ $requestHandler = {
                             if ([string]::Equals($providedUser, $script:cfg.BasicAuthUser, [System.StringComparison]::Ordinal) -and
                                 [string]::Equals($providedPass, $script:cfg.BasicAuthPass, [System.StringComparison]::Ordinal)) {
                                 $authPassed = $true
+                                # User name (NOT password) flows into identity for audit attribution.
+                                $script:authIdentity = "basic:$providedUser"
                             }
                         }
                     } catch { } # malformed base64 — treat as auth failure, no diagnostic leak
@@ -2459,7 +2527,7 @@ $requestHandler = {
                     $resp.AddHeader('WWW-Authenticate', ('Basic realm="{0}"' -f $script:cfg.BasicAuthRealm))
                 }
                 Send-Response -Response $resp -StatusCode 401 -Body $body -RequestId $requestId
-                Write-Log -ClientIP $clientIP -Request $requestLine -Status 'UNAUTHORIZED' -ExitCode '-' -RequestId $requestId
+                Write-Log -ClientIP $clientIP -Request $requestLine -Status 'UNAUTHORIZED' -ExitCode '-' -RequestId $requestId -Identity '-'
                 return
             }
         }
