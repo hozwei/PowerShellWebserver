@@ -259,6 +259,8 @@ $cfg = @{
     DirectoryBrowsingHidden  = @('_error', '.git', '.gitignore') # entries hidden from the directory listing (case-insensitive match on file/folder name)
     AuditLogEnabled          = $false  # F5: write security-relevant events (AUTH_FAIL, IP_BLOCKED, RATE_LIMITED) as NDJSON to AuditLogFile
     AuditLogFile             = ''      # absolute path to audit.log; empty = '<LogDir>\audit.log'
+    SlowRequestThresholdMs   = 0       # F6: requests >= this many ms (after Invoke-Script returns) get an extra line in SlowLogFile. 0 = disabled.
+    SlowLogFile              = ''      # absolute path to slow.log; empty = '<LogDir>\slow.log'
 }
 
 # ---------------------------------------------------------------------------
@@ -322,6 +324,10 @@ if ([string]::IsNullOrEmpty($cfg.JobsLogFile)) {
 # F5: audit-log file path fallback.
 if ([string]::IsNullOrEmpty($cfg.AuditLogFile)) {
     $cfg.AuditLogFile = Join-Path $cfg.LogDir 'audit.log'
+}
+# F6: slow-log file path fallback.
+if ([string]::IsNullOrEmpty($cfg.SlowLogFile)) {
+    $cfg.SlowLogFile = Join-Path $cfg.LogDir 'slow.log'
 }
 
 # StaticRoot fallback — empty string means: reuse WebRoot. Resolved here rather than at
@@ -529,6 +535,44 @@ function Write-AuditLog {
         Add-Content -LiteralPath $script:cfg.AuditLogFile -Value $line -Encoding UTF8
     } catch { } finally {
         try { if ($acquired) { $script:auditMutex.ReleaseMutex() } } catch { }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Write-SlowLog (F6)
+# Appends a pipe-delimited line to <cfg.SlowLogFile> when a request exceeded
+# $cfg.SlowRequestThresholdMs. Rare event, so the existing request-log Mutex
+# is reused (no dedicated mutex needed). Caller passes the already-measured
+# $ElapsedMs so we do not start a second stopwatch here.
+# ---------------------------------------------------------------------------
+function Write-SlowLog {
+    param(
+        [int]    $ElapsedMs,
+        [string] $ClientIP   = '-',
+        [string] $Identity   = '-',
+        [string] $Request    = '-',
+        [string] $ExitCode   = '-',
+        [string] $RequestId  = '-'
+    )
+    if ($script:cfg.SlowRequestThresholdMs -le 0) { return }
+    if ($ElapsedMs -lt $script:cfg.SlowRequestThresholdMs) { return }
+
+    if ([string]::IsNullOrEmpty($Identity)) { $Identity = '-' }
+    $line = '{0} | {1}ms | {2} | identity={3} | {4} | EXIT:{5} | {6}' -f `
+        (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'),
+        $ElapsedMs,
+        $ClientIP,
+        $Identity,
+        $Request,
+        $ExitCode,
+        $RequestId
+
+    $acquired = $false
+    try {
+        $acquired = $script:logMutex.WaitOne(500)
+        Add-Content -LiteralPath $script:cfg.SlowLogFile -Value $line -Encoding UTF8
+    } catch { } finally {
+        try { if ($acquired) { $script:logMutex.ReleaseMutex() } } catch { }
     }
 }
 
@@ -2352,6 +2396,7 @@ $shared = @{
     FnRateLimit      = ${function:Test-RateLimit}
     FnAuthResolve    = ${function:Resolve-ApiKeyIdentity}
     FnAuditLog       = ${function:Write-AuditLog}
+    FnSlowLog        = ${function:Write-SlowLog}
     FnGetMime        = ${function:Get-MimeType}
     FnSendStatic     = ${function:Send-StaticFile}
     FnAddCors        = ${function:Add-CorsHeaders}
@@ -2391,6 +2436,7 @@ $requestHandler = {
     ${function:Test-RateLimit}   = $shared.FnRateLimit
     ${function:Resolve-ApiKeyIdentity} = $shared.FnAuthResolve
     ${function:Write-AuditLog}   = $shared.FnAuditLog
+    ${function:Write-SlowLog}    = $shared.FnSlowLog
     ${function:Get-MimeType}     = $shared.FnGetMime
     ${function:Send-StaticFile}  = $shared.FnSendStatic
     ${function:Add-CorsHeaders}  = $shared.FnAddCors
@@ -2903,11 +2949,16 @@ $requestHandler = {
             }
         }
 
+        # F6: stopwatch around the script invocation so the elapsed time can flow into
+        # Write-Log (new -ElapsedMs column) AND the slow-request log when over threshold.
+        $execStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
         if ($script:cfg.ExecutionMode -eq 'InProcess') {
             $result = Invoke-ScriptInProcess -ScriptPath $resolvedPath -Params $scriptParams -TimeoutSec $script:cfg.ScriptTimeoutSec -JsonFilePath $jsonFilePath -ContextVars $contextVars
         } else {
             $result = Invoke-Script -ScriptPath $resolvedPath -Params $scriptParams -TimeoutSec $script:cfg.ScriptTimeoutSec -JsonFilePath $jsonFilePath -EnvVars $scriptEnvVars
         }
+        $execStopwatch.Stop()
+        $execElapsedMs = [int]$execStopwatch.ElapsedMilliseconds
 
         # Script request completed — increment counter atomically (thread-safe).
         $null = [System.Threading.Interlocked]::Increment($requestsTotal)
@@ -2943,7 +2994,10 @@ $requestHandler = {
         $statusText = if     ($result.TimedOut)       { 'TIMEOUT' }
                       elseif ($result.ExitCode -eq 0) { 'OK' }
                       else                            { 'ERROR' }
-        Write-Log -ClientIP $clientIP -Request $requestLine -Status $statusText -ExitCode "$($result.ExitCode)" -RequestId $requestId
+        Write-Log -ClientIP $clientIP -Request $requestLine -Status $statusText -ExitCode "$($result.ExitCode)" -RequestId $requestId -ElapsedMs $execElapsedMs
+
+        # F6: separately log to slow.log when the threshold is configured and crossed.
+        Write-SlowLog -ElapsedMs $execElapsedMs -ClientIP $clientIP -Identity $script:authIdentity -Request $requestLine -ExitCode "$($result.ExitCode)" -RequestId $requestId
 
     } catch {
         # Error in request processing — log and continue.
