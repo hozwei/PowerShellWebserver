@@ -133,6 +133,215 @@ function Get-PoshGlobalvarValues {
 }
 
 # ---------------------------------------------------------------------------
+# Private RHS-AST helpers. Used by Get-PoshGlobalvarDefinitions and
+# Add-PoshGlobalvar to figure out whether a variable's right-hand side is
+# a plain literal we can safely edit, or a computed expression we should
+# leave alone (Join-Path, $env:..., interpolated strings).
+# ---------------------------------------------------------------------------
+function Get-PoshRhsExpression {
+    param($RhsStatement)
+    $r = $RhsStatement
+    if ($r -is [System.Management.Automation.Language.PipelineAst]) {
+        if ($r.PipelineElements.Count -ne 1) { return $null }
+        $r = $r.PipelineElements[0]
+    }
+    if ($r -is [System.Management.Automation.Language.CommandExpressionAst]) {
+        return $r.Expression
+    }
+    return $r
+}
+
+function Get-PoshRhsTypeInfo {
+    param($RhsStatement)
+    $expr = Get-PoshRhsExpression -RhsStatement $RhsStatement
+    if ($null -eq $expr) { return @{ Type = 'string'; IsLiteral = $false } }
+
+    if ($expr -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+        return @{ Type = 'string'; IsLiteral = $true }
+    }
+    if ($expr -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) {
+        # Interpolation makes this a derived value — read-only in the editor.
+        $nested = @($expr.NestedExpressions)
+        if ($nested.Count -eq 0) { return @{ Type = 'string'; IsLiteral = $true } }
+        return @{ Type = 'string'; IsLiteral = $false }
+    }
+    if ($expr -is [System.Management.Automation.Language.ConstantExpressionAst]) {
+        $v = $expr.Value
+        if ($v -is [int] -or $v -is [long] -or $v -is [int32] -or $v -is [int64]) {
+            return @{ Type = 'int'; IsLiteral = $true }
+        }
+        if ($v -is [bool]) { return @{ Type = 'bool'; IsLiteral = $true } }
+        return @{ Type = 'string'; IsLiteral = $true }
+    }
+    if ($expr -is [System.Management.Automation.Language.ArrayLiteralAst] -or
+        $expr -is [System.Management.Automation.Language.ArrayExpressionAst]) {
+        return @{ Type = 'string-array'; IsLiteral = $true }
+    }
+    # Variable refs ($env:COMPUTERNAME), Join-Path, member access, etc.
+    return @{ Type = 'string'; IsLiteral = $false }
+}
+
+# ---------------------------------------------------------------------------
+# AST-scan globalvars.ps1 for top-level $Var = ... assignments. Returns
+# one entry per actually-defined variable with the type inferred from the
+# RHS literal (string, int, bool, string-array). Variables with computed
+# right-hand sides (Join-Path, $env:..., interpolated strings) are
+# returned with IsLiteral=$false so the caller can show them read-only.
+#
+# This is the dynamic source of truth: deleting a $Var line in globalvars.ps1
+# removes the variable from the editor on the next load; adding a new line
+# makes it appear automatically.
+# ---------------------------------------------------------------------------
+function Get-PoshGlobalvarDefinitions {
+    [OutputType([hashtable[]])]
+    param()
+    $s = Get-PoshIoState
+    if (-not (Test-Path -LiteralPath $s.Globalvars -PathType Leaf)) { return @() }
+    $errs = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($s.Globalvars, [ref]$null, [ref]$errs)
+    if ($errs -and $errs.Count -gt 0) {
+        throw "globalvars.ps1 has parse errors — fix manually first."
+    }
+    $defs = [System.Collections.Generic.List[hashtable]]::new()
+    foreach ($stmt in $ast.EndBlock.Statements) {
+        if ($stmt -isnot [System.Management.Automation.Language.AssignmentStatementAst]) { continue }
+        if ($stmt.Left -isnot [System.Management.Automation.Language.VariableExpressionAst]) { continue }
+        $name = $stmt.Left.VariablePath.UserPath
+        if ([string]::IsNullOrWhiteSpace($name)) { continue }
+        if ($name -eq 'key') { continue }   # AES key — managed via setup helper
+        $info = Get-PoshRhsTypeInfo -RhsStatement $stmt.Right
+        $null = $defs.Add(@{
+            Name      = $name
+            Type      = $info.Type
+            IsLiteral = $info.IsLiteral
+            RawText   = $stmt.Right.Extent.Text
+        })
+    }
+    return @($defs)
+}
+
+# ---------------------------------------------------------------------------
+# Append a new $Var = ... assignment to globalvars.ps1. Placed right after
+# the last literal top-level assignment so it lands in "Section 1"
+# (service endpoints + LDAP) rather than between the path-derivation
+# lines or after the AES key marker.
+# ---------------------------------------------------------------------------
+function Add-PoshGlobalvar {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)] [ValidatePattern('^[A-Za-z_][A-Za-z0-9_]*$')] [string] $Name,
+        [Parameter(Mandatory)] $Value,
+        [Parameter(Mandatory)] [ValidateSet('string','int','string-array','bool')] [string] $Type
+    )
+    $s = Get-PoshIoState
+    Assert-PoshIoTarget -Path $s.Globalvars
+    if (-not (Test-Path -LiteralPath $s.Globalvars -PathType Leaf)) {
+        throw "globalvars.ps1 not found: $($s.Globalvars)"
+    }
+    if ($Name -eq 'key') { throw 'Refusing to overwrite $key via Add-PoshGlobalvar — use the AES-key setup helper instead.' }
+    $existing = @(Get-PoshGlobalvarDefinitions | Where-Object { $_.Name -eq $Name })
+    if ($existing.Count -gt 0) {
+        throw "Variable '`$$Name' already exists. Edit it instead."
+    }
+    $literal = ConvertTo-PoshLiteral -Value $Value -Type $Type
+    $line    = '$' + $Name + ' = ' + $literal
+
+    $errs = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($s.Globalvars, [ref]$null, [ref]$errs)
+    if ($errs -and $errs.Count -gt 0) { throw 'globalvars.ps1 has parse errors — fix manually first.' }
+
+    # Find the last literal top-level assignment so we land in Section 1.
+    # Stop at the first non-literal — that is typically the start of Section 2
+    # ($PoshBaseDir = $PSScriptRoot etc).
+    $lastLiteralAssign = $null
+    foreach ($stmt in $ast.EndBlock.Statements) {
+        if ($stmt -isnot [System.Management.Automation.Language.AssignmentStatementAst]) { continue }
+        if ($stmt.Left -isnot [System.Management.Automation.Language.VariableExpressionAst]) { continue }
+        $n = $stmt.Left.VariablePath.UserPath
+        if ($n -eq 'key') { continue }
+        $info = Get-PoshRhsTypeInfo -RhsStatement $stmt.Right
+        if ($info.IsLiteral) { $lastLiteralAssign = $stmt } else { break }
+    }
+
+    $content = [System.IO.File]::ReadAllText($s.Globalvars)
+    $newline = if ($content.Contains("`r`n")) { "`r`n" } else { "`n" }
+
+    if ($lastLiteralAssign) {
+        # Insert a blank line + the new statement right after the last
+        # Section 1 assignment. EndOffset is after the value AST; we then
+        # walk forward past any same-line trailing comment + line break so
+        # we slot in between two lines rather than mid-line.
+        $insertAt = $lastLiteralAssign.Extent.EndOffset
+        while ($insertAt -lt $content.Length -and $content[$insertAt] -notin @("`r","`n")) { $insertAt++ }
+        if ($insertAt -lt $content.Length -and $content[$insertAt] -eq "`r") { $insertAt++ }
+        if ($insertAt -lt $content.Length -and $content[$insertAt] -eq "`n") { $insertAt++ }
+        $newContent = $content.Substring(0, $insertAt) + $line + $newline + $content.Substring($insertAt)
+    } else {
+        $keyMark = '# >>>POSH_KEY_START<<<'
+        $idx = $content.IndexOf($keyMark)
+        if ($idx -ge 0) {
+            $before = $content.Substring(0, $idx).TrimEnd()
+            $newContent = $before + $newline + $newline + $line + $newline + $newline + $newline + $content.Substring($idx)
+        } else {
+            $newContent = $content.TrimEnd() + $newline + $newline + $line + $newline
+        }
+    }
+
+    if ($PSCmdlet.ShouldProcess($s.Globalvars, "Add `$$Name = $literal")) {
+        [System.IO.File]::WriteAllText($s.Globalvars, $newContent, [System.Text.UTF8Encoding]::new($false))
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Delete one top-level $Var = ... line (and its trailing newline) from
+# globalvars.ps1. Refuses to remove $key. Refuses if the variable is
+# computed (likely a path-derivation in Section 2 — let the user know,
+# don't silently nuke). Refuses if the same name is assigned more than
+# once so we never guess which line to drop.
+# ---------------------------------------------------------------------------
+function Remove-PoshGlobalvar {
+    [CmdletBinding(SupportsShouldProcess)]
+    param([Parameter(Mandatory)] [string] $Name)
+    $s = Get-PoshIoState
+    Assert-PoshIoTarget -Path $s.Globalvars
+    if ($Name -eq 'key') { throw 'Refusing to remove $key — use the setup helper instead.' }
+
+    $errs = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($s.Globalvars, [ref]$null, [ref]$errs)
+    if ($errs -and $errs.Count -gt 0) { throw 'globalvars.ps1 has parse errors — fix manually first.' }
+
+    $matches = @($ast.EndBlock.Statements | Where-Object {
+        $_ -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+        $_.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and
+        $_.Left.VariablePath.UserPath -eq $Name
+    })
+    if ($matches.Count -eq 0) { throw "Variable '`$$Name' not found at top level of globalvars.ps1." }
+    if ($matches.Count -gt 1) { throw "Variable '`$$Name' has multiple assignments — refusing to guess which one to remove." }
+
+    $stmt = $matches[0]
+    $info = Get-PoshRhsTypeInfo -RhsStatement $stmt.Right
+    if (-not $info.IsLiteral) {
+        throw "Variable '`$$Name' is computed (e.g. Join-Path or `$env:...). Edit globalvars.ps1 by hand if you really want to remove it."
+    }
+
+    $content = [System.IO.File]::ReadAllText($s.Globalvars)
+    $start   = $stmt.Extent.StartOffset
+    $end     = $stmt.Extent.EndOffset
+    # Walk start back to beginning of the line (after the previous newline)
+    while ($start -gt 0 -and $content[$start - 1] -ne "`n") { $start-- }
+    # Walk end forward past any trailing comment + line terminator(s)
+    while ($end -lt $content.Length -and $content[$end] -notin @("`r","`n")) { $end++ }
+    if ($end -lt $content.Length -and $content[$end] -eq "`r") { $end++ }
+    if ($end -lt $content.Length -and $content[$end] -eq "`n") { $end++ }
+
+    $newContent = $content.Substring(0, $start) + $content.Substring($end)
+
+    if ($PSCmdlet.ShouldProcess($s.Globalvars, "Remove `$$Name")) {
+        [System.IO.File]::WriteAllText($s.Globalvars, $newContent, [System.Text.UTF8Encoding]::new($false))
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Read config.psd1 via Import-PowerShellDataFile (no script execution).
 # ---------------------------------------------------------------------------
 function Get-PoshConfigValues {
@@ -633,6 +842,9 @@ Export-ModuleMember -Function @(
     'Test-PoshIoTarget',
     'Backup-PoshFile',
     'Get-PoshGlobalvarValues',
+    'Get-PoshGlobalvarDefinitions',
+    'Add-PoshGlobalvar',
+    'Remove-PoshGlobalvar',
     'Get-PoshConfigValues',
     'Get-PoshApiKeyStatus',
     'Get-PoshAesKeyStatus',

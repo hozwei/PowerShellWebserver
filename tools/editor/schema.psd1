@@ -19,6 +19,7 @@
         @{ Id = 'auth';     Title = 'Authentifizierung und Limits' }
         @{ Id = 'logging';  Title = 'Logging' }
         @{ Id = 'features'; Title = 'Komfort-Features' }
+        @{ Id = 'other';    Title = 'Sonstige (selbst hinzugefügt)' }
         @{ Id = 'setup';    Title = 'Setup-Helfer' }
     )
 

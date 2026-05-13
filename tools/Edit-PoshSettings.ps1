@@ -190,14 +190,82 @@ function Update-Activity {
 # ---------------------------------------------------------------------------
 # Route handlers. Each returns nothing; they write the response directly.
 # ---------------------------------------------------------------------------
+# Build the EFFECTIVE schema by scanning globalvars.ps1 for the variables
+# actually present and joining them with the static schema metadata.
+# globalvars.ps1 is the single source of truth for "which variables exist"
+# — deleting a $Var line drops the field on the next reload, adding one
+# makes it appear. Schema metadata (label, help, validator, group) is
+# layered on for matched names; unmatched names land in the "Sonstige"
+# group as auto-discovered with a permissive default type.
+function Build-EffectiveSchema {
+    $defs       = Get-PoshGlobalvarDefinitions
+    $configAll  = Get-PoshConfigValues
+    $configKeys = @($configAll.Keys)
+
+    $fields = [System.Collections.Generic.List[hashtable]]::new()
+
+    foreach ($def in $defs) {
+        $match = @($schema.Fields | Where-Object { $_.File -eq 'globalvars.ps1' -and $_.Name -eq $def.Name } | Select-Object -First 1)
+        # Skip non-literal vars that aren't in the schema. These are server
+        # internals (computed paths like $PoshBaseDir = Join-Path ...,
+        # interpolated strings, $env:... refs). They are not "settings" —
+        # showing them in a "Sonstige" bucket only confuses operators.
+        # Non-literal vars that ARE in the schema (e.g. DefaultTargetHost
+        # = $env:COMPUTERNAME) stay visible as read-only so the user can
+        # see the live value.
+        if (-not $def.IsLiteral -and $match.Count -eq 0) { continue }
+        $field = @{
+            Name      = $def.Name
+            File      = 'globalvars.ps1'
+            Type      = $def.Type
+            IsLiteral = $def.IsLiteral
+            RawText   = $def.RawText
+        }
+        if ($match.Count -gt 0) {
+            $m = $match[0]
+            $field.Label = $m.Label
+            $field.Group = $m.Group
+            $field.Help  = $m.Help
+            # Trust the schema's declared type when it disagrees with the AST
+            # only for literals (e.g. schema says int + Min/Max, AST agrees).
+            if ($def.IsLiteral) { $field.Type = $m.Type }
+            foreach ($k in 'Validator','Min','Max','Choices') {
+                if ($m.ContainsKey($k)) { $field[$k] = $m[$k] }
+            }
+        } else {
+            # User-added var (literal, no schema entry) — route to "Sonstige".
+            $field.Label = '$' + $def.Name
+            $field.Group = 'other'
+            $field.Help  = 'Auto-erkannt aus globalvars.ps1 (nicht im Schema dokumentiert).'
+        }
+        $null = $fields.Add($field)
+    }
+
+    foreach ($sf in @($schema.Fields | Where-Object { $_.File -eq 'config.psd1' })) {
+        if ($configKeys -contains $sf.Name) {
+            $copy = @{}
+            foreach ($k in $sf.Keys) { $copy[$k] = $sf[$k] }
+            $copy.IsLiteral = $true
+            $null = $fields.Add($copy)
+        }
+    }
+
+    # Only keep groups that actually have fields (plus 'setup', which is the
+    # helper tab and always present). Order follows the static $schema.Groups.
+    $usedIds = @($fields | ForEach-Object { $_.Group } | Sort-Object -Unique)
+    $usedIds += 'setup'
+    $groups = @($schema.Groups | Where-Object { $_.Id -in $usedIds })
+
+    return @{ Groups = $groups; Fields = @($fields) }
+}
+
 function Build-CurrentSnapshot {
-    # Hashtable shape: { globalvars: {Name=Value}, config: {Name=Value},
-    #                    env: {...}, aesKey: {...}, secrets: [...] }
-    $namesGlobal = @($schema.Fields | Where-Object { $_.File -eq 'globalvars.ps1' } | ForEach-Object { $_.Name })
+    param([hashtable] $EffectiveSchema = (Build-EffectiveSchema))
+    $namesGlobal = @($EffectiveSchema.Fields | Where-Object { $_.File -eq 'globalvars.ps1' } | ForEach-Object { $_.Name })
     $globalvars  = if ($namesGlobal.Count -gt 0) { Get-PoshGlobalvarValues -Names $namesGlobal } else { @{} }
     $configAll   = Get-PoshConfigValues
     $configSnap  = @{}
-    foreach ($field in $schema.Fields) {
+    foreach ($field in $EffectiveSchema.Fields) {
         if ($field.File -eq 'config.psd1' -and $configAll.ContainsKey($field.Name)) {
             $configSnap[$field.Name] = $configAll[$field.Name]
         }
@@ -213,9 +281,10 @@ function Build-CurrentSnapshot {
 }
 
 function Get-FlatCurrentValues {
-    $snap = Build-CurrentSnapshot
+    param([hashtable] $EffectiveSchema)
+    $snap = Build-CurrentSnapshot -EffectiveSchema $EffectiveSchema
     $out  = @{}
-    foreach ($field in $schema.Fields) {
+    foreach ($field in $EffectiveSchema.Fields) {
         $src = if ($field.File -eq 'globalvars.ps1') { $snap.globalvars } else { $snap.config }
         if ($src.ContainsKey($field.Name)) { $out[$field.Name] = $src[$field.Name] }
     }
@@ -224,10 +293,12 @@ function Get-FlatCurrentValues {
 
 function Invoke-RouteConfigGet {
     param($Response)
+    $eff  = Build-EffectiveSchema
+    $snap = Build-CurrentSnapshot -EffectiveSchema $eff
     Send-PoshJsonResponse -Response $Response -Payload @{
         ok       = $true
-        schema   = $schema
-        snapshot = Build-CurrentSnapshot
+        schema   = $eff
+        snapshot = $snap
     }
 }
 
@@ -237,24 +308,31 @@ function Invoke-RouteDiff {
         Send-PoshErrorResponse -Response $Response -StatusCode 400 -Message "Body must include 'values' object"
         return
     }
-    $proposed = [hashtable]$Body['values']
-    # Validate every proposed field first so a bad value never reaches diff
-    $errors = @{}
-    foreach ($field in $schema.Fields) {
+    $proposed  = [hashtable]$Body['values']
+    $eff       = Build-EffectiveSchema
+    # Only fields the effective schema currently exposes are valid targets.
+    $errors    = @{}
+    foreach ($field in $eff.Fields) {
         if ($proposed.ContainsKey($field.Name)) {
+            if ($field.ContainsKey('IsLiteral') -and -not $field.IsLiteral) {
+                $errors[$field.Name] = 'Wert ist berechnet (z.B. Join-Path); im Editor nicht änderbar.'
+                continue
+            }
             $typed = ConvertTo-PoshTypedValue -Field $field -RawValue $proposed[$field.Name]
             $err   = Test-PoshFieldValue -Field $field -Value $typed
             if ($err) { $errors[$field.Name] = $err }
         }
     }
     if ($errors.Count -gt 0) {
-        Send-PoshErrorResponse -Response $Response -StatusCode 422 -Message 'Validation failed'
-        # 422 already returned — re-call to add per-field errors. Easier:
-        # build the payload by hand instead of the helper above.
+        Send-PoshJsonResponse -Response $Response -StatusCode 422 -Payload @{
+            ok     = $false
+            error  = 'Validation failed'
+            fields = $errors
+        }
         return
     }
-    $current = Get-FlatCurrentValues
-    $changes = Compare-PoshFieldValues -Schema $schema.Fields -Current $current -Proposed $proposed
+    $current = Get-FlatCurrentValues -EffectiveSchema $eff
+    $changes = Compare-PoshFieldValues -Schema $eff.Fields -Current $current -Proposed $proposed
     Send-PoshJsonResponse -Response $Response -Payload @{
         ok      = $true
         changes = $changes
@@ -268,10 +346,18 @@ function Invoke-RouteSave {
         return
     }
     $proposed = [hashtable]$Body['values']
-    # Server-side validation again — never trust the diff confirmation alone.
+    $eff      = Build-EffectiveSchema
+    # Server-side validation against the dynamic schema. Defense in depth —
+    # never trust the diff confirmation alone, and never touch a variable
+    # the file doesn't currently define (the UI would have shown it as
+    # missing).
     $errors = @{}
-    foreach ($field in $schema.Fields) {
+    foreach ($field in $eff.Fields) {
         if ($proposed.ContainsKey($field.Name)) {
+            if ($field.ContainsKey('IsLiteral') -and -not $field.IsLiteral) {
+                $errors[$field.Name] = 'Wert ist berechnet; im Editor nicht änderbar.'
+                continue
+            }
             $typed = ConvertTo-PoshTypedValue -Field $field -RawValue $proposed[$field.Name]
             $err   = Test-PoshFieldValue -Field $field -Value $typed
             if ($err) { $errors[$field.Name] = $err }
@@ -286,7 +372,7 @@ function Invoke-RouteSave {
         return
     }
     try {
-        $backups = Save-PoshFieldChanges -Schema $schema.Fields -Proposed $proposed
+        $backups = Save-PoshFieldChanges -Schema $eff.Fields -Proposed $proposed
     } catch {
         Send-PoshErrorResponse -Response $Response -StatusCode 500 -Message ("Save failed: $_")
         return
@@ -295,6 +381,60 @@ function Invoke-RouteSave {
         ok      = $true
         backups = $backups
     }
+}
+
+function Invoke-RouteGlobalvarAdd {
+    param($Response, [hashtable] $Body)
+    if (-not $Body) { Send-PoshErrorResponse -Response $Response -StatusCode 400 -Message 'Body required'; return }
+    foreach ($k in 'name','value','type') {
+        if (-not $Body.ContainsKey($k)) {
+            Send-PoshErrorResponse -Response $Response -StatusCode 400 -Message ("Body must include '$k'")
+            return
+        }
+    }
+    $name = [string]$Body['name']
+    $type = [string]$Body['type']
+    if ($name -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') {
+        Send-PoshErrorResponse -Response $Response -StatusCode 400 -Message 'Name darf nur Buchstaben, Ziffern und _ enthalten und nicht mit einer Ziffer beginnen.'
+        return
+    }
+    if ($type -notin @('string','int','string-array','bool')) {
+        Send-PoshErrorResponse -Response $Response -StatusCode 400 -Message "Type must be one of: string, int, string-array, bool"
+        return
+    }
+    $rawValue = $Body['value']
+    $tempField = @{ Name = $name; File = 'globalvars.ps1'; Type = $type }
+    $typed = ConvertTo-PoshTypedValue -Field $tempField -RawValue $rawValue
+    $err   = Test-PoshFieldValue -Field $tempField -Value $typed
+    if ($err) {
+        Send-PoshJsonResponse -Response $Response -StatusCode 422 -Payload @{ ok = $false; error = $err; fields = @{ ($name) = $err } }
+        return
+    }
+    try {
+        $null = Backup-PoshFile -FilePath (Get-PoshIoState).Globalvars
+        Add-PoshGlobalvar -Name $name -Value $typed -Type $type
+    } catch {
+        Send-PoshErrorResponse -Response $Response -StatusCode 422 -Message ("$_")
+        return
+    }
+    Send-PoshJsonResponse -Response $Response -Payload @{ ok = $true; name = $name }
+}
+
+function Invoke-RouteGlobalvarRemove {
+    param($Response, [hashtable] $Body)
+    if (-not $Body -or -not $Body.ContainsKey('name')) {
+        Send-PoshErrorResponse -Response $Response -StatusCode 400 -Message "Body must include 'name'"
+        return
+    }
+    $name = [string]$Body['name']
+    try {
+        $null = Backup-PoshFile -FilePath (Get-PoshIoState).Globalvars
+        Remove-PoshGlobalvar -Name $name
+    } catch {
+        Send-PoshErrorResponse -Response $Response -StatusCode 422 -Message ("$_")
+        return
+    }
+    Send-PoshJsonResponse -Response $Response -Payload @{ ok = $true; name = $name }
 }
 
 function Invoke-RouteInitKey {
@@ -462,6 +602,16 @@ try {
                 '^POST /api/setenv$' {
                     $body = Read-PoshJsonBody -Request $request
                     Invoke-RouteSetEnv -Response $response -Body $body
+                    break
+                }
+                '^POST /api/globalvar/add$' {
+                    $body = Read-PoshJsonBody -Request $request
+                    Invoke-RouteGlobalvarAdd -Response $response -Body $body
+                    break
+                }
+                '^POST /api/globalvar/remove$' {
+                    $body = Read-PoshJsonBody -Request $request
+                    Invoke-RouteGlobalvarRemove -Response $response -Body $body
                     break
                 }
                 '^POST /api/quit$' {

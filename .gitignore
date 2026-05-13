@@ -27,6 +27,9 @@ encrypted_pw/encryptedString_*.txt
 config.psd1
 config.psd1.bak.*
 
+# Editor + tooling rotate backups next to the file being edited.
+globalvars.ps1.bak.*
+
 # ---------------------------------------------------------------------------
 # Project-specific exclusions
 # ---------------------------------------------------------------------------

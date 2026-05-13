@@ -203,6 +203,45 @@
             margin-bottom: 16px;
             font-size: 13px;
         }
+
+        .field .remove-btn {
+            margin-top: 6px;
+            border: 1px solid var(--border);
+            background: transparent;
+            color: var(--danger);
+            border-radius: 4px;
+            padding: 2px 8px;
+            font-size: 11px;
+            cursor: pointer;
+        }
+        .field .remove-btn:hover { background: #ffeef0; }
+        .field input:disabled,
+        .field textarea:disabled,
+        .field select:disabled {
+            background: #f0f1f4;
+            color: var(--muted);
+            cursor: not-allowed;
+        }
+        .field .computed-hint {
+            font-size: 11px;
+            color: var(--muted);
+            font-style: italic;
+            margin-top: 4px;
+        }
+        .add-form label {
+            display: block;
+            margin-top: 10px;
+            font-size: 12px;
+            color: var(--muted);
+        }
+        .add-form input, .add-form select, .add-form textarea {
+            width: 100%;
+            padding: 6px 10px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            font: inherit;
+            margin-top: 4px;
+        }
     </style>
 </head>
 <body>
@@ -211,7 +250,8 @@
             <h1>posh Einstellungen</h1>
             <div class="meta" id="meta-line">lade …</div>
         </div>
-        <div>
+        <div style="display:flex; gap:8px;">
+            <button class="btn" id="addvar-btn" title="Neue Variable in globalvars.ps1 anlegen">+ Variable</button>
             <button class="btn btn-danger" id="quit-btn" title="Editor beenden">Beenden</button>
         </div>
     </header>
@@ -246,6 +286,40 @@
             <div class="actions">
                 <button class="btn" id="prompt-cancel">Abbrechen</button>
                 <button class="btn btn-primary" id="prompt-confirm">OK</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal-bg" id="addvar-modal">
+        <div class="modal">
+            <h3>Neue Variable in globalvars.ps1 anlegen</h3>
+            <div class="body">
+                <p style="margin-top:0; color:var(--muted); font-size:13px;">
+                    Wird am Ende der Service-Endpoints-Sektion eingefügt. Beim nächsten Reload erscheint sie automatisch im Tab <strong>Sonstige</strong>.
+                </p>
+                <form class="add-form" id="addvar-form">
+                    <label>Variablenname (ohne <code>$</code>) — A-Z, 0-9, _; nicht mit Ziffer beginnen
+                        <input type="text" id="addvar-name" pattern="^[A-Za-z_][A-Za-z0-9_]*$" required autocomplete="off">
+                    </label>
+                    <label>Typ
+                        <select id="addvar-type">
+                            <option value="string">string</option>
+                            <option value="int">int</option>
+                            <option value="bool">bool</option>
+                            <option value="string-array">string-array</option>
+                        </select>
+                    </label>
+                    <label>Wert
+                        <input type="text" id="addvar-value" autocomplete="off">
+                    </label>
+                    <p id="addvar-hint" style="color:var(--muted); font-size:12px; margin-top:8px;">
+                        Hinweise: <em>string-array</em> = eine Zeile pro Eintrag, <em>bool</em> = <code>true</code> oder <code>false</code>.
+                    </p>
+                </form>
+            </div>
+            <div class="actions">
+                <button class="btn" id="addvar-cancel">Abbrechen</button>
+                <button class="btn btn-primary" id="addvar-confirm">Anlegen</button>
             </div>
         </div>
     </div>
@@ -439,6 +513,22 @@
         def.className = 'help';
         def.innerHTML = 'aktuell in der Datei: <code>' + formatCurrent(field).replace(/</g, '&lt;') + '</code>';
         right.appendChild(def);
+
+        if (field.IsLiteral === false) {
+            input.disabled = true;
+            const hint = document.createElement('div');
+            hint.className = 'computed-hint';
+            hint.textContent = 'Berechneter Wert (z.B. Join-Path oder $env:...) — nur direkt in globalvars.ps1 editierbar.';
+            right.appendChild(hint);
+        } else if (field.File === 'globalvars.ps1') {
+            const rm = document.createElement('button');
+            rm.className = 'remove-btn';
+            rm.type = 'button';
+            rm.textContent = '✕ aus globalvars.ps1 entfernen';
+            rm.title = 'Variable komplett aus globalvars.ps1 löschen';
+            rm.addEventListener('click', () => removeGlobalvar(field.Name));
+            right.appendChild(rm);
+        }
 
         row.append(left, right);
         return row;
@@ -657,10 +747,82 @@
         renderGroup(state.active);
     };
 
+    const removeGlobalvar = async (name) => {
+        if (!confirm("Variable $" + name + " aus globalvars.ps1 wirklich entfernen?\n\nEin Backup wird vorher angelegt.")) return;
+        try {
+            await api('POST', '/api/globalvar/remove', { name });
+            toast('$' + name + ' entfernt.');
+        } catch (e) {
+            toast(e.message, 'err');
+            return;
+        }
+        await loadAll();
+        // Group may have disappeared if it was the last field in that tab.
+        if (!state.schema.Groups.find(g => g.Id === state.active)) {
+            state.active = (state.schema.Groups[0] || { Id: 'setup' }).Id;
+        }
+        renderTabs();
+        renderGroup(state.active);
+    };
+
+    const openAddVarModal = () => {
+        $('#addvar-name').value = '';
+        $('#addvar-type').value = 'string';
+        $('#addvar-value').value = '';
+        $('#addvar-modal').classList.add('shown');
+        setTimeout(() => $('#addvar-name').focus(), 50);
+    };
+
+    const closeAddVarModal = () => {
+        $('#addvar-modal').classList.remove('shown');
+    };
+
+    const confirmAddVar = async () => {
+        const name = $('#addvar-name').value.trim();
+        const type = $('#addvar-type').value;
+        const rawV = $('#addvar-value').value;
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+            toast('Variablenname ungültig.', 'err');
+            return;
+        }
+        let value;
+        if (type === 'bool') {
+            value = (rawV.trim().toLowerCase() === 'true' || rawV.trim() === '1');
+        } else if (type === 'int') {
+            const n = Number(rawV);
+            if (!Number.isInteger(n)) { toast('Wert muss eine Ganzzahl sein.', 'err'); return; }
+            value = n;
+        } else if (type === 'string-array') {
+            value = rawV.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+        } else {
+            value = rawV;
+        }
+        try {
+            await api('POST', '/api/globalvar/add', { name, type, value });
+            toast('$' + name + ' angelegt.');
+        } catch (e) {
+            toast(e.message, 'err');
+            return;
+        }
+        closeAddVarModal();
+        await loadAll();
+        renderTabs();
+        // Jump to "Sonstige" tab so the user immediately sees the new var
+        const otherTab = state.schema.Groups.find(g => g.Id === 'other');
+        if (otherTab) {
+            state.active = 'other';
+            $$('#tabs button').forEach(b => b.classList.toggle('active', b.dataset.id === 'other'));
+        }
+        renderGroup(state.active);
+    };
+
     const init = async () => {
         $('#diff-cancel').addEventListener('click', () => $('#diff-modal').classList.remove('shown'));
         $('#diff-confirm').addEventListener('click', confirmDiffSave);
         $('#save-btn').addEventListener('click', openDiffModal);
+        $('#addvar-btn').addEventListener('click', openAddVarModal);
+        $('#addvar-cancel').addEventListener('click', closeAddVarModal);
+        $('#addvar-confirm').addEventListener('click', confirmAddVar);
         $('#quit-btn').addEventListener('click', async () => {
             if (!confirm('Editor beenden?')) return;
             try { await api('POST', '/api/quit', {}); } catch (e) { /* server is shutting down, that is fine */ }
