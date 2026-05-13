@@ -344,6 +344,30 @@ posh_rate_limit_table_size 12
 # HELP posh_script_metadata_cache_size Cached AST metadata entries.
 # TYPE posh_script_metadata_cache_size gauge
 posh_script_metadata_cache_size 6
+# HELP posh_log_drops_total Log lines skipped because the request-log mutex was contended for >500ms.
+# TYPE posh_log_drops_total counter
+posh_log_drops_total 0
+# HELP posh_audit_log_drops_total Audit-log lines skipped under contention.
+# TYPE posh_audit_log_drops_total counter
+posh_audit_log_drops_total 0
+# HELP posh_slow_log_drops_total Slow-log lines skipped under contention.
+# TYPE posh_slow_log_drops_total counter
+posh_slow_log_drops_total 0
+# HELP posh_runspace_dispose_failures_total EndInvoke/Dispose calls that threw during runspace cleanup.
+# TYPE posh_runspace_dispose_failures_total counter
+posh_runspace_dispose_failures_total 0
+# HELP posh_in_flight_peak High-water mark of concurrently in-flight requests since process start.
+# TYPE posh_in_flight_peak gauge
+posh_in_flight_peak 4
+# HELP posh_auth_failures_total Number of requests that failed authentication (HTTP 401).
+# TYPE posh_auth_failures_total counter
+posh_auth_failures_total 0
+# HELP posh_script_timeouts_total Number of script executions killed for exceeding ScriptTimeoutSec.
+# TYPE posh_script_timeouts_total counter
+posh_script_timeouts_total 0
+# HELP posh_rate_limit_penalty_active Count of rate-limit entries currently in penalty.
+# TYPE posh_rate_limit_penalty_active gauge
+posh_rate_limit_penalty_active 0
 ```
 
 Toggle via `PromMetricsEnabled` in `config.psd1` (default `$true`).
