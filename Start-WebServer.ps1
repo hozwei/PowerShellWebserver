@@ -3506,8 +3506,9 @@ function Get-ScriptIndex {
 # Resolve-ApiKeyIdentity
 # Looks up an X-Api-Key value against $cfg.ApiKeys and returns the matching
 # label, or $null when the key does not match any configured entry.
-# Comparison is ordinal (case-sensitive byte-exact) — matches the Loop-3 fix
-# for the legacy single-key path.
+# Comparison is ordinal AND constant-time (CryptographicOperations::FixedTimeEquals)
+# so an attacker can't probe correct prefixes via response-time differences.
+# The fallback ordinal compare runs only when lengths differ (already non-match).
 #
 # Returned label flows into $script:authIdentity and from there into the
 # request log, audit log, per-key rate-limit, and Prometheus metrics.
@@ -3516,8 +3517,12 @@ function Resolve-ApiKeyIdentity {
     param([string] $ProvidedKey)
     if ([string]::IsNullOrEmpty($ProvidedKey)) { return $null }
     if (-not $script:cfg.ApiKeys -or $script:cfg.ApiKeys.Count -eq 0) { return $null }
+    $providedBytes = [System.Text.Encoding]::UTF8.GetBytes($ProvidedKey)
     foreach ($entry in $script:cfg.ApiKeys.GetEnumerator()) {
-        if ([string]::Equals($entry.Value, $ProvidedKey, [System.StringComparison]::Ordinal)) {
+        $configuredKey = [string]$entry.Value
+        if ($configuredKey.Length -ne $ProvidedKey.Length) { continue }  # length leak is acceptable
+        $configuredBytes = [System.Text.Encoding]::UTF8.GetBytes($configuredKey)
+        if ([System.Security.Cryptography.CryptographicOperations]::FixedTimeEquals($providedBytes, $configuredBytes)) {
             return $entry.Key
         }
     }
@@ -3917,13 +3922,20 @@ $requestHandler = {
             # F4: when RateLimitPerIdentity is on AND the request carries a valid X-Api-Key,
             # account against the key's label instead of the IP. Wrong / missing keys fall
             # back to per-IP — so brute-force attempts on the auth still hit the IP quota.
-            # Resolve here without setting $script:authIdentity; the auth block below does
-            # that authoritatively (same Resolve-ApiKeyIdentity call).
+            # Resolve once and cache for the auth block below — Resolve-ApiKeyIdentity
+            # is constant-time on the key value, so calling it twice doubles the
+            # per-request crypto cost for no reason. The pair of variables is the
+            # sentinel: $apiKeyResolved tracks "did we look up?" so the auth block
+            # can distinguish "not yet checked" from "checked, no match".
+            $script:resolvedApiKeyLabel = $null
+            $script:apiKeyResolved      = $false
             $rateLimitIdentity = ''
             if ($script:cfg.RateLimitPerIdentity) {
                 $earlyKey = $req.Headers['X-Api-Key']
                 if (-not [string]::IsNullOrEmpty($earlyKey)) {
                     $earlyLabel = Resolve-ApiKeyIdentity -ProvidedKey $earlyKey
+                    $script:resolvedApiKeyLabel = $earlyLabel
+                    $script:apiKeyResolved      = $true
                     if ($null -ne $earlyLabel) { $rateLimitIdentity = $earlyLabel }
                 }
             }
@@ -3974,6 +3986,10 @@ $requestHandler = {
         } else {
             $authMode    = $script:cfg.AuthMode
             $authPassed  = $false
+            # Accumulates what the client tried — feeds into the AUTH_FAIL audit entry
+            # below so operators can distinguish brute-force from misconfigured clients.
+            # Never includes the secret VALUE — only the length or a derivable label.
+            $authAttempts = [System.Collections.Generic.List[string]]::new()
 
             # IMPORTANT: PowerShell's -eq operator on strings is case-INSENSITIVE by default.
             # Credentials MUST be compared case-sensitively. [string]::Equals with
@@ -3984,7 +4000,18 @@ $requestHandler = {
             # the BC fallback in startup populates it with @{ 'default' = $cfg.ApiKey }.
             if ($authMode -eq 'ApiKey' -or $authMode -eq 'Both') {
                 $providedKey  = $req.Headers['X-Api-Key']
-                $matchedLabel = Resolve-ApiKeyIdentity -ProvidedKey $providedKey
+                if (-not [string]::IsNullOrEmpty($providedKey)) {
+                    $authAttempts.Add(("apikey(len={0})" -f $providedKey.Length))
+                }
+                # Reuse the rate-limit early-resolve result when one was performed —
+                # avoids a second constant-time scan of $cfg.ApiKeys per request.
+                # $apiKeyResolved=$true means we already did the lookup; the cached
+                # label may be $null (no match) and we honour that.
+                $matchedLabel = if ($script:apiKeyResolved) {
+                    $script:resolvedApiKeyLabel
+                } else {
+                    Resolve-ApiKeyIdentity -ProvidedKey $providedKey
+                }
                 if ($null -ne $matchedLabel) {
                     $authPassed = $true
                     $script:authIdentity = $matchedLabel
@@ -4000,8 +4027,25 @@ $requestHandler = {
                         if ($colonIx -ge 0) {
                             $providedUser = $decoded.Substring(0, $colonIx)
                             $providedPass = $decoded.Substring($colonIx + 1)
-                            if ([string]::Equals($providedUser, $script:cfg.BasicAuthUser, [System.StringComparison]::Ordinal) -and
-                                [string]::Equals($providedPass, $script:cfg.BasicAuthPass, [System.StringComparison]::Ordinal)) {
+                            $authAttempts.Add(("basic(user='{0}')" -f $providedUser))
+                            # Constant-time comparison (same defense as the API-key path).
+                            # Length-pre-check is intentional: leaking length isn't useful
+                            # to an attacker who already has to brute-force two fields.
+                            $configUser = [string]$script:cfg.BasicAuthUser
+                            $configPass = [string]$script:cfg.BasicAuthPass
+                            $userMatch = $false
+                            $passMatch = $false
+                            if ($providedUser.Length -eq $configUser.Length) {
+                                $userMatch = [System.Security.Cryptography.CryptographicOperations]::FixedTimeEquals(
+                                    [System.Text.Encoding]::UTF8.GetBytes($providedUser),
+                                    [System.Text.Encoding]::UTF8.GetBytes($configUser))
+                            }
+                            if ($providedPass.Length -eq $configPass.Length) {
+                                $passMatch = [System.Security.Cryptography.CryptographicOperations]::FixedTimeEquals(
+                                    [System.Text.Encoding]::UTF8.GetBytes($providedPass),
+                                    [System.Text.Encoding]::UTF8.GetBytes($configPass))
+                            }
+                            if ($userMatch -and $passMatch) {
                                 $authPassed = $true
                                 # User name (NOT password) flows into identity for audit attribution.
                                 $script:authIdentity = "basic:$providedUser"
@@ -4014,12 +4058,20 @@ $requestHandler = {
             if (-not $authPassed) {
                 $body = New-JsonResponse -ExitCode 401 -Output '' -Err 'Unauthorized.'
                 if ($authMode -eq 'Basic' -or $authMode -eq 'Both') {
-                    $resp.AddHeader('WWW-Authenticate', ('Basic realm="{0}"' -f $script:cfg.BasicAuthRealm))
+                    # Quoted-string escaping per RFC 7230: backslash-escape '"' and '\'.
+                    # Operators occasionally put weird characters in BasicAuthRealm
+                    # (i18n strings, version stamps); without escaping, an unescaped
+                    # quote would split the header and confuse strict HTTP clients.
+                    $realmEscaped = ([string]$script:cfg.BasicAuthRealm) -replace '\\', '\\' -replace '"', '\"'
+                    $resp.AddHeader('WWW-Authenticate', ('Basic realm="{0}"' -f $realmEscaped))
                 }
                 Send-Response -Response $resp -StatusCode 401 -Body $body -RequestId $requestId
                 Write-Log -ClientIP $clientIP -Request $requestLine -Status 'UNAUTHORIZED' -ExitCode '-' -RequestId $requestId -Identity '-'
                 # F5: audit security-relevant denial — operators can correlate with brute-force attempts.
-                Write-AuditLog -EventName 'AUTH_FAIL' -ClientIP $clientIP -Path $urlPath -Detail ("mode=$authMode")
+                # $authAttempts captures what the client tried (mechanism + user/key-length, never value)
+                # so a forensics review of audit.log shows the attack surface without secret leakage.
+                $attemptsStr = if ($authAttempts.Count -gt 0) { $authAttempts -join ',' } else { 'none' }
+                Write-AuditLog -EventName 'AUTH_FAIL' -ClientIP $clientIP -Path $urlPath -Detail ("mode=$authMode;attempts=$attemptsStr")
                 return
             }
         }
