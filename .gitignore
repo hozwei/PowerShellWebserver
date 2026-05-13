@@ -10,7 +10,7 @@ logs/*.log
 # Secrets — keep encrypted credential files out of git
 # ---------------------------------------------------------------------------
 # globalvars.ps1 is THE central config and ships in the repo. After running
-# tools\Initialize-Globalvars.ps1 the $key array contains your per-install
+# tools\New-PoshAesKey.ps1 the $key array contains your per-install
 # random AES key — do NOT commit that personalised version back upstream.
 encrypted_pw/encryptedString_*.txt
 
@@ -18,7 +18,7 @@ encrypted_pw/encryptedString_*.txt
 !encrypted_pw/.gitkeep
 
 # ---------------------------------------------------------------------------
-# Runtime configuration — generated per install by tools\Initialize-Config.ps1
+# Runtime configuration — generated per install by tools\Initialize-PoshConfig.ps1
 # ---------------------------------------------------------------------------
 # config.psd1 is the runtime source of truth for the posh server. It is
 # generated locally from the inline $cfg defaults in Start-WebServer.ps1

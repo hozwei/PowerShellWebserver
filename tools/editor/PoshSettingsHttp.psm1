@@ -1,7 +1,7 @@
 #Requires -Version 7.0
 <#
 .SYNOPSIS
-    HTTP plumbing for tools\Edit-PoshSettings.ps1.
+    HTTP plumbing for Edit-PoshSettings.ps1.
 
 .DESCRIPTION
     Loopback-only listener helpers: response writers, JSON body reader,

@@ -17,7 +17,6 @@ The repo has extensive documentation — prefer reading these over re-deriving f
 - [docs/configuration.md](docs/configuration.md) — Every `$cfg` option.
 - [docs/contributing.md](docs/contributing.md) — Conventions, branching, commit format, endpoint rules.
 - [docs/post-json.md](docs/post-json.md) — POST-body-as-file passthrough pattern.
-- [docs/feature-comparison-old-posh.md](docs/feature-comparison-old-posh.md) — Feature-by-feature comparison against the legacy PoSH Server 3.7 in the (gitignored) `OLD POSH/` sibling folder, plus the multi-PR implementation roadmap currently in progress.
 
 ## Common commands
 
@@ -95,9 +94,4 @@ Examples:
 ```
 feat(server): add GZIP response compression for text MIME types
 fix(logging): only call ReleaseMutex when WaitOne succeeded
-docs(comparison): add OLD POSH feature parity table
 ```
-
-## Active work
-
-A multi-PR roadmap is in progress to bring the server to feature parity (and beyond) with the legacy PoSH Server 3.7. See [docs/feature-comparison-old-posh.md](docs/feature-comparison-old-posh.md) for the table and PR breakdown. All new options ship with backward-compatible defaults — fresh installs must behave identically to the pre-roadmap baseline unless an option is explicitly enabled.

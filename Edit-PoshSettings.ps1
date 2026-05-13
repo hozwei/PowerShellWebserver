@@ -39,11 +39,11 @@
     Seconds of idle time before the editor stops itself. Default 600.
 
 .PARAMETER RepoRoot
-    Override the repository root. Defaults to the directory above this
-    script.
+    Override the repository root. Defaults to the directory containing
+    this script.
 
 .EXAMPLE
-    .\tools\Edit-PoshSettings.ps1
+    .\Edit-PoshSettings.ps1
 #>
 [CmdletBinding()]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '',
@@ -61,9 +61,9 @@ Set-StrictMode -Version 3.0
 $ErrorActionPreference = 'Stop'
 
 $scriptDir = $PSScriptRoot
-$editorDir = Join-Path $scriptDir 'editor'
+$editorDir = Join-Path $scriptDir 'tools\editor'
 if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
-    $RepoRoot = Split-Path -Parent $scriptDir
+    $RepoRoot = $scriptDir
 }
 
 # ---------------------------------------------------------------------------
@@ -85,9 +85,8 @@ Initialize-PoshSettingsIO -RepoRoot $RepoRoot
 
 # Pre-flight: globalvars.ps1 + config.psd1 must exist and parse cleanly.
 # Failing at startup is friendlier than failing on the first /api/config
-# request with an opaque JS toast. Initialize-Config.ps1 from PR 1
-# is the canonical seeder for config.psd1; globalvars.ps1 is shipped in
-# the repo.
+# request with an opaque JS toast. Initialize-PoshConfig.ps1 is the
+# canonical seeder for config.psd1; globalvars.ps1 is shipped in the repo.
 $ioState = Get-PoshIoState
 if (-not (Test-Path -LiteralPath $ioState.Globalvars -PathType Leaf)) {
     Write-Host "ABORT: globalvars.ps1 not found at $($ioState.Globalvars)" -ForegroundColor Red
@@ -96,7 +95,7 @@ if (-not (Test-Path -LiteralPath $ioState.Globalvars -PathType Leaf)) {
 }
 if (-not (Test-Path -LiteralPath $ioState.ConfigPsd1 -PathType Leaf)) {
     Write-Host "ABORT: config.psd1 not found at $($ioState.ConfigPsd1)" -ForegroundColor Red
-    Write-Host '       Run tools\Initialize-Config.ps1 first.'
+    Write-Host '       Run tools\Initialize-PoshConfig.ps1 first.'
     exit 1
 }
 try {
@@ -112,7 +111,7 @@ try {
 } catch {
     Write-Host "ABORT: config.psd1 is unreadable:" -ForegroundColor Red
     Write-Host "       $_"
-    Write-Host '       Regenerate via tools\Initialize-Config.ps1 -Force.'
+    Write-Host '       Regenerate via tools\Initialize-PoshConfig.ps1 -Force.'
     exit 1
 }
 

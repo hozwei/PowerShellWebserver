@@ -15,7 +15,7 @@
     Secret storage
     --------------
     The $key below encrypts and decrypts every file in encrypted_pw\.
-    Run `tools\Initialize-Globalvars.ps1` ONCE per install to replace
+    Run `tools\New-PoshAesKey.ps1` ONCE per install to replace
     the placeholder bytes below with 32 cryptographically random bytes
     that are unique to this deployment.
 
@@ -42,7 +42,7 @@ param()
 #  Section 1 — Service endpoints and identifiers
 #  Minimal baseline that fits almost every install. Add your own vars
 #  (Jira, vCenter, WSUS, Veeam, Lansweeper, …) directly in this section
-#  or via tools\Edit-PoshSettings.ps1 → "+ Variable".
+#  or via .\Edit-PoshSettings.ps1 → "+ Variable".
 # ===========================================================================
 
 # Active Directory
@@ -84,7 +84,7 @@ $PoshToolsDir         = Join-Path $PoshBaseDir 'tools'
 # ===========================================================================
 #  Section 3 — AES key for encrypted_pw\encryptedString_*.txt
 #
-#  Placeholder below. Run tools\Initialize-Globalvars.ps1 ONCE per install
+#  Placeholder below. Run tools\New-PoshAesKey.ps1 ONCE per install
 #  to replace it with 32 cryptographically random bytes unique to this
 #  deployment. Do NOT commit a personalised globalvars.ps1 with a real key.
 # ===========================================================================

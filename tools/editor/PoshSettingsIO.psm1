@@ -1,7 +1,7 @@
 #Requires -Version 7.0
 <#
 .SYNOPSIS
-    IO layer for tools\Edit-PoshSettings.ps1.
+    IO layer for Edit-PoshSettings.ps1.
 
 .DESCRIPTION
     Reads and writes globalvars.ps1 / config.psd1 in a way that preserves
@@ -386,7 +386,7 @@ function Get-PoshConfigValues {
     param()
     $s = Get-PoshIoState
     if (-not (Test-Path -LiteralPath $s.ConfigPsd1 -PathType Leaf)) {
-        throw "config.psd1 not found: $($s.ConfigPsd1) — run tools\Initialize-Config.ps1 first"
+        throw "config.psd1 not found: $($s.ConfigPsd1) — run tools\Initialize-PoshConfig.ps1 first"
     }
     return Import-PowerShellDataFile -LiteralPath $s.ConfigPsd1
 }
@@ -452,7 +452,7 @@ function Get-PoshSecretList {
 # ---------------------------------------------------------------------------
 # Render a typed value as a psd1 / PowerShell literal. Strings get single
 # quotes with internal '' escaping. Arrays get @(...) on one line for
-# Initialize-Config compatibility (the diff stays minimal).
+# Initialize-PoshConfig compatibility (the diff stays minimal).
 # ---------------------------------------------------------------------------
 function ConvertTo-PoshLiteral {
     [OutputType([string])]
@@ -805,7 +805,7 @@ function Save-PoshFieldChanges {
 
 # ---------------------------------------------------------------------------
 # AES key generation. Mirrors the core write path of
-# tools\Initialize-Globalvars.ps1 but returns instead of exiting so the
+# tools\New-PoshAesKey.ps1 but returns instead of exiting so the
 # HTTP handler can surface success / failure as JSON.
 # ---------------------------------------------------------------------------
 function New-PoshAesKey {

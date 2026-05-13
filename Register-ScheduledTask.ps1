@@ -607,20 +607,20 @@ try {
     # action and shadow the file.
     # ------------------------------------------------------------------
     $configFile       = Join-Path $baseDir 'config.psd1'
-    $initConfigScript = Join-Path $baseDir 'tools\Initialize-Config.ps1'
+    $initConfigScript = Join-Path $baseDir 'tools\Initialize-PoshConfig.ps1'
     $configReady      = $false
     if (Test-Path -LiteralPath $configFile -PathType Leaf) {
         $configReady = $true
         Write-Output "config.psd1  : exists ($configFile) — updating with new port settings."
     } elseif (-not (Test-Path -LiteralPath $initConfigScript -PathType Leaf)) {
-        Write-Output "WARNING: tools\Initialize-Config.ps1 not found at $initConfigScript."
+        Write-Output "WARNING: tools\Initialize-PoshConfig.ps1 not found at $initConfigScript."
         Write-Output '         Server will hard-fail at startup until you create config.psd1 manually.'
     } else {
         Write-Output 'Generating config.psd1 from inline defaults...'
         & $initConfigScript -ServerScript $SCRIPT_PATH -OutputFile $configFile
         if ($LASTEXITCODE -ne 0) {
             Write-Output ''
-            Write-Output "WARNING: Initialize-Config.ps1 exited with code $LASTEXITCODE."
+            Write-Output "WARNING: Initialize-PoshConfig.ps1 exited with code $LASTEXITCODE."
             Write-Output '         Server will hard-fail at startup until config.psd1 is fixed or regenerated.'
         } else {
             $configReady = $true
@@ -657,7 +657,7 @@ try {
                 Write-Output ("  {0,-13} -> {1}" -f $u.Key, $u.Value)
             } catch {
                 Write-Output ("  WARNING: {0} could not be updated: {1}" -f $u.Key, $_)
-                Write-Output '           Edit the file by hand or re-run tools\Edit-PoshSettings.ps1.'
+                Write-Output '           Edit the file by hand or run .\Edit-PoshSettings.ps1.'
             }
         }
     }

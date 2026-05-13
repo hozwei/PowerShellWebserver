@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------
-#  Field metadata for tools\Edit-PoshSettings.ps1
+#  Field metadata for Edit-PoshSettings.ps1
 #
 #  Single source of truth for what the browser editor exposes:
 #  which keys are documented, where they live, how they validate. The

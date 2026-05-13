@@ -52,10 +52,10 @@ param(
     [ValidateRange(1, 65535)]
     [int]    $HttpsPort = 443,
     # Path to the runtime config.psd1. Empty = '<baseDir>\config.psd1'. The file
-    # is mandatory at startup — generate it once via tools\Initialize-Config.ps1.
+    # is mandatory at startup — generate it once via tools\Initialize-PoshConfig.ps1.
     [string] $ConfigFile = '',
     # Internal: dump the inline $cfg defaults (after derived-field fallbacks) as
-    # JSON to stdout, then exit 0. Used by tools\Initialize-Config.ps1 to seed a
+    # JSON to stdout, then exit 0. Used by tools\Initialize-PoshConfig.ps1 to seed a
     # fresh config.psd1 without running the listener. Skips POSH_API_KEY and
     # external-config checks because the dump only consumes inline defaults.
     [switch] $DumpConfig,
@@ -295,7 +295,7 @@ function Set-CfgDerivedDefaults {
 
 # ---------------------------------------------------------------------------
 # -DumpConfig: emit the inline $cfg defaults (after derived-field fallbacks)
-# as JSON and exit. tools\Initialize-Config.ps1 consumes this to seed a
+# as JSON and exit. tools\Initialize-PoshConfig.ps1 consumes this to seed a
 # fresh config.psd1 without ever touching the listener.
 # ---------------------------------------------------------------------------
 if ($DumpConfig) {
@@ -306,14 +306,14 @@ if ($DumpConfig) {
 
 # ---------------------------------------------------------------------------
 # config.psd1 is mandatory at startup — generate it once via
-# tools\Initialize-Config.ps1. The inline $cfg block above remains the
+# tools\Initialize-PoshConfig.ps1. The inline $cfg block above remains the
 # upstream schema (and supplies fallbacks for keys missing from the file),
 # but every install must own a personalised runtime config so changes are
 # visible in `git diff`/the editor and not buried in script defaults.
 # ---------------------------------------------------------------------------
 $resolvedConfigFile = if (-not [string]::IsNullOrEmpty($ConfigFile)) { $ConfigFile } else { Join-Path $baseDir 'config.psd1' }
 if (-not (Test-Path -LiteralPath $resolvedConfigFile -PathType Leaf)) {
-    $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | STARTUP | ERROR: config.psd1 not found at '$resolvedConfigFile'. Run tools\Initialize-Config.ps1 first."
+    $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | STARTUP | ERROR: config.psd1 not found at '$resolvedConfigFile'. Run tools\Initialize-PoshConfig.ps1 first."
     try {
         if (-not (Test-Path $baseDir)) { $null = New-Item -ItemType Directory -Path $baseDir -Force }
         [System.IO.File]::AppendAllText((Join-Path $baseDir 'logs\startup.log'), $line + [System.Environment]::NewLine, [System.Text.Encoding]::UTF8)
@@ -323,7 +323,7 @@ if (-not (Test-Path -LiteralPath $resolvedConfigFile -PathType Leaf)) {
     Write-Output "ERROR: config.psd1 is required but was not found at: $resolvedConfigFile"
     Write-Output ''
     Write-Output 'Solution: generate it once from the inline defaults via:'
-    Write-Output '  .\tools\Initialize-Config.ps1'
+    Write-Output '  .\tools\Initialize-PoshConfig.ps1'
     Write-Output ''
     Write-Output 'Or pass an explicit path:'
     Write-Output "  .\Start-WebServer.ps1 -ConfigFile 'D:\posh\custom.psd1'"

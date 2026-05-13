@@ -19,7 +19,7 @@
     encryptedString_*.txt must be re-encrypted via Set-PoshSecret.ps1.
 
 .EXAMPLE
-    .\tools\Initialize-Globalvars.ps1
+    .\tools\New-PoshAesKey.ps1
 #>
 [CmdletBinding(SupportsShouldProcess)]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '',
