@@ -59,10 +59,110 @@ function Test-PoshIoTarget {
     $resolved = [System.IO.Path]::GetFullPath($Path)
     if ($resolved -ieq $s.Globalvars) { return $true }
     if ($resolved -ieq $s.ConfigPsd1) { return $true }
+    # Backup siblings of the two managed files. The stamp pattern is the
+    # one Backup-PoshFile writes; anything outside that suffix is rejected
+    # so an attacker who somehow reached this layer can't aim at arbitrary
+    # paths.
+    if ($resolved -match '^(.+)\.bak\.[0-9]{8}-[0-9]{6}$') {
+        $base = $matches[1]
+        if ($base -ieq $s.Globalvars) { return $true }
+        if ($base -ieq $s.ConfigPsd1) { return $true }
+    }
     $encPrefix = $s.EncryptedDir + [System.IO.Path]::DirectorySeparatorChar
     if ($resolved.StartsWith($encPrefix, [System.StringComparison]::OrdinalIgnoreCase) -and
         ($resolved -match 'encryptedString_[A-Za-z0-9_-]+\.txt$')) { return $true }
     return $false
+}
+
+# ---------------------------------------------------------------------------
+# Backup catalogue + read/restore helpers used by the Setup tab.
+# ---------------------------------------------------------------------------
+function Get-PoshBackupList {
+    [OutputType([hashtable])]
+    param()
+    $s = Get-PoshIoState
+    $out = @{}
+    foreach ($entry in @(
+        @{ Logical = 'globalvars.ps1'; Path = $s.Globalvars }
+        @{ Logical = 'config.psd1';    Path = $s.ConfigPsd1 }
+    )) {
+        $dir  = Split-Path -Parent $entry.Path
+        $name = Split-Path -Leaf   $entry.Path
+        $list = [System.Collections.Generic.List[hashtable]]::new()
+        if (Test-Path -LiteralPath $dir -PathType Container) {
+            $files = Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -match ("^" + [regex]::Escape($name) + "\.bak\.([0-9]{8}-[0-9]{6})$") } |
+                Sort-Object Name -Descending
+            foreach ($f in $files) {
+                $null = $matches  # touch automatic var so strict mode is happy
+                if ($f.Name -match ("^" + [regex]::Escape($name) + "\.bak\.([0-9]{8}-[0-9]{6})$")) {
+                    $stamp = $matches[1]
+                    $iso   = try {
+                        [datetime]::ParseExact($stamp, 'yyyyMMdd-HHmmss', $null).ToString('yyyy-MM-dd HH:mm:ss')
+                    } catch { $stamp }
+                    $null = $list.Add(@{
+                        Stamp     = $stamp
+                        Displayed = $iso
+                        SizeBytes = $f.Length
+                    })
+                }
+            }
+        }
+        $out[$entry.Logical] = @($list)
+    }
+    return $out
+}
+
+function Read-PoshBackup {
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)] [ValidateSet('globalvars.ps1','config.psd1')] [string] $File,
+        [Parameter(Mandatory)] [ValidatePattern('^[0-9]{8}-[0-9]{6}$')] [string] $Stamp,
+        [int] $MaxBytes = 262144
+    )
+    $s = Get-PoshIoState
+    $base = if ($File -eq 'globalvars.ps1') { $s.Globalvars } else { $s.ConfigPsd1 }
+    $backupPath = "$base.bak.$Stamp"
+    Assert-PoshIoTarget -Path $backupPath
+    if (-not (Test-Path -LiteralPath $backupPath -PathType Leaf)) {
+        throw "Backup not found: $File @ $Stamp"
+    }
+    $info = Get-Item -LiteralPath $backupPath
+    if ($info.Length -gt $MaxBytes) {
+        throw ("Backup is too large to preview ({0} bytes > {1} cap)" -f $info.Length, $MaxBytes)
+    }
+    return [System.IO.File]::ReadAllText($backupPath, [System.Text.UTF8Encoding]::new($false))
+}
+
+function Restore-PoshBackup {
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)] [ValidateSet('globalvars.ps1','config.psd1')] [string] $File,
+        [Parameter(Mandatory)] [ValidatePattern('^[0-9]{8}-[0-9]{6}$')] [string] $Stamp
+    )
+    $s = Get-PoshIoState
+    $current = if ($File -eq 'globalvars.ps1') { $s.Globalvars } else { $s.ConfigPsd1 }
+    $backupPath = "$current.bak.$Stamp"
+    Assert-PoshIoTarget -Path $backupPath
+    Assert-PoshIoTarget -Path $current
+    if (-not (Test-Path -LiteralPath $backupPath -PathType Leaf)) {
+        throw "Backup not found: $File @ $Stamp"
+    }
+    # Always back up the current file before overwriting so a misclick is
+    # recoverable. Pruning is handled by Backup-PoshFile's rotation.
+    $newBackup = $null
+    if ($PSCmdlet.ShouldProcess($current, "Pre-restore backup")) {
+        $newBackup = Backup-PoshFile -FilePath $current
+    }
+    if ($PSCmdlet.ShouldProcess($current, "Restore from $Stamp")) {
+        Copy-Item -LiteralPath $backupPath -Destination $current -Force
+    }
+    return @{
+        File          = $File
+        RestoredStamp = $Stamp
+        PreBackup     = $newBackup
+    }
 }
 
 function Assert-PoshIoTarget {
@@ -1074,5 +1174,8 @@ Export-ModuleMember -Function @(
     'New-PoshAesKey',
     'Save-PoshSecret',
     'Set-PoshApiKeyEnv',
-    'Test-PoshIsAdmin'
+    'Test-PoshIsAdmin',
+    'Get-PoshBackupList',
+    'Read-PoshBackup',
+    'Restore-PoshBackup'
 )

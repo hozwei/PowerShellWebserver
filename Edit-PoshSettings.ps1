@@ -293,6 +293,7 @@ function Build-CurrentSnapshot {
         aesKey     = Get-PoshAesKeyStatus
         secrets    = Get-PoshSecretList
         isAdmin    = Test-PoshIsAdmin
+        backups    = Get-PoshBackupList
     }
 }
 
@@ -598,6 +599,44 @@ function Invoke-RouteSetEnv {
     Send-PoshJsonResponse -Response $Response -Payload @{ ok = $true }
 }
 
+function Invoke-RouteBackupRead {
+    param($Response, [hashtable] $Body)
+    if (-not $Body -or -not $Body.ContainsKey('file') -or -not $Body.ContainsKey('stamp')) {
+        Send-PoshErrorResponse -Response $Response -StatusCode 400 -Message "Body must include 'file' and 'stamp'"
+        return
+    }
+    try {
+        $content = Read-PoshBackup -File ([string]$Body['file']) -Stamp ([string]$Body['stamp'])
+        Send-PoshJsonResponse -Response $Response -Payload @{
+            ok      = $true
+            file    = [string]$Body['file']
+            stamp   = [string]$Body['stamp']
+            content = $content
+        }
+    } catch {
+        Send-PoshErrorResponse -Response $Response -StatusCode 422 -Message ("$_")
+    }
+}
+
+function Invoke-RouteBackupRestore {
+    param($Response, [hashtable] $Body)
+    if (-not $Body -or -not $Body.ContainsKey('file') -or -not $Body.ContainsKey('stamp')) {
+        Send-PoshErrorResponse -Response $Response -StatusCode 400 -Message "Body must include 'file' and 'stamp'"
+        return
+    }
+    try {
+        $result = Restore-PoshBackup -File ([string]$Body['file']) -Stamp ([string]$Body['stamp'])
+        Send-PoshJsonResponse -Response $Response -Payload @{
+            ok           = $true
+            file         = $result.File
+            restoredFrom = $result.RestoredStamp
+            preBackup    = $result.PreBackup
+        }
+    } catch {
+        Send-PoshErrorResponse -Response $Response -StatusCode 422 -Message ("$_")
+    }
+}
+
 function Invoke-RouteQuit {
     param($Response)
     Send-PoshJsonResponse -Response $Response -Payload @{ ok = $true; reason = 'user-quit' }
@@ -704,6 +743,16 @@ try {
                 '^POST /api/globalvar/remove$' {
                     $body = Read-PoshJsonBody -Request $request
                     Invoke-RouteGlobalvarRemove -Response $response -Body $body
+                    break
+                }
+                '^POST /api/backup$' {
+                    $body = Read-PoshJsonBody -Request $request
+                    Invoke-RouteBackupRead -Response $response -Body $body
+                    break
+                }
+                '^POST /api/restore$' {
+                    $body = Read-PoshJsonBody -Request $request
+                    Invoke-RouteBackupRestore -Response $response -Body $body
                     break
                 }
                 '^POST /api/quit$' {

@@ -199,9 +199,17 @@
         .diff-row .arrow { color: var(--muted); margin: 0 6px; }
         .diff-row .after  { color: var(--ok);     font-family: ui-monospace, Consolas, monospace; font-size: 13px; }
 
-        .toast {
+        .toast-stack {
             position: fixed;
-            top: 16px; right: 16px;
+            top: 16px;
+            right: 16px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            z-index: 200;
+            pointer-events: none;
+        }
+        .toast {
             background: var(--ok);
             color: white;
             padding: 10px 16px;
@@ -210,10 +218,15 @@
             opacity: 0;
             transform: translateY(-8px);
             transition: opacity .2s, transform .2s;
-            z-index: 200;
+            pointer-events: auto;
+            max-width: 420px;
+            min-width: 180px;
+            word-wrap: break-word;
+            cursor: pointer;
         }
         .toast.shown { opacity: 1; transform: translateY(0); }
         .toast.err { background: var(--danger); }
+        .toast.leaving { opacity: 0; transform: translateY(-8px); }
 
         .setup-card {
             background: var(--panel);
@@ -403,6 +416,44 @@
         }
         .empty-state .em-title { color: var(--text); font-weight: 600; margin-bottom: 4px; }
 
+        .backup-table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+        .backup-table th, .backup-table td {
+            text-align: left;
+            padding: 6px 10px;
+            border-bottom: 1px solid var(--border);
+            font-size: 13px;
+        }
+        .backup-table th { color: var(--muted); font-weight: 600; }
+        .backup-table .bt-section {
+            background: var(--bg);
+            font-weight: 600;
+            padding: 6px 10px;
+        }
+        .backup-table .bt-actions { white-space: nowrap; text-align: right; }
+        .backup-table .bt-actions button {
+            border: 1px solid var(--border);
+            background: var(--panel);
+            color: var(--text);
+            padding: 2px 10px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            margin-left: 6px;
+        }
+        .backup-table .bt-actions button:hover { background: var(--bg); }
+        .backup-preview {
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 12px;
+            margin-top: 8px;
+            font: 12px ui-monospace, Consolas, monospace;
+            max-height: 60vh;
+            overflow: auto;
+            white-space: pre-wrap;
+            color: var(--text);
+        }
+
         .field-reset {
             display: none;
             border: 1px solid var(--border);
@@ -521,6 +572,16 @@
         </div>
     </div>
 
+    <div class="modal-bg" id="preview-modal">
+        <div class="modal" style="max-width: 900px; width: 80vw;">
+            <h3 id="preview-title">Backup preview</h3>
+            <div class="body"><div class="backup-preview" id="preview-body"></div></div>
+            <div class="actions">
+                <button class="btn" id="preview-close">Close</button>
+            </div>
+        </div>
+    </div>
+
     <div class="modal-bg" id="addvar-modal">
         <div class="modal">
             <h3>Create a new variable in globalvars.ps1</h3>
@@ -555,7 +616,7 @@
         </div>
     </div>
 
-    <div class="toast" id="toast"></div>
+    <div class="toast-stack" id="toast-stack" aria-live="polite"></div>
 
 <script>
 (() => {
@@ -673,12 +734,35 @@
         return hay.includes(q);
     };
 
+    // Toast queue. Each call appends a new <div> to #toast-stack; the
+    // element auto-removes after a timeout. Older toasts stay visible
+    // until they expire so a save + warning + info burst doesn't lose
+    // information mid-stream the way the old single-slot toast did.
+    // Click on a toast to dismiss it early. Cap at 5 visible — anything
+    // beyond drops the oldest to keep the stack from growing unbounded.
+    const TOAST_VISIBLE_CAP = 5;
+    const TOAST_LINGER_MS = 4500;
     const toast = (msg, kind = 'ok') => {
-        const t = $('#toast');
+        const stack = $('#toast-stack');
+        if (!stack) return;
+        const t = document.createElement('div');
+        t.className = 'toast' + (kind === 'err' ? ' err' : '');
         t.textContent = msg;
-        t.className = 'toast shown' + (kind === 'err' ? ' err' : '');
-        clearTimeout(toast._t);
-        toast._t = setTimeout(() => t.classList.remove('shown'), 4500);
+        stack.appendChild(t);
+        // Trigger the slide-in.
+        requestAnimationFrame(() => t.classList.add('shown'));
+        const dismiss = () => {
+            if (!t.parentNode) return;
+            t.classList.add('leaving');
+            setTimeout(() => { if (t.parentNode) t.parentNode.removeChild(t); }, 250);
+        };
+        t.addEventListener('click', dismiss);
+        setTimeout(dismiss, TOAST_LINGER_MS);
+        // Cap visible toasts — drop the oldest after appending.
+        while (stack.childElementCount > TOAST_VISIBLE_CAP) {
+            const oldest = stack.firstElementChild;
+            if (oldest) oldest.parentNode.removeChild(oldest);
+        }
     };
 
     // Format a thrown api() error for display: surface per-field
@@ -1368,6 +1452,66 @@
                 } catch (e) { toast(formatApiError(e), 'err'); }
             });
         }
+
+        // Backups card — lists rotation backups for both managed files,
+        // offers preview (read-only) and restore (overwrites the live
+        // file after creating a fresh pre-restore backup).
+        const backups = state.snapshot.backups || {};
+        const backupCard = document.createElement('div');
+        backupCard.className = 'setup-card';
+        let table = '<h3>File backups</h3>' +
+                    '<p>Most recent 5 backups per file. "Restore" overwrites the live file (with a fresh pre-restore backup) — the server then needs to be restarted.</p>';
+        table += '<table class="backup-table"><thead><tr><th>Timestamp</th><th>Size</th><th></th></tr></thead><tbody>';
+        for (const file of ['globalvars.ps1', 'config.psd1']) {
+            const rows = backups[file] || [];
+            table += '<tr><td colspan="3" class="bt-section">' + file + (rows.length === 0 ? ' — no backups yet' : '') + '</td></tr>';
+            for (const b of rows) {
+                table +=
+                    '<tr data-file="' + file + '" data-stamp="' + b.Stamp + '">' +
+                    '<td>' + b.Displayed + '</td>' +
+                    '<td>' + (b.SizeBytes != null ? (b.SizeBytes + ' B') : '?') + '</td>' +
+                    '<td class="bt-actions">' +
+                        '<button class="bt-preview">Preview</button>' +
+                        '<button class="bt-restore">Restore</button>' +
+                    '</td></tr>';
+            }
+        }
+        table += '</tbody></table>';
+        backupCard.innerHTML = table;
+        main.appendChild(backupCard);
+
+        backupCard.querySelectorAll('.bt-preview').forEach(btn => {
+            btn.addEventListener('click', async (ev) => {
+                const tr = ev.target.closest('tr');
+                const file  = tr.dataset.file;
+                const stamp = tr.dataset.stamp;
+                try {
+                    const r = await api('POST', '/api/backup', { file, stamp });
+                    $('#preview-title').textContent = file + ' @ ' + stamp;
+                    $('#preview-body').textContent = r.content;
+                    openModal($('#preview-modal'), $('#preview-close'));
+                } catch (e) { toast(formatApiError(e), 'err'); }
+            });
+        });
+        backupCard.querySelectorAll('.bt-restore').forEach(btn => {
+            btn.addEventListener('click', async (ev) => {
+                const tr = ev.target.closest('tr');
+                const file  = tr.dataset.file;
+                const stamp = tr.dataset.stamp;
+                const ok = await confirmAsync(
+                    'This will overwrite the live ' + file + ' with the backup from ' + stamp + '. A pre-restore backup of the current file is created first.',
+                    'Restore ' + file,
+                    { danger: true, okLabel: 'Restore' }
+                );
+                if (!ok) return;
+                try {
+                    const r = await api('POST', '/api/restore', { file, stamp });
+                    toast('Restored ' + file + '. Pre-restore backup: ' + (r.preBackup || '(none)'));
+                    await loadAll();
+                    renderGroup('setup');
+                } catch (e) { toast(formatApiError(e), 'err'); }
+            });
+        });
     };
 
     const renderTabs = () => {
@@ -1621,6 +1765,7 @@
         $('#addvar-confirm').addEventListener('click', confirmAddVar);
         $('#addvar-type').addEventListener('change', syncAddVarValueShape);
         $('#field-search').addEventListener('input', onSearchInput);
+        $('#preview-close').addEventListener('click', () => closeModal($('#preview-modal')));
 
         // Global keyboard shortcuts. Bound on document so they fire from
         // anywhere except when the user is typing into the search input
