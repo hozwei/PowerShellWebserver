@@ -642,6 +642,42 @@ if ($cfg.PhpCgiEnabled) {
 }
 
 # ---------------------------------------------------------------------------
+# Prefixes validation — HttpListener requires each prefix to end with '/'.
+# Catch the obvious misconfiguration early with a clear message instead of
+# letting Listener.Start() throw an obscure ArgumentException later.
+# ---------------------------------------------------------------------------
+if ($cfg.Prefixes -and $cfg.Prefixes.Count -gt 0) {
+    foreach ($p in $cfg.Prefixes) {
+        if ([string]::IsNullOrEmpty($p) -or -not $p.EndsWith('/')) {
+            Write-StartupLog "ERROR: Prefix '$p' is missing the trailing '/' required by HttpListener."
+            Write-Output ''
+            Write-Output "ERROR: \$cfg.Prefixes entry '$p' must end with '/'."
+            Write-Output 'Example: @(''http://api.internal.example.com:443/'')'
+            exit 1
+        }
+        if (-not ($p -match '^https?://')) {
+            Write-StartupLog "ERROR: Prefix '$p' must use the http:// or https:// scheme."
+            Write-Output ''
+            Write-Output "ERROR: \$cfg.Prefixes entry '$p' must start with 'http://' or 'https://'."
+            exit 1
+        }
+    }
+    Write-StartupLog ("Prefixes validation OK: {0} explicit prefix(es) configured." -f $cfg.Prefixes.Count)
+}
+
+# ---------------------------------------------------------------------------
+# Static-serving + error-pages soft warnings — non-existent directories are
+# not fatal (the runtime falls back gracefully), but operators usually want
+# to know that they pointed a feature at a missing path.
+# ---------------------------------------------------------------------------
+if ($cfg.StaticServingEnabled -and -not (Test-Path -LiteralPath $cfg.StaticRoot -PathType Container)) {
+    Write-StartupLog "WARN: StaticServingEnabled = `$true but StaticRoot does not exist: '$($cfg.StaticRoot)'. Static requests will return 404 until the directory is created."
+}
+if ($cfg.CustomErrorPages -and -not (Test-Path -LiteralPath $cfg.ErrorPagesRoot -PathType Container)) {
+    Write-StartupLog "WARN: CustomErrorPages = `$true but ErrorPagesRoot does not exist: '$($cfg.ErrorPagesRoot)'. Error responses fall back to the JSON envelope."
+}
+
+# ---------------------------------------------------------------------------
 # Log startup information
 # ---------------------------------------------------------------------------
 $httpsInfo = if ($cfg.HttpsEnabled) { "  HTTPS=:$($cfg.HttpsPort)" } else { '' }
