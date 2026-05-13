@@ -3509,6 +3509,20 @@ function Format-PromMetrics {
     $null = $sb.AppendLine('# HELP posh_in_flight_peak High-water mark of concurrently in-flight requests since process start.')
     $null = $sb.AppendLine('# TYPE posh_in_flight_peak gauge')
     $null = $sb.AppendLine("posh_in_flight_peak $peak")
+    # posh_rate_limit_penalty_active: count of rate-limit entries currently in
+    # active penalty (PenaltyUntil > now). Spike = active throttling /
+    # spray. Computed on demand because penalty windows are short and a
+    # dedicated counter would need invalidation logic the table doesn't carry.
+    $penaltyActive = 0L
+    try {
+        $nowTicks = [datetime]::UtcNow.Ticks
+        foreach ($entry in $script:rateLimitTable.Values) {
+            if ($entry.PenaltyUntil.Ticks -gt $nowTicks) { $penaltyActive++ }
+        }
+    } catch { $penaltyActive = -1 }  # -1 signals "transient enumeration failure under high churn"
+    $null = $sb.AppendLine('# HELP posh_rate_limit_penalty_active Count of rate-limit entries currently in penalty (PenaltyUntil > now). -1 means transient enumeration failure under high churn.')
+    $null = $sb.AppendLine('# TYPE posh_rate_limit_penalty_active gauge')
+    $null = $sb.AppendLine("posh_rate_limit_penalty_active $penaltyActive")
     return $sb.ToString()
 }
 
