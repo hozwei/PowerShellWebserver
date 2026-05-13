@@ -15,14 +15,13 @@
 
 . $PSScriptRoot/_Common.ps1
 
-$session = $null
-$first  = Invoke-Posh -Path '/session.ps1'
-# Re-run by injecting a fresh session object. Invoke-Posh wraps
-# Invoke-RestMethod, which auto-creates the WebSession when -WebSession
-# is omitted, so we manually create one here for the round trip.
+# A fresh WebRequestSession captures the cookie the server sets on the first
+# response. Passing the same instance to the second call replays the cookie,
+# so the server sees the same POSH-Session-Id on both calls when
+# SessionEnabled is on.
 $session = [Microsoft.PowerShell.Commands.WebRequestSession]::new()
-$first  = Invoke-Posh -Path '/session.ps1' -Session $session
-$second = Invoke-Posh -Path '/session.ps1' -Session $session
+$first   = Invoke-Posh -Path '/session.ps1' -Session $session
+$second  = Invoke-Posh -Path '/session.ps1' -Session $session
 
 $firstParsed  = $first.output  | ConvertFrom-Json -Depth 5
 $secondParsed = $second.output | ConvertFrom-Json -Depth 5

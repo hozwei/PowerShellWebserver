@@ -148,7 +148,7 @@ $cfg = @{
     RateLimitPerIdentity     = $false   # F4: key the rate-limit table by API-key label (when authenticated) instead of client IP. Anonymous/auth-exempt requests still keyed by IP.
     RateLimitQueueTimeoutSec = 10     # 'queue' mode only: seconds to wait before returning HTTP 429
     RateLimitExemptPaths     = @('/health', '/metrics', '/metrics-prom', '/openapi.json') # paths excluded from rate limiting — always an array
-    MinRequestIntervalSec    = 1      # minimum seconds between dispatched requests, globally — 0 = disabled. /health and /metrics are always exempt.
+    MinRequestIntervalSec    = 1      # minimum seconds between dispatched requests, globally — 0 = disabled. /health, /metrics, /metrics-prom, /openapi.json are always exempt.
     AllowedIPs               = @()    # IP allowlist — empty = all IPs allowed; non-empty = only listed IPs pass (except /health)
     BlockedIPs               = @()    # IP blocklist — always rejected before AllowedIPs check (except /health); empty = no blocks
     GzipEnabled              = $true  # GZIP response compression — only applied when client sent Accept-Encoding: gzip AND body >= GzipMinBytes AND Content-Type matches GzipMimeTypes
@@ -348,11 +348,13 @@ $startTime = [System.Diagnostics.Stopwatch]::StartNew()
 $script:requestsTotal = [ref] 0L
 
 # Counts requests rejected by rate limiting (HTTP 429).
-# Kept separate from requestsTotal — used by the future /metrics endpoint.
+# Kept separate from requestsTotal — exposed as `rateLimitedTotal` in /metrics
+# and as `posh_rate_limited_total` in /metrics-prom.
 $script:rateLimitedTotal = [ref] 0L
 
-# Per-IP rate limit state — ConcurrentDictionary for lock-free access from RunspacePool Runspaces.
-# Key: client IP string. Value: PSCustomObject { Count [ref]; WindowStart [datetime]; PenaltyUntil [datetime] }.
+# Rate-limit state — ConcurrentDictionary for lock-free access from RunspacePool Runspaces.
+# Key: 'ip:<address>' or 'id:<api-key-label>' depending on RateLimitPerIdentity (F4).
+# Value: PSCustomObject { Count [ref]; WindowStart [datetime]; PenaltyUntil [datetime] }.
 $script:rateLimitTable = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
 
 # F7: per-script metadata cache populated lazily by Get-ScriptMetadata.
@@ -3130,7 +3132,7 @@ $requestHandler = {
         }
 
         # --------------------------------------------------------------
-        # GET /metrics -> server metrics (auth required)
+        # GET /metrics -> server metrics (auth-exempt, see exempt-route block above).
         # rateLimitedTotal counts per-IP rate-limit rejections (HTTP 429 from
         # the Runspace) — global-throttle 429s (MinRequestIntervalSec, main
         # thread) are intentionally excluded, consistent with the no-logging
@@ -3778,40 +3780,27 @@ try {
                 }
                 Write-Output $ipLogLine
                 # F5: audit IP rejections so the audit log captures all main-thread denials too.
-                # Identity is unknown at this point (auth never runs for blocked IPs).
-                if ($cfg.AuditLogEnabled) {
-                    $auditObj = [ordered]@{
-                        ts       = (Get-Date).ToString('o')
-                        event    = 'IP_BLOCKED'
-                        identity = '-'
-                        ip       = $reqClientIP
-                        path     = $reqUrlPath
-                        detail   = $ipStatus
-                    }
-                    $auditLine = $auditObj | ConvertTo-Json -Compress -Depth 3
-                    $auditHeld = $false
-                    try {
-                        $auditHeld = $script:auditMutex.WaitOne(500)
-                        [System.IO.File]::AppendAllText($cfg.AuditLogFile, $auditLine + [System.Environment]::NewLine, [System.Text.Encoding]::UTF8)
-                    } catch { } finally {
-                        try { if ($auditHeld) { $script:auditMutex.ReleaseMutex() } } catch { }
-                    }
-                }
+                # Identity is '-' because auth never runs for blocked IPs. Write-AuditLog is in
+                # scope here at script-level; it no-ops when AuditLogEnabled is $false.
+                Write-AuditLog -EventName 'IP_BLOCKED' -ClientIP $reqClientIP -Path $reqUrlPath -Detail $ipStatus
                 continue
             }
         }
 
         # Global throttle — enforce MinRequestIntervalSec between dispatched requests.
         # Checked in the main thread before any runspace is started — RunspacePool stays cold.
-        # /health and /metrics are always exempt so monitoring endpoints are never blocked.
+        # /health, /metrics, /metrics-prom, /openapi.json are exempt so monitoring tools and
+        # API-discovery tools (Prometheus, Swagger UI) are never throttled.
         # Stopwatch::GetTimestamp() / Frequency gives elapsed seconds as a plain long division —
         # no [datetime] operators, no .NET method dispatch issues.
         # $lastDispatchTick is only updated when the request is allowed through —
         # a 429 response must not reset the clock (a burst would otherwise push the deadline
         # forward indefinitely and block all subsequent legitimate requests).
         if ($cfg.MinRequestIntervalSec -gt 0 -and
-            $reqUrlPath -ne '/health' -and
-            $reqUrlPath -ne '/metrics') {
+            $reqUrlPath -ne '/health'       -and
+            $reqUrlPath -ne '/metrics'      -and
+            $reqUrlPath -ne '/metrics-prom' -and
+            $reqUrlPath -ne '/openapi.json') {
 
             $nowTick    = [System.Diagnostics.Stopwatch]::GetTimestamp()
             $elapsedSec = ($nowTick - $lastDispatchTick) / [System.Diagnostics.Stopwatch]::Frequency
