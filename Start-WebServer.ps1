@@ -685,6 +685,12 @@ $script:inFlightPeak = [ref] 0L
 # touch the rate-limit subsystem (auth check runs after rate-limit).
 $script:authFailuresTotal = [ref] 0L
 
+# Counts script executions that exceeded ScriptTimeoutSec and got killed.
+# Exposed as posh_script_timeouts_total. Spike = scripts blocking on a
+# downstream that became unresponsive, or operator-set timeout too low.
+# Incremented from Invoke-Script and Invoke-ScriptInProcess on TimedOut.
+$script:scriptTimeoutsTotal = [ref] 0L
+
 # Rate-limit state — ConcurrentDictionary for lock-free access from RunspacePool Runspaces.
 # Key: 'ip:<address>' or 'id:<api-key-label>' depending on RateLimitPerIdentity (F4).
 # Value: PSCustomObject { Count [ref]; WindowStart [datetime]; PenaltyUntil [datetime] }.
@@ -2788,6 +2794,7 @@ function Invoke-ScriptInProcess {
             try { $ps.Stop() } catch { }
             try { if ($null -ne $ps) { $ps.Dispose(); $ps = $null } } catch { }
             try { if ($null -ne $rs) { $rs.Dispose(); $rs = $null } } catch { }
+            $null = [System.Threading.Interlocked]::Increment($script:scriptTimeoutsTotal)
             return [PSCustomObject]@{
                 ExitCode = -1
                 Output   = ''
@@ -3189,6 +3196,7 @@ function Invoke-Script {
         if (-not [string]::IsNullOrWhiteSpace($partialErr)) {
             $errText = "$errText`n--- partial stderr ---`n$($partialErr.TrimEnd())"
         }
+        $null = [System.Threading.Interlocked]::Increment($script:scriptTimeoutsTotal)
         return [PSCustomObject]@{
             ExitCode = -1
             Output   = $partialOut.TrimEnd()
@@ -3482,6 +3490,7 @@ function Format-PromMetrics {
     $rsFails     = [System.Threading.Interlocked]::Read($script:runspaceDisposeFailures)
     $peak        = [System.Threading.Interlocked]::Read($script:inFlightPeak)
     $authFails   = [System.Threading.Interlocked]::Read($script:authFailuresTotal)
+    $timeouts    = [System.Threading.Interlocked]::Read($script:scriptTimeoutsTotal)
 
     $sb = [System.Text.StringBuilder]::new(1024)
     $null = $sb.AppendLine('# HELP posh_uptime_seconds Server uptime since process start.')
@@ -3520,6 +3529,9 @@ function Format-PromMetrics {
     $null = $sb.AppendLine('# HELP posh_auth_failures_total Number of requests that failed authentication (HTTP 401).')
     $null = $sb.AppendLine('# TYPE posh_auth_failures_total counter')
     $null = $sb.AppendLine("posh_auth_failures_total $authFails")
+    $null = $sb.AppendLine('# HELP posh_script_timeouts_total Number of script executions killed for exceeding ScriptTimeoutSec.')
+    $null = $sb.AppendLine('# TYPE posh_script_timeouts_total counter')
+    $null = $sb.AppendLine("posh_script_timeouts_total $timeouts")
     # posh_rate_limit_penalty_active: count of rate-limit entries currently in
     # active penalty (PenaltyUntil > now). Spike = active throttling /
     # spray. Computed on demand because penalty windows are short and a
@@ -3922,6 +3934,7 @@ $requestHandler = {
     $script:runspaceDisposeFailures = $runspaceDisposeFailures
     $script:inFlightPeak            = $inFlightPeak
     $script:authFailuresTotal       = $authFailuresTotal
+    $script:scriptTimeoutsTotal     = $scriptTimeoutsTotal
     # $semaphore, $startTime, $requestsTotal are used directly (no $script: needed)
 
     try {
@@ -4234,6 +4247,7 @@ $requestHandler = {
             $rsFails     = [System.Threading.Interlocked]::Read($script:runspaceDisposeFailures)
             $peak        = [System.Threading.Interlocked]::Read($script:inFlightPeak)
             $authFails   = [System.Threading.Interlocked]::Read($script:authFailuresTotal)
+            $timeouts    = [System.Threading.Interlocked]::Read($script:scriptTimeoutsTotal)
             $body        = [ordered]@{
                 uptime                       = $uptimeStr
                 requestsTotal                = $total
@@ -4244,6 +4258,7 @@ $requestHandler = {
                 runspaceDisposeFailuresTotal = $rsFails
                 inFlightPeak                 = $peak
                 authFailuresTotal            = $authFails
+                scriptTimeoutsTotal          = $timeouts
             } | ConvertTo-Json -Compress
             Send-Response -Response $resp -StatusCode 200 -Body $body -RequestId $requestId
             Write-Log -ClientIP $clientIP -Request $requestLine -Status 'METRICS' -ExitCode '-' -RequestId $requestId
@@ -4667,7 +4682,8 @@ foreach ($entry in @(
     [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('slowLogDropsTotal',         $script:slowLogDropsTotal,        $null),
     [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('runspaceDisposeFailures',   $script:runspaceDisposeFailures,  $null),
     [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('inFlightPeak',              $script:inFlightPeak,             $null),
-    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('authFailuresTotal',         $script:authFailuresTotal,        $null)
+    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('authFailuresTotal',         $script:authFailuresTotal,        $null),
+    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('scriptTimeoutsTotal',       $script:scriptTimeoutsTotal,      $null)
 )) { $iss.Variables.Add($entry) }
 
 # RunspacePool max = MaxConcurrent * RunspacePoolOverprovision (default 2).
