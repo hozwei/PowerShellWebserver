@@ -1031,6 +1031,14 @@ function Add-CorsHeaders {
     $origin = $Request.Headers['Origin']
     if ([string]::IsNullOrEmpty($origin)) { return $null }
 
+    # Defense against header-injection via the Origin echo: reject any value carrying a
+    # control character (CR, LF, NUL, etc.). .NET's HttpListenerResponse.AddHeader
+    # would itself throw on CR/LF, but pre-validating means we just deny CORS instead
+    # of bubbling an ArgumentException into a 500 from the request handler.
+    foreach ($ch in $origin.ToCharArray()) {
+        if ([int][char]$ch -lt 0x20 -or [int][char]$ch -eq 0x7F) { return $null }
+    }
+
     $matchedOrigin = $null
     if ($script:cfg.CorsAllowedOrigins -contains '*') {
         # Wildcard: echo back the actual origin when credentials are allowed (spec forbids '*' + credentials);
