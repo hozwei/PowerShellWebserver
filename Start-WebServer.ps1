@@ -3775,6 +3775,28 @@ $shared = @{
 # Executed per request in its own Runspace (via RunspacePool + PowerShell::Create).
 # Live objects ($semaphore, $script:logMutex, etc.) are available directly —
 # they were injected into the runspace via InitialSessionState.Variables.
+#
+# Flow inside the handler (top-to-bottom):
+#   1. Function + variable injection from $shared / InitialSessionState
+#   2. Outer try/finally (semaphore leak guard, Teil 4 iter 1)
+#   3. CORS preflight short-circuit (OPTIONS before auth)
+#   4. Method gate (GET/POST only)
+#   5. Cookie/Session minting
+#   6. Rate-limit check (with queue mode + early-resolve cache for F4)
+#   7. Auth — ApiKey / Basic / Both, exempt paths bypass
+#   8. Built-in endpoints (/, /health, /metrics, /metrics-prom, /openapi.json)
+#   9. PHP-CGI dispatch (when PhpCgiEnabled and .php)
+#  10. Script dispatch — Test-IsScriptPath -> Invoke-Script (Subprocess) or
+#      Invoke-ScriptInProcess; output multiplexes by extension:
+#        .ps1   -> JSON envelope { exitCode, output, error }
+#        .posh  -> raw HTML (Content-Type per ScriptExtensionMap)
+#        .psxml -> raw XML
+#        .psapi -> legacy PoSH 'API' XML envelope
+#  11. Static file branch (StaticServingEnabled) or directory listing
+#  12. Fallback 404
+#
+# Errors at any level are caught by the inner try/catch and produce a 500
+# response (the outer try only catches setup-time throws).
 # ---------------------------------------------------------------------------
 $requestHandler = {
     param(
