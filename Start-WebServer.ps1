@@ -1735,6 +1735,25 @@ function Resolve-RoutedScript {
     param([string] $UrlPath)
     if (-not $script:cfg.PathPlaceholders) { return $null }
     if ([string]::IsNullOrEmpty($UrlPath)) { return $null }
+
+    # Exact-filename priority: before walking the placeholder route table, see if
+    # a real file with one of the registered script extensions exists at the URL
+    # path. So a request like '/users/admin' resolves to '/users/admin.ps1' when
+    # that file exists — only routing to '/users/[id].ps1' when no exact match
+    # is on disk. Without this, the placeholder route would shadow specific
+    # filename-based handlers.
+    if ($UrlPath -notmatch '/$') {
+        $relAbs       = $UrlPath.TrimStart('/').Replace('/', '\')
+        $webrootFull  = [System.IO.Path]::GetFullPath($script:cfg.WebRoot)
+        foreach ($ext in $script:cfg.ScriptExtensionMap.Keys) {
+            $probe = [System.IO.Path]::GetFullPath((Join-Path $script:cfg.WebRoot ($relAbs + $ext)))
+            if ($probe.StartsWith($webrootFull + '\', [System.StringComparison]::OrdinalIgnoreCase) -and
+                (Test-Path -LiteralPath $probe -PathType Leaf)) {
+                return [PSCustomObject]@{ ScriptPath = $probe; Placeholders = [ordered]@{} }
+            }
+        }
+    }
+
     foreach ($route in (Get-RouteTable)) {
         if ($UrlPath -match $route.Regex) {
             $placeholders = [ordered]@{}
@@ -2305,6 +2324,18 @@ function Get-ScriptMetadata {
     $paramHelp   = @{}
     try {
         $helpComment = $ast.GetHelpContent()
+        # PS 7's GetHelpContent returns $null when '#Requires' precedes the help
+        # block (which is the de-facto convention in this repo's webroot scripts).
+        # Fall back to re-parsing the source with '#Requires' lines stripped so the
+        # help block ends up where GetHelpContent expects it.
+        if ($null -eq $helpComment) {
+            try {
+                $raw       = [System.IO.File]::ReadAllText($ScriptPath, [System.Text.Encoding]::UTF8)
+                $stripped  = $raw -replace '(?m)^#Requires[^\r\n]*', ''
+                $astRetry  = [System.Management.Automation.Language.Parser]::ParseInput($stripped, [ref]$null, [ref]$null)
+                if ($null -ne $astRetry) { $helpComment = $astRetry.GetHelpContent() }
+            } catch { }
+        }
         if ($null -ne $helpComment) {
             if ($helpComment.Synopsis)    { $synopsis    = $helpComment.Synopsis.Trim() }
             if ($helpComment.Description) { $description = $helpComment.Description.Trim() }
@@ -2322,8 +2353,11 @@ function Get-ScriptMetadata {
                 $paramDefault = if ($null -ne $p.DefaultValue) { $p.DefaultValue.Extent.Text } else { $null }
                 $paramDescription = ''
                 # Comment-based help keys arrive uppercased in PS 7's GetHelpContent().
+                # $paramHelp is a Dictionary[string,string] when GetHelpContent returns
+                # — its .Contains takes a KeyValuePair, not a string, so we have to use
+                # the IDictionary cast (which exposes the non-generic Contains(object)).
                 $upperName = $paramName.ToUpperInvariant()
-                if ($paramHelp -is [System.Collections.IDictionary] -and $paramHelp.Contains($upperName)) {
+                if ($paramHelp -is [System.Collections.IDictionary] -and ([System.Collections.IDictionary]$paramHelp).Contains($upperName)) {
                     $paramDescription = ([string]$paramHelp[$upperName]).Trim()
                 }
                 $parameters += [ordered]@{
@@ -2415,10 +2449,16 @@ function Build-OpenApiSpec {
                 foreach ($p in $meta.parameters) {
                     $isPath = $placeholderNames -contains $p.name
                     $schema = Get-OpenApiSchemaForType -PsTypeName $p.type
+                    # [switch] parameters are never required — they always default to $false
+                    # in PowerShell regardless of whether the user wrote `= $false`. Treating
+                    # them like ordinary parameters would mark every switch as required because
+                    # their AST DefaultValue is $null.
+                    $isSwitch = $p.type -in @('SwitchParameter', 'Switch')
+                    $required = $isPath -or (-not $isSwitch -and $null -eq $p.default)
                     $paramObj = [ordered]@{
                         name        = $p.name
                         'in'        = if ($isPath) { 'path' } else { 'query' }
-                        required    = $isPath -or ($null -eq $p.default)
+                        required    = $required
                         description = if ($p.description) { [string]$p.description } else { '' }
                         schema      = $schema
                     }
