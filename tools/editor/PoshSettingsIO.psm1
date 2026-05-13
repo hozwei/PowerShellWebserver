@@ -492,6 +492,42 @@ function Get-PoshConfigValues {
 }
 
 # ---------------------------------------------------------------------------
+# Inline $cfg defaults from Start-WebServer.ps1 — used to display a
+# reasonable "current" value for schema fields that aren't in the
+# operator's config.psd1 yet (e.g. keys added in a server upgrade).
+# Spawned once per editor session; cached for the editor's lifetime.
+# Returns @{} on any failure so the caller can fall back gracefully.
+# ---------------------------------------------------------------------------
+$script:inlineDefaultsCache = $null
+function Get-PoshConfigDefaults {
+    [OutputType([hashtable])]
+    param()
+    if ($null -ne $script:inlineDefaultsCache) { return $script:inlineDefaultsCache }
+    $s = Get-PoshIoState
+    $serverPath = Join-Path $s.RepoRoot 'Start-WebServer.ps1'
+    if (-not (Test-Path -LiteralPath $serverPath -PathType Leaf)) {
+        $script:inlineDefaultsCache = @{}
+        return $script:inlineDefaultsCache
+    }
+    try {
+        $json = & pwsh -NoProfile -File $serverPath -DumpConfig 2>$null
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($json)) {
+            $script:inlineDefaultsCache = @{}
+            return $script:inlineDefaultsCache
+        }
+        # ConvertFrom-Json -AsHashtable gives us native PS types matching
+        # what Get-PoshConfigValues returns from Import-PowerShellDataFile,
+        # so the two are merge-compatible without per-type coercion.
+        $obj = $json | ConvertFrom-Json -AsHashtable
+        $script:inlineDefaultsCache = $obj
+        return $obj
+    } catch {
+        $script:inlineDefaultsCache = @{}
+        return $script:inlineDefaultsCache
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Status of POSH_API_KEY. We never expose the key itself — only whether
 # it is set, and how long it is, so the UI can surface "configured: yes,
 # 24 chars" without leaking the secret.
@@ -943,12 +979,41 @@ function Set-PoshConfigKey {
         $_.Item1 -is [System.Management.Automation.Language.StringConstantExpressionAst] -and
         $_.Item1.Value -eq $Key
     } | Select-Object -First 1
-    if (-not $pair) {
-        throw "Key '$Key' not found at top level of config.psd1"
-    }
-    $extent  = $pair.Item2.Extent
     $content = [System.IO.File]::ReadAllText($s.ConfigPsd1)
 
+    if (-not $pair) {
+        # Key isn't in config.psd1 yet — happens when the server grew a new
+        # $cfg key and the operator hasn't regenerated. Insert at the end
+        # of the outer hashtable with a marker comment so the addition is
+        # visible in git diff. Without this the editor was unable to save
+        # any field the user's existing config didn't already declare.
+        $closeBraceOffset = $hash.Extent.EndOffset - 1   # position of the closing '}'
+        # Detect the indent style by re-using the first KeyValuePair's column.
+        $sampleIndent = 6
+        if ($hash.KeyValuePairs.Count -gt 0) {
+            $sampleStart = $hash.KeyValuePairs[0].Item1.Extent.StartOffset
+            $sampleScan  = $sampleStart - 1
+            $count = 0
+            while ($sampleScan -ge 0 -and $content[$sampleScan] -ne "`n") {
+                if ($content[$sampleScan] -eq ' ') { $count++ }
+                elseif ($content[$sampleScan] -eq "`t") { $count += 4 }
+                else { $count = 0 }
+                $sampleScan--
+            }
+            if ($count -gt 0) { $sampleIndent = $count }
+        }
+        $newline = if ($content.Contains("`r`n")) { "`r`n" } else { "`n" }
+        $literal = ConvertTo-PoshLiteral -Value $Value -Type $Type -IndentSpaces $sampleIndent
+        $padded  = (' ' * $sampleIndent) + ("{0,-24} = {1}" -f $Key, $literal)
+        $insertText = $newline + (' ' * $sampleIndent) + ("# added by Edit-PoshSettings on {0}" -f (Get-Date -Format 'yyyy-MM-dd')) + $newline + $padded + $newline
+        $newContent = $content.Substring(0, $closeBraceOffset) + $insertText + $content.Substring($closeBraceOffset)
+        if ($PSCmdlet.ShouldProcess($s.ConfigPsd1, "Insert new key '$Key'")) {
+            [System.IO.File]::WriteAllText($s.ConfigPsd1, $newContent, [System.Text.UTF8Encoding]::new($false))
+        }
+        return
+    }
+
+    $extent  = $pair.Item2.Extent
     # Detect the indent of the line containing the key so multi-line
     # literals (keymap) align with the surrounding @{} block instead of
     # using a hardcoded 12-space indent.
@@ -1160,6 +1225,7 @@ Export-ModuleMember -Function @(
     'Add-PoshGlobalvar',
     'Remove-PoshGlobalvar',
     'Get-PoshConfigValues',
+    'Get-PoshConfigDefaults',
     'Get-PoshApiKeyStatus',
     'Get-PoshAesKeyStatus',
     'Get-PoshSecretList',

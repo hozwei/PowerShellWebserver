@@ -1111,7 +1111,12 @@
             renderKeymapField(field, left, right, vmsg);
             const def = document.createElement('div');
             def.className = 'help';
-            def.innerHTML = 'current value in file: <code>' + formatCurrent(field).replace(/</g, '&lt;') + '</code>';
+            if (field.NotInFile) {
+                def.innerHTML = 'inline default (will be inserted on save): <code>' + formatCurrent(field).replace(/</g, '&lt;') + '</code>';
+                def.style.color = 'var(--warn-fg)';
+            } else {
+                def.innerHTML = 'current value in file: <code>' + formatCurrent(field).replace(/</g, '&lt;') + '</code>';
+            }
             right.appendChild(def);
             const reset = document.createElement('button');
             reset.type = 'button';
@@ -1278,7 +1283,12 @@
         }
         const def = document.createElement('div');
         def.className = 'help';
-        def.innerHTML = 'current value in file: <code>' + formatCurrent(field).replace(/</g, '&lt;') + '</code>';
+        if (field.NotInFile) {
+            def.innerHTML = 'inline default (will be inserted on save): <code>' + formatCurrent(field).replace(/</g, '&lt;') + '</code>';
+            def.style.color = 'var(--warn-fg)';
+        } else {
+            def.innerHTML = 'current value in file: <code>' + formatCurrent(field).replace(/</g, '&lt;') + '</code>';
+        }
         right.appendChild(def);
 
         if (field.IsLiteral === false) {

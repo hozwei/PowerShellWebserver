@@ -158,9 +158,12 @@ $cfg = @{
     RateLimitPerIdentity     = $false   # F4: key the rate-limit table by API-key label (when authenticated) instead of client IP. Anonymous/auth-exempt requests still keyed by IP.
     RateLimitQueueTimeoutSec = 10     # 'queue' mode only: seconds to wait before returning HTTP 429
     RateLimitExemptPaths     = @('/health', '/metrics', '/metrics-prom', '/openapi.json') # paths excluded from rate limiting — always an array
-    MinRequestIntervalSec    = 1      # minimum seconds between dispatched requests, globally — 0 = disabled. /health, /metrics, /metrics-prom, /openapi.json are always exempt.
-    AllowedIPs               = @()    # IP allowlist — empty = all IPs allowed; non-empty = only listed IPs pass (except /health)
-    BlockedIPs               = @()    # IP blocklist — always rejected before AllowedIPs check (except /health); empty = no blocks
+    MinRequestIntervalSec    = 1      # minimum seconds between dispatched requests, globally — 0 = disabled. GlobalThrottleExemptPaths bypass this.
+    GlobalThrottleExemptPaths = @('/health', '/metrics', '/metrics-prom', '/openapi.json') # paths exempt from MinRequestIntervalSec — defaults to the monitoring/discovery routes
+    AuthExemptPaths          = @('/health', '/metrics', '/metrics-prom', '/openapi.json') # paths that skip authentication entirely. Identity is logged as 'anonymous'.
+    AllowedIPs               = @()    # IP allowlist — empty = all IPs allowed; non-empty = only listed IPs pass. IpFilterExemptPaths override this per path.
+    BlockedIPs               = @()    # IP blocklist — always rejected before AllowedIPs check. IpFilterExemptPaths override this per path.
+    IpFilterExemptPaths      = @('/health') # paths that bypass BlockedIPs / AllowedIPs. Default keeps /health reachable from external monitoring.
     GzipEnabled              = $true  # GZIP response compression — only applied when client sent Accept-Encoding: gzip AND body >= GzipMinBytes AND Content-Type matches GzipMimeTypes
     BrotliEnabled            = $true  # Brotli compression — preferred over GZIP when both client supports them. Reuses GzipMinBytes / GzipMaxBytes / GzipMimeTypes for eligibility.
     GzipMinBytes             = 1024   # responses smaller than this byte count are never compressed (compression overhead exceeds savings)
@@ -3119,9 +3122,12 @@ $requestHandler = {
         # response does not leak which mechanism the server is actually checking.
         # WWW-Authenticate is added on Basic/Both so browsers display a login dialog.
         # --------------------------------------------------------------
-        if ($urlPath -eq '/health' -or $urlPath -eq '/metrics' -or $urlPath -eq '/metrics-prom' -or $urlPath -eq '/openapi.json') {
-            # Auth-exempt routes mark the identity as 'anonymous' so log + rate-limit
-            # downstream can still attribute the request meaningfully.
+        # Auth-exempt routes mark the identity as 'anonymous' so log + rate-limit
+        # downstream can still attribute the request meaningfully. The list is
+        # configurable via $cfg.AuthExemptPaths so operators can add custom
+        # public endpoints (e.g. /version, /robots.txt) without code edits.
+        $authExempt = @($script:cfg.AuthExemptPaths)
+        if ($authExempt -contains $urlPath) {
             $script:authIdentity = 'anonymous'
         } else {
             $authMode    = $script:cfg.AuthMode
@@ -3798,14 +3804,16 @@ try {
 
         # ---------------------------------------------------------------------------
         # IP filter — checked in the main thread before the global throttle.
-        # /health is always exempt so monitoring tools are never blocked.
+        # Paths listed in $cfg.IpFilterExemptPaths bypass both BlockedIPs and
+        # AllowedIPs (default keeps /health reachable from external monitoring).
         # BlockedIPs is checked first — an IP on both lists is always blocked.
         # AllowedIPs empty = all IPs pass; non-empty = only listed IPs pass.
         # Direct [System.IO.File]::AppendAllText for logging — Write-Log lives in
         # the Runspace scope and is not available in the main thread.
         # ---------------------------------------------------------------------------
         $reqUrlPath = $context.Request.Url.AbsolutePath
-        if ($reqUrlPath -ne '/health' -and
+        $ipFilterExempt = @($cfg.IpFilterExemptPaths)
+        if (($ipFilterExempt -notcontains $reqUrlPath) -and
             ($cfg.BlockedIPs.Count -gt 0 -or $cfg.AllowedIPs.Count -gt 0)) {
 
             $reqClientIP = $context.Request.RemoteEndPoint.Address.ToString()
@@ -3865,18 +3873,16 @@ try {
 
         # Global throttle — enforce MinRequestIntervalSec between dispatched requests.
         # Checked in the main thread before any runspace is started — RunspacePool stays cold.
-        # /health, /metrics, /metrics-prom, /openapi.json are exempt so monitoring tools and
-        # API-discovery tools (Prometheus, Swagger UI) are never throttled.
+        # Paths in $cfg.GlobalThrottleExemptPaths bypass this (defaults to the
+        # monitoring/discovery routes so Prometheus + Swagger UI are never throttled).
         # Stopwatch::GetTimestamp() / Frequency gives elapsed seconds as a plain long division —
         # no [datetime] operators, no .NET method dispatch issues.
         # $lastDispatchTick is only updated when the request is allowed through —
         # a 429 response must not reset the clock (a burst would otherwise push the deadline
         # forward indefinitely and block all subsequent legitimate requests).
+        $globalThrottleExempt = @($cfg.GlobalThrottleExemptPaths)
         if ($cfg.MinRequestIntervalSec -gt 0 -and
-            $reqUrlPath -ne '/health'       -and
-            $reqUrlPath -ne '/metrics'      -and
-            $reqUrlPath -ne '/metrics-prom' -and
-            $reqUrlPath -ne '/openapi.json') {
+            ($globalThrottleExempt -notcontains $reqUrlPath)) {
 
             $nowTick    = [System.Diagnostics.Stopwatch]::GetTimestamp()
             $elapsedSec = ($nowTick - $lastDispatchTick) / [System.Diagnostics.Stopwatch]::Frequency

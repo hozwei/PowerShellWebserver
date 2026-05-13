@@ -25,8 +25,11 @@
         @{ Id = 'globalvars'; Title = 'globalvars.ps1' }
         @{ Id = 'server';     Title = 'Server runtime' }
         @{ Id = 'auth';       Title = 'Authentication and limits' }
+        @{ Id = 'cors';       Title = 'CORS' }
+        @{ Id = 'static';     Title = 'Static files and MIME' }
         @{ Id = 'logging';    Title = 'Logging' }
         @{ Id = 'features';   Title = 'Quality-of-life features' }
+        @{ Id = 'paths';      Title = 'Filesystem paths' }
         @{ Id = 'setup';      Title = 'Setup helpers' }
     )
 
@@ -350,6 +353,48 @@
             Label     = 'AcceptedContentTypes'
             Help      = "Whitelist of Content-Type prefixes accepted for POST bodies. One per line. Default: application/json, application/x-www-form-urlencoded."
         }
+        @{
+            Name      = 'AuthExemptPaths'
+            File      = 'config.psd1'
+            Group     = 'auth'
+            Type      = 'string-array'
+            Label     = 'AuthExemptPaths'
+            Help      = "URL paths that skip authentication (logged as 'anonymous'). One per line. Default exposes /health, /metrics, /metrics-prom, /openapi.json for monitoring tools."
+        }
+        @{
+            Name      = 'IpFilterExemptPaths'
+            File      = 'config.psd1'
+            Group     = 'auth'
+            Type      = 'string-array'
+            Label     = 'IpFilterExemptPaths'
+            Help      = "URL paths that bypass AllowedIPs / BlockedIPs. One per line. Default is just /health so external monitoring still reaches the server even when an allowlist is set."
+        }
+        @{
+            Name      = 'GlobalThrottleExemptPaths'
+            File      = 'config.psd1'
+            Group     = 'auth'
+            Type      = 'string-array'
+            Label     = 'GlobalThrottleExemptPaths'
+            Help      = "URL paths that bypass the MinRequestIntervalSec global throttle. One per line."
+        }
+        @{
+            Name      = 'RateLimitExemptPaths'
+            File      = 'config.psd1'
+            Group     = 'auth'
+            Type      = 'string-array'
+            Label     = 'RateLimitExemptPaths'
+            Help      = "URL paths excluded from per-IP rate limiting (RateLimitRequests/Window). One per line."
+        }
+        @{
+            Name      = 'RateLimitQueueTimeoutSec'
+            File      = 'config.psd1'
+            Group     = 'auth'
+            Type      = 'int'
+            Label     = 'RateLimitQueueTimeoutSec'
+            Help      = "Only consulted when RateLimitMode is 'queue': max seconds a request waits in the queue before returning HTTP 429."
+            Min       = 1
+            Max       = 3600
+        }
 
         # -- Logging (config.psd1) ------------------------------------------
         @{
@@ -474,6 +519,207 @@
             Label     = 'PathPlaceholders'
             Help      = "Enables '[id].ps1' as a placeholder for /users/123 etc."
         }
+
+        # -- CORS (config.psd1) ---------------------------------------------
+        @{
+            Name      = 'CorsAllowedOrigins'
+            File      = 'config.psd1'
+            Group     = 'cors'
+            Type      = 'string-array'
+            Label     = 'CorsAllowedOrigins'
+            Help      = "Allowed CORS origins. One per line. Empty = CORS disabled. Use '*' to allow any origin (incompatible with CorsAllowCredentials per spec)."
+        }
+        @{
+            Name      = 'CorsAllowedMethods'
+            File      = 'config.psd1'
+            Group     = 'cors'
+            Type      = 'string'
+            Label     = 'CorsAllowedMethods'
+            Help      = "Comma-separated method list. Sent in Access-Control-Allow-Methods on preflight responses."
+            Validator = '^[A-Z, ]+$|^$'
+        }
+        @{
+            Name      = 'CorsAllowedHeaders'
+            File      = 'config.psd1'
+            Group     = 'cors'
+            Type      = 'string'
+            Label     = 'CorsAllowedHeaders'
+            Help      = "Comma-separated header list sent in Access-Control-Allow-Headers."
+            Validator = '^[A-Za-z0-9\-, ]+$|^$'
+        }
+        @{
+            Name      = 'CorsAllowCredentials'
+            File      = 'config.psd1'
+            Group     = 'cors'
+            Type      = 'bool'
+            Label     = 'CorsAllowCredentials'
+            Help      = "Send Access-Control-Allow-Credentials: true on responses to allowed origins. Cannot be combined with CorsAllowedOrigins='*'."
+        }
+        @{
+            Name      = 'CorsMaxAgeSec'
+            File      = 'config.psd1'
+            Group     = 'cors'
+            Type      = 'int'
+            Label     = 'CorsMaxAgeSec'
+            Help      = "Access-Control-Max-Age — seconds the browser may cache preflight responses."
+            Min       = 0
+            Max       = 86400
+        }
+
+        # -- Static files and MIME (config.psd1) ----------------------------
+        @{
+            Name      = 'DefaultDocuments'
+            File      = 'config.psd1'
+            Group     = 'static'
+            Type      = 'string-array'
+            Label     = 'DefaultDocuments'
+            Help      = "Filenames served for directory requests (one per line). First match wins. Falls back to DirectoryBrowsing when none exist."
+        }
+        @{
+            Name      = 'StaticCacheHeaders'
+            File      = 'config.psd1'
+            Group     = 'static'
+            Type      = 'bool'
+            Label     = 'StaticCacheHeaders'
+            Help      = "Emit ETag + Last-Modified on static responses and honour If-None-Match / If-Modified-Since (HTTP 304)."
+        }
+        @{
+            Name      = 'BlockedMimeTypes'
+            File      = 'config.psd1'
+            Group     = 'static'
+            Type      = 'string-array'
+            Label     = 'BlockedMimeTypes'
+            Help      = "MIME-type prefix blacklist for static responses (one per line). Matched via StartsWith — entries trigger HTTP 403."
+        }
+        @{
+            Name      = 'GzipMinBytes'
+            File      = 'config.psd1'
+            Group     = 'static'
+            Type      = 'int'
+            Label     = 'GzipMinBytes'
+            Help      = "Responses smaller than this byte count are never compressed (overhead exceeds savings)."
+            Min       = 0
+            Max       = 1048576
+        }
+        @{
+            Name      = 'GzipMaxBytes'
+            File      = 'config.psd1'
+            Group     = 'static'
+            Type      = 'int'
+            Label     = 'GzipMaxBytes'
+            Help      = "Responses larger than this byte count are streamed uncompressed (guards against OOM). 10 MB = 10485760."
+            Min       = 1024
+            Max       = 1073741824
+        }
+        @{
+            Name      = 'GzipMimeTypes'
+            File      = 'config.psd1'
+            Group     = 'static'
+            Type      = 'string-array'
+            Label     = 'GzipMimeTypes'
+            Help      = "Content-Type prefixes eligible for compression (one per line). Matched via StartsWith."
+        }
+
+        # -- Filesystem paths (config.psd1) ---------------------------------
+        @{
+            Name      = 'WebRoot'
+            File      = 'config.psd1'
+            Group     = 'paths'
+            Type      = 'string'
+            Label     = 'WebRoot'
+            Help      = "Directory containing .ps1 endpoints. Absolute path."
+        }
+        @{
+            Name      = 'StaticRoot'
+            File      = 'config.psd1'
+            Group     = 'paths'
+            Type      = 'string'
+            Label     = 'StaticRoot'
+            Help      = "Directory for non-.ps1 static files. Empty = use WebRoot. Absolute path."
+        }
+        @{
+            Name      = 'LogDir'
+            File      = 'config.psd1'
+            Group     = 'paths'
+            Type      = 'string'
+            Label     = 'LogDir'
+            Help      = "Directory for request and worker logs. Used as the parent for default AuditLogFile / SlowLogFile / JobsLogFile when those are empty."
+        }
+        @{
+            Name      = 'AuditLogFile'
+            File      = 'config.psd1'
+            Group     = 'paths'
+            Type      = 'string'
+            Label     = 'AuditLogFile'
+            Help      = "Absolute path to audit.log. Empty = <LogDir>\audit.log. Only consulted when AuditLogEnabled = true."
+        }
+        @{
+            Name      = 'SlowLogFile'
+            File      = 'config.psd1'
+            Group     = 'paths'
+            Type      = 'string'
+            Label     = 'SlowLogFile'
+            Help      = "Absolute path to slow.log. Empty = <LogDir>\slow.log. Only consulted when SlowRequestThresholdMs > 0."
+        }
+        @{
+            Name      = 'JobsLogFile'
+            File      = 'config.psd1'
+            Group     = 'paths'
+            Type      = 'string'
+            Label     = 'JobsLogFile'
+            Help      = "Absolute path to jobs.log. Empty = <LogDir>\jobs.log. Used by BackgroundJobs."
+        }
+        @{
+            Name      = 'PwshExe'
+            File      = 'config.psd1'
+            Group     = 'paths'
+            Type      = 'string'
+            Label     = 'PwshExe'
+            Help      = "Absolute path to pwsh.exe used for Subprocess execution mode. Defaults to the server process's own pwsh."
+        }
+        @{
+            Name      = 'ErrorPagesRoot'
+            File      = 'config.psd1'
+            Group     = 'paths'
+            Type      = 'string'
+            Label     = 'ErrorPagesRoot'
+            Help      = "Directory containing <code>.html templates for CustomErrorPages. Empty = <WebRoot>\\_error."
+        }
+        @{
+            Name      = 'PostJsonDir'
+            File      = 'config.psd1'
+            Group     = 'paths'
+            Type      = 'string'
+            Label     = 'PostJsonDir'
+            Help      = "Directory where POST-body JSON files are captured by post-json.ps1."
+        }
+
+        # -- OpenAPI metadata (config.psd1) ---------------------------------
+        @{
+            Name      = 'OpenApiTitle'
+            File      = 'config.psd1'
+            Group     = 'features'
+            Type      = 'string'
+            Label     = 'OpenApiTitle'
+            Help      = "'info.title' field in the generated OpenAPI 3.1 spec at GET /openapi.json."
+        }
+        @{
+            Name      = 'OpenApiVersion'
+            File      = 'config.psd1'
+            Group     = 'features'
+            Type      = 'string'
+            Label     = 'OpenApiVersion'
+            Help      = "'info.version' field in the generated OpenAPI 3.1 spec."
+            Validator = '^[A-Za-z0-9\-\.\+]+$|^$'
+        }
+        @{
+            Name      = 'Prefixes'
+            File      = 'config.psd1'
+            Group     = 'server'
+            Type      = 'string-array'
+            Label     = 'Prefixes'
+            Help      = "Explicit HttpListener prefixes (one per line, e.g. http://api.example.com:80/). Empty = build from HttpPort/HttpsPort with the '+' wildcard binding (default)."
+        }
         @{
             Name      = 'SessionEnabled'
             File      = 'config.psd1'
@@ -515,22 +761,7 @@
             Label     = 'CustomErrorPages'
             Help      = "Serve <ErrorPagesRoot>\\<code>.html for 4xx/5xx when the client Accepts text/html. Falls back to JSON envelope otherwise."
         }
-        @{
-            Name      = 'ErrorPagesRoot'
-            File      = 'config.psd1'
-            Group     = 'features'
-            Type      = 'string'
-            Label     = 'ErrorPagesRoot'
-            Help      = "Directory containing <code>.html templates for CustomErrorPages. Absolute path."
-        }
-        @{
-            Name      = 'PostJsonDir'
-            File      = 'config.psd1'
-            Group     = 'features'
-            Type      = 'string'
-            Label     = 'PostJsonDir'
-            Help      = "Directory where POST-body JSON files are captured by post-json.ps1. Absolute path."
-        }
+        # ErrorPagesRoot, PostJsonDir grouped under "Filesystem paths" below.
         @{
             Name      = 'PhpCgiEnabled'
             File      = 'config.psd1'

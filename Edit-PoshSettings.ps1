@@ -258,12 +258,16 @@ function Build-EffectiveSchema {
     }
 
     foreach ($sf in @($schema.Fields | Where-Object { $_.File -eq 'config.psd1' })) {
-        if ($configKeys -contains $sf.Name) {
-            $copy = @{}
-            foreach ($k in $sf.Keys) { $copy[$k] = $sf[$k] }
-            $copy.IsLiteral = $true
-            $null = $fields.Add($copy)
-        }
+        $copy = @{}
+        foreach ($k in $sf.Keys) { $copy[$k] = $sf[$k] }
+        $copy.IsLiteral = $true
+        # When the key isn't in config.psd1 yet (e.g. the server grew a
+        # new $cfg key after install), still expose it. NotInFile = true
+        # tells the UI to render a "will be inserted on save" hint and
+        # the value coercer to read $null instead of an existing value.
+        # Set-PoshConfigKey auto-inserts on first save.
+        $copy.NotInFile = -not ($configKeys -contains $sf.Name)
+        $null = $fields.Add($copy)
     }
 
     # Only keep groups that actually have fields (plus 'setup', which is the
@@ -280,10 +284,17 @@ function Build-CurrentSnapshot {
     $namesGlobal = @($EffectiveSchema.Fields | Where-Object { $_.File -eq 'globalvars.ps1' } | ForEach-Object { $_.Name })
     $globalvars  = if ($namesGlobal.Count -gt 0) { Get-PoshGlobalvarValues -Names $namesGlobal } else { @{} }
     $configAll   = Get-PoshConfigValues
+    # Inline defaults from Start-WebServer.ps1 -DumpConfig. Used to fill
+    # in display values for schema fields the operator's config.psd1
+    # doesn't declare yet (NotInFile = $true). Spawn-once, cached.
+    $inlineDefaults = Get-PoshConfigDefaults
     $configSnap  = @{}
     foreach ($field in $EffectiveSchema.Fields) {
-        if ($field.File -eq 'config.psd1' -and $configAll.ContainsKey($field.Name)) {
+        if ($field.File -ne 'config.psd1') { continue }
+        if ($configAll.ContainsKey($field.Name)) {
             $configSnap[$field.Name] = $configAll[$field.Name]
+        } elseif ($inlineDefaults.ContainsKey($field.Name)) {
+            $configSnap[$field.Name] = $inlineDefaults[$field.Name]
         }
     }
     return @{
