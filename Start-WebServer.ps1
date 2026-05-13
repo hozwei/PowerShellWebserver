@@ -106,6 +106,18 @@ if ([string]::IsNullOrEmpty($apiKey)) {
 }
 
 # ---------------------------------------------------------------------------
+# Basic-Auth credentials (PR-4) — sourced from machine-scope env vars analogous
+# to POSH_API_KEY. Read here BEFORE $cfg so values are available when the
+# hashtable is materialised. Empty strings are fine; the startup validator
+# below only complains when AuthMode requires Basic but the credentials are
+# missing.
+# ---------------------------------------------------------------------------
+$basicUser = $env:POSH_BASIC_USER
+$basicPass = $env:POSH_BASIC_PASS
+if ($null -eq $basicUser) { $basicUser = '' }
+if ($null -eq $basicPass) { $basicPass = '' }
+
+# ---------------------------------------------------------------------------
 # Configuration
 # The prefix is no longer stored in $cfg — it is built dynamically from
 # HttpPort/HttpsPort and added directly to the listener.
@@ -216,6 +228,10 @@ $cfg = @{
     CorsAllowCredentials     = $false # set Access-Control-Allow-Credentials: true when an Origin is allowed (incompatible with '*' wildcard per CORS spec)
     CorsMaxAgeSec            = 600    # value of the Access-Control-Max-Age header on preflight responses (how long the browser may cache the preflight result)
     AcceptedContentTypes     = @('application/json', 'application/x-www-form-urlencoded') # POST body content types that pass the Get-BodyParams gate
+    AuthMode                 = 'ApiKey' # 'ApiKey' (default), 'Basic', or 'Both' — 'Both' accepts either the X-Api-Key header OR a valid Authorization: Basic header
+    BasicAuthUser            = $basicUser # from $env:POSH_BASIC_USER — only validated at startup when AuthMode requires Basic
+    BasicAuthPass            = $basicPass # from $env:POSH_BASIC_PASS — kept in process memory only, never written to disk
+    BasicAuthRealm           = 'posh'  # value of the WWW-Authenticate realm parameter on 401 responses
 }
 
 # StaticRoot fallback — empty string means: reuse WebRoot. Resolved here rather than at
@@ -563,6 +579,23 @@ if ($cfg.HttpsEnabled) {
         exit 1
     }
     Write-StartupLog "HTTPS validation OK: netsh sslcert binding found for port $($cfg.HttpsPort)."
+}
+
+# ---------------------------------------------------------------------------
+# Auth-mode validation — when AuthMode requires Basic, both POSH_BASIC_USER
+# and POSH_BASIC_PASS must be set. Mirrors the POSH_API_KEY check above.
+# ---------------------------------------------------------------------------
+if ($cfg.AuthMode -ne 'ApiKey') {
+    if ([string]::IsNullOrEmpty($cfg.BasicAuthUser) -or [string]::IsNullOrEmpty($cfg.BasicAuthPass)) {
+        Write-StartupLog ("ERROR: AuthMode = '{0}' requires POSH_BASIC_USER and POSH_BASIC_PASS environment variables." -f $cfg.AuthMode)
+        Write-Output ''
+        Write-Output ("ERROR: AuthMode = '{0}' but Basic-Auth credentials are not set." -f $cfg.AuthMode)
+        Write-Output 'Solution: set both environment variables as Machine-scope and restart the server:'
+        Write-Output "  [Environment]::SetEnvironmentVariable('POSH_BASIC_USER', 'username', 'Machine')"
+        Write-Output "  [Environment]::SetEnvironmentVariable('POSH_BASIC_PASS', 'password', 'Machine')"
+        exit 1
+    }
+    Write-StartupLog "Auth validation OK: AuthMode = '$($cfg.AuthMode)', Basic credentials present."
 }
 
 # ---------------------------------------------------------------------------
@@ -1566,16 +1599,45 @@ $requestHandler = {
         }
 
         # --------------------------------------------------------------
-        # API key authentication
-        # /health and /metrics are intentionally open — monitoring and metrics
-        # endpoints must be reachable without credentials.
-        # All other routes require the X-Api-Key header.
-        # Same response for missing and incorrect key — no hint which case applies.
+        # Authentication — mode-aware. /health and /metrics are intentionally open
+        # (monitoring tools must be able to scrape without credentials).
+        # AuthMode = 'ApiKey' (default): X-Api-Key header required.
+        # AuthMode = 'Basic':            Authorization: Basic <base64> required.
+        # AuthMode = 'Both':             either X-Api-Key OR Authorization: Basic accepted.
+        # Same generic 401 message regardless of which credential was wrong, so the
+        # response does not leak which mechanism the server is actually checking.
+        # WWW-Authenticate is added on Basic/Both so browsers display a login dialog.
         # --------------------------------------------------------------
         if ($urlPath -ne '/health' -and $urlPath -ne '/metrics') {
-            $providedKey = $req.Headers['X-Api-Key']
-            if ($providedKey -ne $script:cfg.ApiKey) {
+            $authMode    = $script:cfg.AuthMode
+            $authPassed  = $false
+
+            if ($authMode -eq 'ApiKey' -or $authMode -eq 'Both') {
+                if ($req.Headers['X-Api-Key'] -eq $script:cfg.ApiKey) { $authPassed = $true }
+            }
+            if (-not $authPassed -and ($authMode -eq 'Basic' -or $authMode -eq 'Both')) {
+                $authHeader = $req.Headers['Authorization']
+                if ($authHeader -and $authHeader.StartsWith('Basic ', [System.StringComparison]::OrdinalIgnoreCase)) {
+                    $b64 = $authHeader.Substring(6).Trim()
+                    try {
+                        $decoded = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($b64))
+                        $colonIx = $decoded.IndexOf(':')
+                        if ($colonIx -ge 0) {
+                            $providedUser = $decoded.Substring(0, $colonIx)
+                            $providedPass = $decoded.Substring($colonIx + 1)
+                            if ($providedUser -eq $script:cfg.BasicAuthUser -and $providedPass -eq $script:cfg.BasicAuthPass) {
+                                $authPassed = $true
+                            }
+                        }
+                    } catch { } # malformed base64 — treat as auth failure, no diagnostic leak
+                }
+            }
+
+            if (-not $authPassed) {
                 $body = New-JsonResponse -ExitCode 401 -Output '' -Err 'Unauthorized.'
+                if ($authMode -eq 'Basic' -or $authMode -eq 'Both') {
+                    $resp.AddHeader('WWW-Authenticate', ('Basic realm="{0}"' -f $script:cfg.BasicAuthRealm))
+                }
                 Send-Response -Response $resp -StatusCode 401 -Body $body -RequestId $requestId
                 Write-Log -ClientIP $clientIP -Request $requestLine -Status 'UNAUTHORIZED' -ExitCode '-' -RequestId $requestId
                 return

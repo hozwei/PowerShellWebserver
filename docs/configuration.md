@@ -54,6 +54,10 @@ $cfg = @{
     CorsAllowCredentials     = $false
     CorsMaxAgeSec            = 600
     AcceptedContentTypes     = @('application/json', 'application/x-www-form-urlencoded')
+    AuthMode                 = 'ApiKey'
+    BasicAuthUser            = $env:POSH_BASIC_USER
+    BasicAuthPass            = $env:POSH_BASIC_PASS
+    BasicAuthRealm           = 'posh'
 }
 ```
 
@@ -104,6 +108,10 @@ $cfg = @{
     CorsAllowCredentials     = $true
     CorsMaxAgeSec            = 600
     AcceptedContentTypes     = @('application/json')   # narrow gate: JSON only, reject form-encoded
+    AuthMode                 = 'Both'                  # accept either X-Api-Key or Basic-Auth
+    BasicAuthUser            = $env:POSH_BASIC_USER
+    BasicAuthPass            = $env:POSH_BASIC_PASS
+    BasicAuthRealm           = 'posh-admin'
 }
 ```
 
@@ -119,6 +127,8 @@ $cfg = @{
 |---|---|
 | `POSH_API_KEY` | API key required in the `X-Api-Key` request header. Must be set as a `Machine`-scope system environment variable before the server starts. Set automatically by `Register-ScheduledTask.ps1`. The server refuses to start if this variable is empty or missing. |
 | `POSH_CERT_THUMBPRINT` | Thumbprint of the certificate bound to the HTTPS port. Set automatically by `Register-ScheduledTask.ps1` after a successful `netsh` binding. Not a secret — used for diagnostics only. |
+| `POSH_BASIC_USER` | Basic-Auth username. Required only when `$cfg.AuthMode` is `'Basic'` or `'Both'`. Must be set as a `Machine`-scope system environment variable before the server starts. |
+| `POSH_BASIC_PASS` | Basic-Auth password. Same scope and requirement as `POSH_BASIC_USER`. Kept in process memory only — never written to disk. |
 
 To set manually (requires an Administrator session):
 
@@ -183,6 +193,10 @@ These are passed on the command line when starting the server. `Register-Schedul
 | `CorsAllowCredentials` | `bool` | `$false` | Set `Access-Control-Allow-Credentials: true` when the request origin matches the allowlist. Browsers send cookies / `Authorization` only when this is enabled. Incompatible with `@('*')` per CORS spec. |
 | `CorsMaxAgeSec` | `integer` | `600` | Value of `Access-Control-Max-Age` on OPTIONS preflight responses — how long the browser may cache the preflight result. `0` omits the header entirely. |
 | `AcceptedContentTypes` | `string[]` | `@('application/json', 'application/x-www-form-urlencoded')` | Allowed POST `Content-Type` prefixes. Matched via `StartsWith`. Requests with a non-listed Content-Type receive HTTP 415. Narrow this list (e.g. to `@('application/json')`) to reject form-encoded bodies entirely. |
+| `AuthMode` | `string` | `'ApiKey'` | Authentication mode. `'ApiKey'`: only `X-Api-Key` is accepted (default). `'Basic'`: only HTTP Basic Auth (`Authorization: Basic <base64>`) is accepted. `'Both'`: either credential is accepted, whichever the client sends. Failed auth on `'Basic'` or `'Both'` emits a `WWW-Authenticate: Basic realm="…"` header so browsers display a login dialog. |
+| `BasicAuthUser` | `string` | `$env:POSH_BASIC_USER` | Basic-Auth username. Sourced from the `POSH_BASIC_USER` env var — do not hardcode. Validated at startup when `AuthMode` requires Basic. |
+| `BasicAuthPass` | `string` | `$env:POSH_BASIC_PASS` | Basic-Auth password. Sourced from the `POSH_BASIC_PASS` env var — kept in process memory only, never written to disk. |
+| `BasicAuthRealm` | `string` | `'posh'` | Realm string in the `WWW-Authenticate` header. Browsers display this label in the login dialog. |
 
 ### Register-ScheduledTask.ps1 — Scheduled Task Options
 
