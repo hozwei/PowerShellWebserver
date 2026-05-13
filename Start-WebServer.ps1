@@ -25,6 +25,10 @@
 .PARAMETER HttpsPort
     HTTPS port. Default: 443. Only evaluated when -HttpsEnabled is set.
 
+.PARAMETER BaseDir
+    Base directory for runtime artefacts (config.psd1, webroot, logs, postjson).
+    Default: 'C:\posh'. Override for multi-instance or non-default deployments.
+
 .EXAMPLE
     # HTTP only (default)
     .\Start-WebServer.ps1
@@ -51,7 +55,12 @@ param(
     [int]    $HttpPort  = 80,
     [ValidateRange(1, 65535)]
     [int]    $HttpsPort = 443,
-    # Path to the runtime config.psd1. Empty = '<baseDir>\config.psd1'. The file
+    # Base directory for runtime artefacts: config.psd1, webroot, logs, postjson.
+    # All derived $cfg paths (WebRoot, LogDir, PostJsonDir) default to subfolders
+    # of this. Override to support multi-instance deployments (e.g. -BaseDir
+    # 'D:\posh-staging') or non-default install locations.
+    [string] $BaseDir   = 'C:\posh',
+    # Path to the runtime config.psd1. Empty = '<BaseDir>\config.psd1'. The file
     # is mandatory at startup — generate it once via tools\Initialize-PoshConfig.ps1.
     [string] $ConfigFile = '',
     # Internal: dump the inline $cfg defaults (after derived-field fallbacks) as
@@ -67,11 +76,12 @@ param(
 )
 
 # ---------------------------------------------------------------------------
-# Base path — hardcoded for reliable operation across all execution contexts.
-# Defined before all checks so every early-exit path shares the same value.
-# Adjust if the deployment directory differs.
+# Base path — defaults to 'C:\posh' but is overridable via -BaseDir. Defined
+# before all checks so every early-exit path shares the same value. The
+# config-merge step below preserves the resolved value in $cfg via the
+# derived-default WebRoot/LogDir/PostJsonDir lookups.
 # ---------------------------------------------------------------------------
-$baseDir = 'C:\posh'
+$baseDir = $BaseDir
 
 # ---------------------------------------------------------------------------
 # PowerShell 7 — mandatory check
@@ -135,6 +145,13 @@ if ($null -eq $basicPass) { $basicPass = '' }
 # The prefix is no longer stored in $cfg — it is built dynamically from
 # HttpPort/HttpsPort and added directly to the listener.
 # HttpPort = 0 signals: HTTP disabled (only useful with HttpsEnabled).
+#
+# PowerShell evaluates this hashtable literal EAGERLY at parse-time of the
+# enclosing scope. Every variable used inside the block — $HttpsEnabled,
+# $HttpPort, $HttpsPort, $baseDir, $apiKey, $basicUser, $basicPass, plus
+# $PID for PwshExe — must therefore be defined BEFORE the block runs.
+# Reordering blocks here without minding that contract leaves silently
+# empty $cfg fields (no error is raised — $null just lands in the value).
 # ---------------------------------------------------------------------------
 $cfg = @{
     HttpsEnabled        = $HttpsEnabled.IsPresent                    # HTTPS active?
@@ -289,21 +306,48 @@ $cfg = @{
 # ---------------------------------------------------------------------------
 function Set-CfgDerivedDefaults {
     param([Parameter(Mandatory)] [hashtable] $Cfg)
-    if ([string]::IsNullOrEmpty($Cfg.ErrorPagesRoot)) { $Cfg.ErrorPagesRoot = Join-Path $Cfg.WebRoot '_error' }
-    if ([string]::IsNullOrEmpty($Cfg.JobsLogFile))    { $Cfg.JobsLogFile    = Join-Path $Cfg.LogDir 'jobs.log' }
-    if ([string]::IsNullOrEmpty($Cfg.AuditLogFile))   { $Cfg.AuditLogFile   = Join-Path $Cfg.LogDir 'audit.log' }
-    if ([string]::IsNullOrEmpty($Cfg.SlowLogFile))    { $Cfg.SlowLogFile    = Join-Path $Cfg.LogDir 'slow.log' }
-    if ([string]::IsNullOrEmpty($Cfg.StaticRoot))     { $Cfg.StaticRoot     = $Cfg.WebRoot }
+    # IsNullOrWhiteSpace (rather than IsNullOrEmpty) so that an operator setting
+    # ErrorPagesRoot = '   ' in config.psd1 doesn't sneak whitespace into the
+    # derived path that Test-Path / Join-Path would then handle inconsistently.
+    if ([string]::IsNullOrWhiteSpace([string]$Cfg.ErrorPagesRoot)) { $Cfg.ErrorPagesRoot = Join-Path $Cfg.WebRoot '_error' }
+    if ([string]::IsNullOrWhiteSpace([string]$Cfg.JobsLogFile))    { $Cfg.JobsLogFile    = Join-Path $Cfg.LogDir 'jobs.log' }
+    if ([string]::IsNullOrWhiteSpace([string]$Cfg.AuditLogFile))   { $Cfg.AuditLogFile   = Join-Path $Cfg.LogDir 'audit.log' }
+    if ([string]::IsNullOrWhiteSpace([string]$Cfg.SlowLogFile))    { $Cfg.SlowLogFile    = Join-Path $Cfg.LogDir 'slow.log' }
+    if ([string]::IsNullOrWhiteSpace([string]$Cfg.StaticRoot))     { $Cfg.StaticRoot     = $Cfg.WebRoot }
+}
+
+# ---------------------------------------------------------------------------
+# Returns a shallow copy of $cfg with secret-bearing fields zeroed out, so
+# dump-style outputs are safe to paste into bug reports / chats. The env-
+# sourced credentials (ApiKey, BasicAuthUser, BasicAuthPass) are emptied
+# unconditionally because they belong in environment variables, never on
+# disk. ApiKeys values are replaced with a marker but the labels stay so
+# operators can see WHICH keys exist without leaking the secret.
+# ---------------------------------------------------------------------------
+function Get-RedactedCfgCopy {
+    param([Parameter(Mandatory)] [hashtable] $Cfg)
+    $copy = @{}
+    foreach ($k in $Cfg.Keys) { $copy[$k] = $Cfg[$k] }
+    $copy.ApiKey        = ''
+    $copy.BasicAuthUser = ''
+    $copy.BasicAuthPass = ''
+    if ($copy.ApiKeys -and $copy.ApiKeys.Count -gt 0) {
+        $redactedKeys = [ordered]@{}
+        foreach ($label in $copy.ApiKeys.Keys) { $redactedKeys[$label] = '***REDACTED***' }
+        $copy.ApiKeys = $redactedKeys
+    }
+    return $copy
 }
 
 # ---------------------------------------------------------------------------
 # -DumpConfig: emit the inline $cfg defaults (after derived-field fallbacks)
 # as JSON and exit. tools\Initialize-PoshConfig.ps1 consumes this to seed a
-# fresh config.psd1 without ever touching the listener.
+# fresh config.psd1 without ever touching the listener. Secrets are stripped
+# so the output is safe even if POSH_API_KEY happens to be set in the env.
 # ---------------------------------------------------------------------------
 if ($DumpConfig) {
     Set-CfgDerivedDefaults -Cfg $cfg
-    $cfg | ConvertTo-Json -Depth 20 -Compress
+    Get-RedactedCfgCopy -Cfg $cfg | ConvertTo-Json -Depth 20 -Compress
     exit 0
 }
 
@@ -348,22 +392,52 @@ $external = $null
 try {
     $external = Import-PowerShellDataFile -LiteralPath $resolvedConfigFile
 } catch {
-    $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | STARTUP | ERROR: External config '$resolvedConfigFile' could not be parsed: $_"
+    # Surface the parser's position info ($_.InvocationInfo.PositionMessage when
+    # set — multi-line, contains the offending line and a caret pointer) so
+    # operators do not have to dig through the file by hand. Fall back to the
+    # bare exception message when no position is available (e.g. file-not-
+    # readable rather than parse error).
+    $details = if ($_.InvocationInfo -and $_.InvocationInfo.PositionMessage) {
+        $_.InvocationInfo.PositionMessage.Trim()
+    } else {
+        $_.Exception.Message
+    }
+    $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | STARTUP | ERROR: External config '$resolvedConfigFile' could not be parsed: $($_.Exception.Message)"
     try {
         if (-not (Test-Path $baseDir)) { $null = New-Item -ItemType Directory -Path $baseDir -Force }
         [System.IO.File]::AppendAllText((Join-Path $baseDir 'logs\startup.log'), $line + [System.Environment]::NewLine, [System.Text.Encoding]::UTF8)
+        if ($details -ne $_.Exception.Message) {
+            [System.IO.File]::AppendAllText((Join-Path $baseDir 'logs\startup.log'), $details + [System.Environment]::NewLine, [System.Text.Encoding]::UTF8)
+        }
     } catch { }
     Write-Output $line
     Write-Output ''
     Write-Output "ERROR: External config '$resolvedConfigFile' is not a valid PowerShell data file."
     Write-Output 'Inspect the file and ensure it contains only a single hashtable: @{ Key = Value; ... }'
+    if ($details -ne $_.Exception.Message) {
+        Write-Output ''
+        Write-Output $details
+    }
     exit 1
 }
 if ($null -ne $external) {
-    foreach ($k in $external.Keys) { $cfg[$k] = $external[$k] }
+    # Snapshot the inline schema BEFORE the merge so typo detection has a
+    # ground truth (operators love to type 'WebRroot' instead of 'WebRoot' —
+    # without this check the typo would silently land in $cfg with no effect).
+    $knownCfgKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($k in $cfg.Keys) { $null = $knownCfgKeys.Add([string]$k) }
+
+    $unknownKeys = [System.Collections.Generic.List[string]]::new()
+    foreach ($k in $external.Keys) {
+        if (-not $knownCfgKeys.Contains([string]$k)) { $unknownKeys.Add([string]$k) }
+        $cfg[$k] = $external[$k]
+    }
     # Stash the success line for Write-StartupLog further down (Write-StartupLog
     # is not defined yet at this point; we want this in startup.log, not just Write-Output).
     $script:externalConfigStartupNote = "External config loaded: $resolvedConfigFile ($($external.Count) key(s) overridden)"
+    if ($unknownKeys.Count -gt 0) {
+        $script:externalConfigUnknownKeysNote = "WARN: config.psd1 contains $($unknownKeys.Count) key(s) not present in the inline schema (likely typos): $($unknownKeys -join ', ')"
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -398,13 +472,89 @@ if ($cfg.HttpsPort -lt 1 -or $cfg.HttpsPort -gt 65535) {
 }
 
 # ---------------------------------------------------------------------------
-# API-Keys BC fallback — if the operator did not populate ApiKeys via the
-# external config, lift the legacy single $cfg.ApiKey into ApiKeys under the
-# 'default' label so the auth path can use one uniform lookup.
+# Post-merge numeric-range validation for the remaining $cfg numerics that
+# config.psd1 could set to absurd values. The CLI-param decorators only
+# guard the three port/switch fields handled above. Anything sourced from
+# config.psd1 reaches the runtime unchecked, so a stray `-1` would surface
+# as an opaque .NET error inside a runspace many requests in.
+#
+# Pairs: (Key, Minimum, Maximum) — Maximum = $null means unbounded above.
+# Each pair must hold post-merge AND post-derived-defaults; placed here
+# because Set-CfgDerivedDefaults runs further down and only touches paths.
 # ---------------------------------------------------------------------------
-if (-not $cfg.ApiKeys -or $cfg.ApiKeys.Count -eq 0) {
-    if (-not [string]::IsNullOrEmpty($cfg.ApiKey)) {
+$numericBounds = @(
+    @{ Key = 'ScriptTimeoutSec';         Min = 1;    Max = 86400 }   # 1 s .. 24 h
+    @{ Key = 'MaxConcurrent';            Min = 1;    Max = 10000 }   # >= 1 worker, soft upper to catch typos
+    @{ Key = 'MaxRequestBodyBytes';      Min = 1KB;  Max = 1GB }     # 1 KB .. 1 GB
+    @{ Key = 'LogRetentionDays';         Min = 0;    Max = 36500 }   # 0 = disabled, 100 years upper
+    @{ Key = 'PostJsonRetentionDays';    Min = 0;    Max = 36500 }
+    @{ Key = 'RateLimitRequests';        Min = 0;    Max = 1000000 } # 0 = disabled
+    @{ Key = 'MinRequestIntervalSec';    Min = 0;    Max = 3600 }    # 0 = disabled, 1 h upper
+    @{ Key = 'GzipMinBytes';             Min = 0;    Max = 1GB }
+    @{ Key = 'GzipMaxBytes';             Min = 1;    Max = 1GB }
+    @{ Key = 'PhpCgiTimeoutSec';         Min = 1;    Max = 86400 }
+    @{ Key = 'CorsMaxAgeSec';            Min = 0;    Max = 86400 }
+    @{ Key = 'SlowRequestThresholdMs';   Min = 0;    Max = 3600000 } # 0 = disabled, 1 h upper
+)
+foreach ($b in $numericBounds) {
+    $v = $cfg[$b.Key]
+    if ($null -eq $v) { continue }            # missing key: derived-defaults pass / earlier check handles it
+    $n = $null
+    if (-not [long]::TryParse([string]$v, [ref]$n)) {
+        Write-Output ("ERROR: {0} = '{1}' is not numeric. Fix config.psd1." -f $b.Key, $v)
+        exit 1
+    }
+    if ($n -lt $b.Min -or $n -gt $b.Max) {
+        Write-Output ("ERROR: {0} = {1} out of range ({2}..{3}). Fix config.psd1." -f $b.Key, $n, $b.Min, $b.Max)
+        exit 1
+    }
+}
+
+# ---------------------------------------------------------------------------
+# API-Keys merge — the auth path resolves keys exclusively through ApiKeys.
+# Two paths into the table:
+#   (a) Operator-populated ApiKeys in config.psd1 (multi-key map).
+#   (b) Legacy single key from $env:POSH_API_KEY ($cfg.ApiKey).
+# Previously, populating (a) silently dropped (b), so anyone calling with the
+# env-var key got 401 with no log trace. Both now coexist:
+#   - When ApiKeys is empty, the env-var key seeds it under 'default' (BC).
+#   - When ApiKeys is populated and the env-var key is not yet a value in the
+#     table, it is added under 'env' (or 'env-<rand>' if that label is taken).
+# Operator entries always win over BC seeding by label name, but the key
+# value is never silently discarded.
+# ---------------------------------------------------------------------------
+if (-not $cfg.ApiKeys) {
+    $cfg.ApiKeys = [ordered]@{}
+}
+if (-not [string]::IsNullOrEmpty($cfg.ApiKey)) {
+    if ($cfg.ApiKeys.Count -eq 0) {
         $cfg.ApiKeys = [ordered]@{ 'default' = $cfg.ApiKey }
+    } else {
+        $envKeyAlreadyPresent = $false
+        foreach ($existing in $cfg.ApiKeys.Values) {
+            if ([string]$existing -ceq [string]$cfg.ApiKey) { $envKeyAlreadyPresent = $true; break }
+        }
+        if (-not $envKeyAlreadyPresent) {
+            $envLabel = if ($cfg.ApiKeys.Contains('env')) { 'env-' + [guid]::NewGuid().ToString('N').Substring(0, 6) } else { 'env' }
+            $cfg.ApiKeys[$envLabel] = $cfg.ApiKey
+            $script:envKeyMergeNote = "Auto-added POSH_API_KEY to ApiKeys as label '$envLabel' (would otherwise be silently ignored)."
+        }
+    }
+}
+
+# Path inputs the derived-defaults pass depends on must be absolute, non-empty
+# strings — Join-Path of '' or a relative path would silently fold the
+# derived paths (ErrorPagesRoot, JobsLogFile, ...) into the current
+# working directory, which under Scheduled Task is C:\Windows\System32.
+foreach ($pathKey in @('WebRoot', 'LogDir', 'PostJsonDir')) {
+    $v = [string]$cfg[$pathKey]
+    if ([string]::IsNullOrWhiteSpace($v)) {
+        Write-Output "ERROR: $pathKey is empty after config merge. Fix config.psd1."
+        exit 1
+    }
+    if (-not [System.IO.Path]::IsPathRooted($v)) {
+        Write-Output "ERROR: $pathKey = '$v' is not an absolute path. Use a rooted path (e.g. 'C:\posh\webroot') in config.psd1."
+        exit 1
     }
 }
 
@@ -413,9 +563,10 @@ if (-not $cfg.ApiKeys -or $cfg.ApiKeys.Count -eq 0) {
 Set-CfgDerivedDefaults -Cfg $cfg
 
 # -DumpEffectiveConfig stops here, after config.psd1 + CLI overrides + the
-# second derived-defaults pass. The output is what the listener WOULD use.
+# second derived-defaults pass. The output is what the listener WOULD use,
+# minus the secret-bearing fields (see Get-RedactedCfgCopy).
 if ($DumpEffectiveConfig) {
-    $cfg | ConvertTo-Json -Depth 20 -Compress
+    Get-RedactedCfgCopy -Cfg $cfg | ConvertTo-Json -Depth 20 -Compress
     exit 0
 }
 
@@ -866,6 +1017,12 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 if (-not [string]::IsNullOrEmpty($script:externalConfigStartupNote)) {
     Write-StartupLog $script:externalConfigStartupNote
 }
+if (-not [string]::IsNullOrEmpty($script:externalConfigUnknownKeysNote)) {
+    Write-StartupLog $script:externalConfigUnknownKeysNote
+}
+if (-not [string]::IsNullOrEmpty($script:envKeyMergeNote)) {
+    Write-StartupLog $script:envKeyMergeNote
+}
 
 if ($cfg.HttpsEnabled) {
     $netshOut = netsh http show sslcert "ipport=0.0.0.0:$($cfg.HttpsPort)" 2>&1
@@ -918,6 +1075,7 @@ if ($cfg.PhpCgiEnabled) {
 # letting Listener.Start() throw an obscure ArgumentException later.
 # ---------------------------------------------------------------------------
 if ($cfg.Prefixes -and $cfg.Prefixes.Count -gt 0) {
+    $seenPrefixes = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($p in $cfg.Prefixes) {
         if ([string]::IsNullOrEmpty($p) -or -not $p.EndsWith('/')) {
             Write-StartupLog "ERROR: Prefix '$p' is missing the trailing '/' required by HttpListener."
@@ -930,6 +1088,14 @@ if ($cfg.Prefixes -and $cfg.Prefixes.Count -gt 0) {
             Write-StartupLog "ERROR: Prefix '$p' must use the http:// or https:// scheme."
             Write-Output ''
             Write-Output "ERROR: \$cfg.Prefixes entry '$p' must start with 'http://' or 'https://'."
+            exit 1
+        }
+        # Duplicate prefixes make HttpListener throw an opaque "Prefix has
+        # already been added" exception at Start() — catch it here.
+        if (-not $seenPrefixes.Add($p)) {
+            Write-StartupLog "ERROR: Prefix '$p' is listed more than once in `$cfg.Prefixes."
+            Write-Output ''
+            Write-Output "ERROR: Duplicate prefix '$p'. HttpListener requires each prefix to appear exactly once."
             exit 1
         }
     }
@@ -949,6 +1115,253 @@ if ($cfg.CustomErrorPages -and -not (Test-Path -LiteralPath $cfg.ErrorPagesRoot 
 }
 
 # ---------------------------------------------------------------------------
+# Cross-field consistency validation. Catches misconfigurations that today
+# silently degrade a feature (no error, just doesn't work). Fatal checks
+# (exit 1) are reserved for operator mistakes that an admin must know about
+# at startup; soft WARNs surface less-critical typos that would otherwise
+# produce a working-but-unintended server.
+#
+# What lives here (in dispatch order):
+#   1. Enum allow-lists       — AuthMode, ExecutionMode, RateLimitMode,
+#                                LogSchedule, LogFormat
+#   2. Sub-feature gates      — DirectoryBrowsing/StaticServing,
+#                                SessionEnabled/SessionCookieName,
+#                                BasicAuthRealm non-empty,
+#                                CORS '*' + AllowCredentials
+#   3. Numeric ranges (post-  — RateLimitWindowSec, RateLimitQueueTimeoutSec,
+#      merge)                   GzipMinBytes vs GzipMaxBytes
+#   4. ApiKeys hygiene        — no empty values
+#   5. Exempt path arrays     — leading '/', non-empty
+#   6. BlockedIPs/AllowedIPs  — regex/CIDR/IP grammar
+#   7. MimeTypeMap /          — keys start with '.', lowercase; values
+#      ScriptExtensionMap       look like Content-Types
+#   8. Content-Type lists     — GzipMimeTypes, AcceptedContentTypes,
+#                                BlockedMimeTypes — entries contain '/'
+#
+# Validations that depend on path inputs and therefore run BEFORE the
+# derived-defaults pass (further up the file): WebRoot / LogDir /
+# PostJsonDir rootedness, port-range, post-merge numeric bounds, unknown-
+# key typo detection.
+# ---------------------------------------------------------------------------
+
+# Whitelist-style enum validation — invalid values otherwise fall through to
+# the default branch of switch/if-elseif chains with no warning. Driven by a
+# single table so adding a new enum-style config key is a one-liner.
+$enumBounds = @(
+    @{ Key = 'AuthMode';      Valid = @('ApiKey', 'Basic', 'Both') }
+    @{ Key = 'ExecutionMode'; Valid = @('Subprocess', 'InProcess') }
+    @{ Key = 'RateLimitMode'; Valid = @('reject', 'queue') }
+    @{ Key = 'LogSchedule';   Valid = @('Daily', 'Hourly') }
+    @{ Key = 'LogFormat';     Valid = @('Native', 'IIS-W3C') }
+)
+foreach ($e in $enumBounds) {
+    $current = $cfg[$e.Key]
+    if ($e.Valid -notcontains $current) {
+        $allowed = $e.Valid -join ', '
+        Write-StartupLog ("ERROR: {0} = '{1}' is invalid. Allowed: {2}." -f $e.Key, $current, $allowed)
+        Write-Output ''
+        Write-Output ("ERROR: {0} = '{1}' — must be one of: {2}." -f $e.Key, $current, $allowed)
+        exit 1
+    }
+}
+
+# DirectoryBrowsing is a sub-feature of StaticServing — without static serving
+# the directory-listing renderer is never reached, so the flag is a silent no-op.
+if ($cfg.DirectoryBrowsing -and -not $cfg.StaticServingEnabled) {
+    Write-StartupLog 'WARN: DirectoryBrowsing = $true has no effect while StaticServingEnabled = $false. Enable StaticServing or set DirectoryBrowsing = $false to silence this warning.'
+}
+
+# SessionEnabled with an empty cookie name silently fails: the server would
+# emit a Set-Cookie header without a name, which browsers ignore. Catch it.
+if ($cfg.SessionEnabled -and [string]::IsNullOrWhiteSpace([string]$cfg.SessionCookieName)) {
+    Write-StartupLog 'ERROR: SessionEnabled = $true but SessionCookieName is empty. Sessions would never be issued.'
+    Write-Output ''
+    Write-Output 'ERROR: SessionEnabled requires a non-empty SessionCookieName.'
+    exit 1
+}
+
+# BasicAuthRealm is sent verbatim in the WWW-Authenticate header. An empty
+# realm produces a malformed header that some clients reject.
+if ($cfg.AuthMode -ne 'ApiKey' -and [string]::IsNullOrWhiteSpace([string]$cfg.BasicAuthRealm)) {
+    Write-StartupLog ("ERROR: AuthMode = '{0}' requires a non-empty BasicAuthRealm." -f $cfg.AuthMode)
+    Write-Output ''
+    Write-Output ("ERROR: BasicAuthRealm is empty but AuthMode = '{0}' relies on it." -f $cfg.AuthMode)
+    exit 1
+}
+
+# CORS spec forbids '*' with credentials — browsers reject the response,
+# so the combination breaks every authenticated cross-origin call silently.
+if ($cfg.CorsAllowCredentials -and ($cfg.CorsAllowedOrigins -contains '*')) {
+    Write-StartupLog 'ERROR: CorsAllowCredentials = $true is incompatible with CorsAllowedOrigins = @(''*''). The CORS spec requires an explicit origin list when credentials are enabled; browsers will reject every cross-origin response.'
+    Write-Output ''
+    Write-Output "ERROR: CORS misconfiguration — '*' origin cannot be combined with AllowCredentials = `$true."
+    Write-Output 'Solution: replace @(''*'') with the concrete origins that need credentialed access.'
+    exit 1
+}
+
+# Rate-limit numeric ranges — config.psd1 can set absurd values that no
+# CLI param decorator would have caught. Order matters: a zero RateLimitRequests
+# legitimately disables the limit (documented behaviour), so only the windows
+# and the queue timeout need lower bounds.
+if ($cfg.RateLimitWindowSec -lt 1) {
+    Write-StartupLog "ERROR: RateLimitWindowSec = $($cfg.RateLimitWindowSec) must be >= 1 (or set RateLimitRequests = 0 to disable rate limiting entirely)."
+    Write-Output ''
+    Write-Output "ERROR: RateLimitWindowSec = $($cfg.RateLimitWindowSec) — must be >= 1 second."
+    exit 1
+}
+if ($cfg.RateLimitMode -eq 'queue' -and $cfg.RateLimitQueueTimeoutSec -lt 1) {
+    Write-StartupLog "ERROR: RateLimitMode = 'queue' requires RateLimitQueueTimeoutSec >= 1 (got $($cfg.RateLimitQueueTimeoutSec))."
+    Write-Output ''
+    Write-Output "ERROR: RateLimitQueueTimeoutSec = $($cfg.RateLimitQueueTimeoutSec) — queue mode needs a positive timeout."
+    exit 1
+}
+
+# GZIP threshold sanity — inverted bounds disable compression silently.
+if ($cfg.GzipEnabled -and $cfg.GzipMinBytes -ge $cfg.GzipMaxBytes) {
+    Write-StartupLog "ERROR: GzipMinBytes ($($cfg.GzipMinBytes)) >= GzipMaxBytes ($($cfg.GzipMaxBytes)) — compression would never fire. Adjust the thresholds."
+    Write-Output ''
+    Write-Output "ERROR: GzipMinBytes ($($cfg.GzipMinBytes)) must be less than GzipMaxBytes ($($cfg.GzipMaxBytes))."
+    exit 1
+}
+
+# ApiKeys hashtable must not contain empty values — an empty key in the table
+# would let an unauthenticated request through if a client sent '' in X-Api-Key.
+if ($cfg.ApiKeys -and $cfg.ApiKeys.Count -gt 0) {
+    foreach ($label in $cfg.ApiKeys.Keys) {
+        if ([string]::IsNullOrEmpty([string]$cfg.ApiKeys[$label])) {
+            Write-StartupLog "ERROR: ApiKeys['$label'] is empty — empty keys would weaken authentication. Remove the entry or set a real key."
+            Write-Output ''
+            Write-Output "ERROR: ApiKeys['$label'] has an empty value. Remove the entry or set a real key."
+            exit 1
+        }
+    }
+}
+
+# Exempt-path arrays — all four are matched verbatim (case-insensitive) against
+# the request URL's AbsolutePath, which always starts with '/'. Entries missing
+# the leading slash silently never match, so a typo like 'health' instead of
+# '/health' would quietly expose the route to the very limit it was meant to
+# bypass. Warn (not error) because the config still produces a working server
+# — just not the one the operator intended.
+$exemptPathKeys = @('RateLimitExemptPaths', 'GlobalThrottleExemptPaths', 'AuthExemptPaths', 'IpFilterExemptPaths')
+foreach ($key in $exemptPathKeys) {
+    $arr = $cfg[$key]
+    if (-not $arr -or $arr.Count -eq 0) { continue }
+    foreach ($p in $arr) {
+        if ([string]::IsNullOrWhiteSpace([string]$p)) {
+            Write-StartupLog "WARN: ${key} contains an empty entry — it will never match a request path."
+            continue
+        }
+        if (-not ([string]$p).StartsWith('/')) {
+            Write-StartupLog "WARN: ${key} entry '$p' does not start with '/'. Request paths always do — this entry will never match."
+        }
+    }
+}
+
+# BlockedIPs / AllowedIPs — entries are silently skipped by Test-IpMatch when
+# they fail to parse, so a typo turns a security boundary into a no-op. Run
+# the same pattern grammar (regex / CIDR / exact IP) at startup and warn on
+# every entry that wouldn't match anything. Not fatal: the rest of the list
+# still works, and the operator may have a half-written config.
+$ipListKeys = @('BlockedIPs', 'AllowedIPs')
+foreach ($key in $ipListKeys) {
+    $arr = $cfg[$key]
+    if (-not $arr -or $arr.Count -eq 0) { continue }
+    foreach ($pat in $arr) {
+        $s = [string]$pat
+        if ([string]::IsNullOrWhiteSpace($s)) {
+            Write-StartupLog "WARN: ${key} contains an empty entry — it will never match."
+            continue
+        }
+        if ($s -ne $s.Trim()) {
+            Write-StartupLog "WARN: ${key} entry '$s' has leading/trailing whitespace — Test-IpMatch will never match it. Trim the entry in config.psd1."
+            continue
+        }
+        if ($s.StartsWith('~')) {
+            try { $null = [regex]::new($s.Substring(1)) } catch {
+                Write-StartupLog "WARN: ${key} regex entry '$s' is malformed: $($_.Exception.Message)"
+            }
+            continue
+        }
+        $slashIx = $s.IndexOf('/')
+        if ($slashIx -gt 0) {
+            $netPart  = $s.Substring(0, $slashIx)
+            $bitsPart = $s.Substring($slashIx + 1)
+            $ip = $null; $bits = $null
+            $ipOk   = [System.Net.IPAddress]::TryParse($netPart, [ref]$ip)
+            $bitsOk = [int]::TryParse($bitsPart, [ref]$bits)
+            if (-not $ipOk -or -not $bitsOk) {
+                Write-StartupLog "WARN: ${key} CIDR entry '$s' is malformed (expected '<ip>/<bits>')."
+                continue
+            }
+            $maxBits = if ($ip.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) { 128 } else { 32 }
+            if ($bits -lt 0 -or $bits -gt $maxBits) {
+                Write-StartupLog "WARN: ${key} CIDR entry '$s' has prefix length out of range (allowed: 0..$maxBits)."
+            }
+            continue
+        }
+        $ip = $null
+        if (-not [System.Net.IPAddress]::TryParse($s, [ref]$ip)) {
+            Write-StartupLog "WARN: ${key} entry '$s' is not a valid IP address, CIDR range, or '~regex'. It will never match."
+        }
+    }
+}
+
+# MimeTypeMap / ScriptExtensionMap — extension lookups in Get-MimeType / the
+# scriptextension dispatch use the literal hashtable key. Keys without a
+# leading dot, or with mixed case, silently never match because the lookup
+# canonicalises the input to '.<lowercase>'.
+foreach ($mapKey in @('MimeTypeMap', 'ScriptExtensionMap')) {
+    $map = $cfg[$mapKey]
+    if ($null -eq $map -or $map.Count -eq 0) { continue }
+    foreach ($ext in @($map.Keys)) {
+        $extStr = [string]$ext
+        if ([string]::IsNullOrWhiteSpace($extStr)) {
+            Write-StartupLog "WARN: ${mapKey} contains an empty key — it will never match a file extension."
+            continue
+        }
+        if (-not $extStr.StartsWith('.')) {
+            Write-StartupLog "WARN: ${mapKey} key '$extStr' must start with '.' to match. Add the leading dot in config.psd1."
+        }
+        if ($extStr -cne $extStr.ToLowerInvariant()) {
+            Write-StartupLog "WARN: ${mapKey} key '$extStr' is not lowercase. Lookups canonicalise to lowercase before matching."
+        }
+        # Value sanity: MimeTypeMap values must be non-empty Content-Types. The
+        # ScriptExtensionMap permits '' for .ps1 (JSON envelope), but any other
+        # value should still resemble a media type ('<type>/<subtype>').
+        $valStr = [string]$map[$ext]
+        if ($mapKey -eq 'MimeTypeMap') {
+            if ([string]::IsNullOrWhiteSpace($valStr) -or -not $valStr.Contains('/')) {
+                Write-StartupLog "WARN: MimeTypeMap['$extStr'] = '$valStr' does not look like a Content-Type ('<type>/<subtype>')."
+            }
+        } else {
+            if (-not [string]::IsNullOrEmpty($valStr) -and -not $valStr.Contains('/')) {
+                Write-StartupLog "WARN: ScriptExtensionMap['$extStr'] = '$valStr' does not look like a Content-Type. Use '' for the JSON envelope or '<type>/<subtype>' for a raw passthrough."
+            }
+        }
+    }
+}
+
+# Content-Type lists — GzipMimeTypes / AcceptedContentTypes / BlockedMimeTypes
+# are all matched via StartsWith against the request/response Content-Type.
+# Entries without '/' (e.g. 'json' instead of 'application/json') will never
+# match anything.
+foreach ($listKey in @('GzipMimeTypes', 'AcceptedContentTypes', 'BlockedMimeTypes')) {
+    $list = $cfg[$listKey]
+    if (-not $list -or $list.Count -eq 0) { continue }
+    foreach ($ct in $list) {
+        $ctStr = [string]$ct
+        if ([string]::IsNullOrWhiteSpace($ctStr)) {
+            Write-StartupLog "WARN: ${listKey} contains an empty entry — it will never match a Content-Type."
+            continue
+        }
+        if (-not $ctStr.Contains('/')) {
+            Write-StartupLog "WARN: ${listKey} entry '$ctStr' is not a media-type prefix ('<type>/<subtype>'). StartsWith match will never succeed."
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Log startup information
 # ---------------------------------------------------------------------------
 $httpsInfo = if ($cfg.HttpsEnabled) { "  HTTPS=:$($cfg.HttpsPort)" } else { '' }
@@ -956,12 +1369,30 @@ $httpInfo  = if ($cfg.HttpPort -gt 0) { "  HTTP=:$($cfg.HttpPort)" } else { '  H
 Write-StartupLog "Web server starting. BaseDir=$baseDir  WebRoot=$($cfg.WebRoot)  LogDir=$($cfg.LogDir)  PS=$($PSVersionTable.PSVersion)$httpInfo$httpsInfo"
 
 # ---------------------------------------------------------------------------
-# Ensure directories exist
+# Ensure directories exist. The top-level dirs (WebRoot, LogDir, PostJsonDir)
+# are created unconditionally — they are part of the deployment contract.
+# Audit/Slow/Jobs log files default to <LogDir>, but operators can redirect
+# them anywhere via config.psd1. Make sure each parent exists so the runtime
+# Add-Content writes don't silently fail in a runspace where errors are
+# already swallowed by try/catch.
 # ---------------------------------------------------------------------------
 foreach ($dir in @($cfg.WebRoot, $cfg.LogDir, $cfg.PostJsonDir)) {
     if (-not (Test-Path -LiteralPath $dir -PathType Container)) {
         $null = New-Item -ItemType Directory -Path $dir -Force
         Write-StartupLog "Directory created: $dir"
+    }
+}
+foreach ($logKey in @('JobsLogFile', 'AuditLogFile', 'SlowLogFile')) {
+    $logFile = [string]$cfg[$logKey]
+    if ([string]::IsNullOrWhiteSpace($logFile)) { continue }
+    $parent = Split-Path -Parent $logFile
+    if (-not [string]::IsNullOrEmpty($parent) -and -not (Test-Path -LiteralPath $parent -PathType Container)) {
+        try {
+            $null = New-Item -ItemType Directory -Path $parent -Force
+            Write-StartupLog "Directory created for ${logKey}: $parent"
+        } catch {
+            Write-StartupLog "WARN: ${logKey} parent directory '$parent' could not be created: $($_.Exception.Message). Writes to '$logFile' will fail silently at runtime."
+        }
     }
 }
 
