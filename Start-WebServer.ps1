@@ -3228,6 +3228,16 @@ function Get-ScriptMetadata {
         return $null
     }
     if ($null -eq $ast) { return $null }
+    # Parse errors don't return $null AST but make metadata extraction
+    # unreliable -- log them once per file (the cache key keeps it from
+    # repeating per request). The metadata still gets cached as a best-effort
+    # so /openapi.json and the script index aren't wholly empty.
+    if ($null -ne $errors -and $errors.Count -gt 0) {
+        $firstErr = $errors[0]
+        try {
+            Write-StartupLog ("WARN: script metadata parse for '{0}' produced {1} error(s); first: {2} at line {3}." -f $ScriptPath, $errors.Count, $firstErr.Message, $firstErr.Extent.StartLineNumber)
+        } catch { $null = $_ }
+    }
 
     $synopsis    = ''
     $description = ''
