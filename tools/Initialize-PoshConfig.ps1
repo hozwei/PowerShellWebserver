@@ -108,17 +108,17 @@ $GROUP_ORDER = @(
     @{ Title = 'HTTP / HTTPS endpoints';     Keys = @('HttpsEnabled', 'HttpPort', 'HttpsPort', 'Prefixes') }
     @{ Title = 'Filesystem paths';           Keys = @('WebRoot', 'LogDir', 'PwshExe', 'PostJsonDir', 'PostJsonRetentionDays') }
     @{ Title = 'Authentication';             Keys = @('ApiKey', 'ApiKeys', 'AuthMode', 'BasicAuthUser', 'BasicAuthPass', 'BasicAuthRealm') }
-    @{ Title = 'Script execution';           Keys = @('ExecutionMode', 'InjectContextVars', 'ScriptTimeoutSec', 'MaxConcurrent', 'MaxRequestBodyBytes', 'AcceptedContentTypes', 'ScriptExtensionMap') }
-    @{ Title = 'Rate limiting';              Keys = @('RateLimitRequests', 'RateLimitWindowSec', 'RateLimitPenaltySec', 'RateLimitMode', 'RateLimitPerIdentity', 'RateLimitQueueTimeoutSec', 'RateLimitExemptPaths', 'MinRequestIntervalSec') }
+    @{ Title = 'Script execution';           Keys = @('ExecutionMode', 'InjectContextVars', 'ScriptTimeoutSec', 'MaxConcurrent', 'RunspacePoolOverprovision', 'MaxRequestBodyBytes', 'AcceptedContentTypes', 'ScriptExtensionMap') }
+    @{ Title = 'Rate limiting';              Keys = @('RateLimitRequests', 'RateLimitWindowSec', 'RateLimitPenaltySec', 'RateLimitMode', 'RateLimitPerIdentity', 'RateLimitQueueTimeoutSec', 'RateLimitQueuePollMs', 'RateLimitExemptPaths', 'RateLimitSweepIntervalSec', 'RateLimitTableSizeWarnThreshold', 'MinRequestIntervalSec') }
     @{ Title = 'IP filtering';               Keys = @('AllowedIPs', 'BlockedIPs') }
-    @{ Title = 'Logging';                    Keys = @('LogRetentionDays', 'LogIntegrityHash', 'LogSchedule', 'LogFormat', 'AuditLogEnabled', 'AuditLogFile', 'SlowRequestThresholdMs', 'SlowLogFile') }
+    @{ Title = 'Logging';                    Keys = @('LogRetentionDays', 'LogIntegrityHash', 'LogSchedule', 'LogFormat', 'LogMutexTimeoutMs', 'AuditLogEnabled', 'AuditLogFile', 'AuditLogMaxBytes', 'SlowRequestThresholdMs', 'SlowLogFile', 'SlowLogMaxBytes') }
     @{ Title = 'Compression';                Keys = @('GzipEnabled', 'BrotliEnabled', 'GzipMinBytes', 'GzipMaxBytes', 'GzipMimeTypes') }
     @{ Title = 'Static serving';             Keys = @('StaticServingEnabled', 'StaticRoot', 'DefaultDocuments', 'StaticCacheHeaders', 'BlockedMimeTypes', 'MimeTypeMap') }
     @{ Title = 'Sessions and cookies';       Keys = @('SessionEnabled', 'SessionCookieName') }
     @{ Title = 'CORS';                       Keys = @('CorsAllowedOrigins', 'CorsAllowedMethods', 'CorsAllowedHeaders', 'CorsAllowCredentials', 'CorsMaxAgeSec') }
     @{ Title = 'PHP CGI';                    Keys = @('PhpCgiEnabled', 'PhpCgiPath', 'PhpCgiTimeoutSec') }
     @{ Title = 'Custom error pages';         Keys = @('CustomErrorPages', 'ErrorPagesRoot') }
-    @{ Title = 'Background jobs';            Keys = @('BackgroundJobs', 'JobsLogFile') }
+    @{ Title = 'Background jobs';            Keys = @('BackgroundJobs', 'JobsLogFile', 'JobsLogMaxBytes') }
     @{ Title = 'Directory browsing';         Keys = @('DirectoryBrowsing', 'DirectoryBrowsingHidden') }
     @{ Title = 'Discovery and metadata';     Keys = @('IndexShowMetadata', 'PromMetricsEnabled', 'PathPlaceholders', 'OpenApiEnabled', 'OpenApiTitle', 'OpenApiVersion') }
 )
