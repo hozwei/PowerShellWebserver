@@ -521,7 +521,10 @@ if ($null -ne $external) {
     $skippedEmpty = [System.Collections.Generic.List[string]]::new()
     foreach ($k in $external.Keys) {
         if (-not $knownCfgKeys.Contains([string]$k)) { $unknownKeys.Add([string]$k) }
-        if ($envSourcedKeys.Contains([string]$k) -and [string]::IsNullOrEmpty([string]$external[$k])) {
+        # IsNullOrWhiteSpace (not IsNullOrEmpty): whitespace-only psd1 values like
+        # '   ' would otherwise silently wipe the env-sourced default, producing the
+        # same auth-misconfig regression IsNullOrEmpty was added to prevent.
+        if ($envSourcedKeys.Contains([string]$k) -and [string]::IsNullOrWhiteSpace([string]$external[$k])) {
             $skippedEmpty.Add([string]$k)
             continue
         }
@@ -908,10 +911,17 @@ function Write-Log {
     # runspaces and corrupts the log file.
     # Track $acquired: ReleaseMutex() must only be called when WaitOne() succeeded —
     # otherwise ApplicationException because the calling thread does not hold the mutex.
+    # AbandonedMutexException: the previous holder died without releasing. WaitOne
+    # still grants ownership to THIS thread — we must release in finally, otherwise
+    # the mutex stays permanently owned and every future log line gets dropped.
     $acquired   = $false
     $waitMs     = if ($script:cfg.LogMutexTimeoutMs -gt 0) { $script:cfg.LogMutexTimeoutMs } else { 500 }
     try {
-        $acquired = $script:logMutex.WaitOne($waitMs)
+        try {
+            $acquired = $script:logMutex.WaitOne($waitMs)
+        } catch [System.Threading.AbandonedMutexException] {
+            $acquired = $true
+        }
         if ($acquired) {
             if ($format -eq 'IIS-W3C' -and -not (Test-Path -LiteralPath $logFile -PathType Leaf)) {
                 # Emit W3C header block once per file — the #Fields line is what tools like
@@ -980,7 +990,12 @@ function Write-AuditLog {
     $acquired = $false
     $waitMs   = if ($script:cfg.LogMutexTimeoutMs -gt 0) { $script:cfg.LogMutexTimeoutMs } else { 500 }
     try {
-        $acquired = $script:auditMutex.WaitOne($waitMs)
+        try {
+            $acquired = $script:auditMutex.WaitOne($waitMs)
+        } catch [System.Threading.AbandonedMutexException] {
+            # Previous holder died without releasing; ownership has passed to us.
+            $acquired = $true
+        }
         if ($acquired) {
             Add-Content -LiteralPath $script:cfg.AuditLogFile -Value $line -Encoding UTF8
         } else {
@@ -1023,7 +1038,12 @@ function Write-SlowLog {
     $acquired = $false
     $waitMs   = if ($script:cfg.LogMutexTimeoutMs -gt 0) { $script:cfg.LogMutexTimeoutMs } else { 500 }
     try {
-        $acquired = $script:logMutex.WaitOne($waitMs)
+        try {
+            $acquired = $script:logMutex.WaitOne($waitMs)
+        } catch [System.Threading.AbandonedMutexException] {
+            # Previous holder died without releasing; ownership has passed to us.
+            $acquired = $true
+        }
         if ($acquired) {
             Add-Content -LiteralPath $script:cfg.SlowLogFile -Value $line -Encoding UTF8
         } else {
@@ -3224,12 +3244,21 @@ function Invoke-Script {
 
     $finished = $proc.WaitForExit($TimeoutSec * 1000)
 
+    # Race window: WaitForExit can return $false (timeout) while the process
+    # exited naturally microseconds later. Re-check HasExited before killing —
+    # otherwise we'd report a phony timeout AND lose the real exit code AND
+    # falsely bump scriptTimeoutsTotal. HasExited is a cheap WaitHandle peek.
+    if (-not $finished -and $proc.HasExited) {
+        $finished = $true
+    }
+
     if (-not $finished) {
-        # Timeout — kill the process. After Kill() the streams close on the
-        # OS side; we grab whatever has been written so far so the caller
-        # (and the slow-log entry) can see the script's last words before
-        # it was terminated. Without this, debugging a stuck script means
-        # adding a `Set-Content` line and waiting for the next reproduction.
+        # Real timeout — process is still running. Kill it. After Kill() the
+        # streams close on the OS side; we grab whatever has been written so
+        # far so the caller (and the slow-log entry) can see the script's
+        # last words before it was terminated. Without this, debugging a
+        # stuck script means adding a `Set-Content` line and waiting for
+        # the next reproduction.
         try { $proc.Kill() } catch { }
         try { $null = $proc.WaitForExit(2000) } catch { }
         $partialOut = ''
@@ -4024,6 +4053,12 @@ $requestHandler = {
         # the auth block below sets it to a key label, 'basic:<user>', or 'anonymous'
         # for the auth-exempt routes. Flows into Write-Log, Test-RateLimit, Write-AuditLog.
         $script:authIdentity = '-'
+        # Defensive top-level reset: the rate-limit block also resets these but only when
+        # $cfg.RateLimitRequests > 0. If a runspace runs requests under that mode and the
+        # operator later disables it, stale $true would otherwise cause the auth block to
+        # trust a cached label from a previous request. Reset unconditionally per request.
+        $script:apiKeyResolved      = $false
+        $script:resolvedApiKeyLabel = $null
 
         $clientIP    = $req.RemoteEndPoint.Address.ToString()
         $urlPath     = $req.Url.AbsolutePath
@@ -4819,7 +4854,13 @@ if ($cfg.BackgroundJobs -and $cfg.BackgroundJobs.Count -gt 0) {
             param([string] $LogText)
             $acquired = $false
             try {
-                $acquired = $jobsMutex.WaitOne($MutexWaitMs)
+                try {
+                    $acquired = $jobsMutex.WaitOne($MutexWaitMs)
+                } catch [System.Threading.AbandonedMutexException] {
+                    # Previous holder died without releasing; the mutex is now ours.
+                    # We must release in finally, otherwise no future job can write.
+                    $acquired = $true
+                }
                 if ($acquired) {
                     Add-Content -LiteralPath $LogFile -Value $LogText -Encoding UTF8
                 }
@@ -4846,7 +4887,13 @@ if ($cfg.BackgroundJobs -and $cfg.BackgroundJobs.Count -gt 0) {
                     $null = $proc.Start()
                     $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
                     $stderrTask = $proc.StandardError.ReadToEndAsync()
-                    $null = $proc.WaitForExit()
+                    # Poll WaitForExit so the parent shutdown can stop the runspace
+                    # within ~1s of calling Ps.Stop(). A blocking WaitForExit() with
+                    # no timeout pins the runspace until the subprocess exits naturally,
+                    # which can hang the entire shutdown if the BG script itself stalls.
+                    while (-not $proc.HasExited) {
+                        $null = $proc.WaitForExit(1000)
+                    }
                     # stdout is drained but intentionally discarded — reading it is required to
                     # prevent the child from blocking on a full pipe buffer; the actual content
                     # is only of interest in stderr (errors) and the exit code.
@@ -5042,6 +5089,14 @@ try {
                 $resp403.ContentType     = 'application/json; charset=utf-8'
                 $resp403.ContentLength64 = $bodyBytes.Length
                 $resp403.AddHeader('X-Request-Id', $ipReqId)
+                # HSTS on HTTPS fast-paths: same policy as Send-Response. Without this,
+                # a browser hitting a blocked IP over HTTPS would never see the header
+                # and could downgrade-attack the same origin via HTTP.
+                if ($cfg.HstsEnabled -and $context.Request.IsSecureConnection) {
+                    $h = "max-age=$([int]$cfg.HstsMaxAgeSec)"
+                    if ($cfg.HstsIncludeSubdomains) { $h += '; includeSubDomains' }
+                    try { $resp403.AddHeader('Strict-Transport-Security', $h) } catch { }
+                }
                 try { $resp403.OutputStream.Write($bodyBytes, 0, $bodyBytes.Length) } catch { }
                 try { $resp403.OutputStream.Close()                                  } catch { }
                 # Write-Log is defined in this scope (main thread) and uses the same
@@ -5082,6 +5137,11 @@ try {
                 $resp429.ContentLength64 = $bodyBytes.Length
                 $resp429.AddHeader('Retry-After', [string]$retryAfter)
                 $resp429.AddHeader('X-Request-Id', $throttleReqId)
+                if ($cfg.HstsEnabled -and $context.Request.IsSecureConnection) {
+                    $h = "max-age=$([int]$cfg.HstsMaxAgeSec)"
+                    if ($cfg.HstsIncludeSubdomains) { $h += '; includeSubDomains' }
+                    try { $resp429.AddHeader('Strict-Transport-Security', $h) } catch { }
+                }
                 try { $resp429.OutputStream.Write($bodyBytes, 0, $bodyBytes.Length) } catch { }
                 try { $resp429.OutputStream.Close()                                  } catch { }
                 # The main-loop 429/503 paths skip Write-Log because the
@@ -5106,6 +5166,11 @@ try {
             $resp503.ContentType     = 'application/json; charset=utf-8'
             $resp503.ContentLength64 = $bodyBytes.Length
             $resp503.AddHeader('X-Request-Id', $overloadReqId)
+            if ($cfg.HstsEnabled -and $context.Request.IsSecureConnection) {
+                $h = "max-age=$([int]$cfg.HstsMaxAgeSec)"
+                if ($cfg.HstsIncludeSubdomains) { $h += '; includeSubDomains' }
+                try { $resp503.AddHeader('Strict-Transport-Security', $h) } catch { }
+            }
             try { $resp503.OutputStream.Write($bodyBytes, 0, $bodyBytes.Length) } catch { }
             try { $resp503.OutputStream.Close()                                  } catch { }
             Write-Log -ClientIP $reqClientIP -Request "$($context.Request.HttpMethod) $reqUrlPath" -Status 'OVERLOAD' -ExitCode '-' -RequestId $overloadReqId
@@ -5162,14 +5227,32 @@ try {
     try { Start-Sleep -Seconds 5                          } catch { }
     try { $listener.Close()                               } catch { }
     # Stop background jobs — their script blocks loop forever, so Stop() is the only way out.
+    # BeginStop is non-blocking: we issue stop requests for all jobs in parallel, then wait
+    # up to 3s each for graceful exit. A synchronous Stop() can hang the entire shutdown if
+    # the BG runspace is blocked deep in a .NET call (e.g. Process.WaitForExit), because the
+    # cancellation signal is only checked at PowerShell pipeline boundaries.
     try {
         if ($null -ne $bgJobInstances) {
+            $stopHandles = @()
             foreach ($bg in $bgJobInstances) {
-                try { $bg.Ps.Stop() } catch {
-                    try { Write-StartupLog "WARN: bg-job '$($bg.Path)' Stop() threw: $($_.Exception.Message)" } catch { }
+                try {
+                    $h = $bg.Ps.BeginStop($null, $null)
+                    $stopHandles += [pscustomobject]@{ Bg = $bg; Handle = $h }
+                } catch {
+                    try { Write-StartupLog "WARN: bg-job '$($bg.Path)' BeginStop() threw: $($_.Exception.Message)" } catch { }
+                    $stopHandles += [pscustomobject]@{ Bg = $bg; Handle = $null }
                 }
-                try { $bg.Ps.Dispose()     } catch { }
-                try { $bg.Rs.Dispose()     } catch { }
+            }
+            foreach ($item in $stopHandles) {
+                if ($null -ne $item.Handle) {
+                    try {
+                        if (-not $item.Handle.AsyncWaitHandle.WaitOne(3000)) {
+                            try { Write-StartupLog "WARN: bg-job '$($item.Bg.Path)' did not stop within 3s — disposing forcefully" } catch { }
+                        }
+                    } catch { }
+                }
+                try { $item.Bg.Ps.Dispose() } catch { }
+                try { $item.Bg.Rs.Dispose() } catch { }
             }
         }
     } catch { }

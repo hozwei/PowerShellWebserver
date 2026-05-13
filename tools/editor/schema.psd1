@@ -286,7 +286,7 @@
             Label     = 'MaxConcurrent'
             Help      = "More concurrent requests -> HTTP 503."
             Min       = 1
-            Max       = 1000
+            Max       = 10000
         }
         @{
             Name      = 'RunspacePoolOverprovision'
