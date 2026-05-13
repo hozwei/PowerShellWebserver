@@ -3478,14 +3478,35 @@ function Build-OpenApiSpec {
         }
     }
 
+    # Servers array — Swagger UI and codegen tools use this to construct full
+    # URLs. Reconstruct from cfg.Prefixes when explicit, otherwise from
+    # HttpPort / HttpsPort. Skips disabled ports (HttpPort = 0) and the
+    # wildcard '+' which OpenAPI clients can't dereference.
+    $servers = [System.Collections.Generic.List[object]]::new()
+    if ($script:cfg.Prefixes -and $script:cfg.Prefixes.Count -gt 0) {
+        foreach ($p in $script:cfg.Prefixes) {
+            $ps = [string]$p
+            if ($ps -match '^https?://[+*]') { continue }  # wildcard binding -- not a callable URL
+            $null = $servers.Add(@{ url = $ps.TrimEnd('/') })
+        }
+    } else {
+        if ($script:cfg.HttpPort -gt 0) {
+            $null = $servers.Add(@{ url = "http://localhost:$($script:cfg.HttpPort)" })
+        }
+        if ($script:cfg.HttpsEnabled) {
+            $null = $servers.Add(@{ url = "https://localhost:$($script:cfg.HttpsPort)" })
+        }
+    }
+
     $spec = [ordered]@{
         openapi = '3.1.0'
         info    = [ordered]@{
             title   = [string]$script:cfg.OpenApiTitle
             version = [string]$script:cfg.OpenApiVersion
         }
-        paths   = $paths
     }
+    if ($servers.Count -gt 0) { $spec.servers = @($servers) }
+    $spec.paths = $paths
     return $spec | ConvertTo-Json -Compress -Depth 12
 }
 
