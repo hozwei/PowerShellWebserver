@@ -1214,17 +1214,22 @@ function Send-StaticFile {
                 if ($mime.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
                     # Load + compress in-memory. Acceptable for text content where bodies are
                     # typically small (HTML/CSS/JS); GzipMinBytes still gates against tiny payloads.
-                    $useGzip      = $true
-                    $allBytes     = [System.IO.File]::ReadAllBytes($FilePath)
-                    $ms           = [System.IO.MemoryStream]::new()
-                    $gz           = [System.IO.Compression.GZipStream]::new($ms, [System.IO.Compression.CompressionLevel]::Optimal, $true)
+                    # Wrap allocations in try/finally so MemoryStream cannot leak when
+                    # ReadAllBytes / GZipStream constructor / Write throws.
+                    $ms = $null
+                    $gz = $null
                     try {
+                        $allBytes     = [System.IO.File]::ReadAllBytes($FilePath)
+                        $ms           = [System.IO.MemoryStream]::new()
+                        $gz           = [System.IO.Compression.GZipStream]::new($ms, [System.IO.Compression.CompressionLevel]::Optimal, $true)
                         $gz.Write($allBytes, 0, $allBytes.Length)
+                        $gz.Dispose(); $gz = $null
+                        $compressBody = $ms.ToArray()
+                        $useGzip      = $true
                     } finally {
-                        $gz.Dispose()
+                        if ($null -ne $gz) { try { $gz.Dispose() } catch { } }
+                        if ($null -ne $ms) { try { $ms.Dispose() } catch { } }
                     }
-                    $compressBody = $ms.ToArray()
-                    $ms.Dispose()
                     break
                 }
             }
@@ -1328,12 +1333,19 @@ function ConvertTo-PoshApiXml {
         $null = $itemsNode.AppendChild($itemNode)
     }
 
-    $sw  = [System.IO.StringWriter]::new()
-    $xtw = [System.Xml.XmlTextWriter]::new($sw)
-    $xtw.Formatting = [System.Xml.Formatting]::Indented
-    $doc.WriteTo($xtw)
-    $xtw.Flush()
-    return $sw.ToString()
+    $sw  = $null
+    $xtw = $null
+    try {
+        $sw  = [System.IO.StringWriter]::new()
+        $xtw = [System.Xml.XmlTextWriter]::new($sw)
+        $xtw.Formatting = [System.Xml.Formatting]::Indented
+        $doc.WriteTo($xtw)
+        $xtw.Flush()
+        return $sw.ToString()
+    } finally {
+        if ($null -ne $xtw) { try { $xtw.Dispose() } catch { } }
+        if ($null -ne $sw)  { try { $sw.Dispose()  } catch { } }
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -1605,7 +1617,12 @@ function Invoke-PhpCgi {
     $finished = $proc.WaitForExit($TimeoutSec * 1000)
     if (-not $finished) {
         try { $proc.Kill() } catch { }
-        $proc.Dispose()
+        # Kill makes the CopyToAsync tasks complete; bounded wait so a stuck pipe cannot
+        # block the timeout response forever.
+        try { $null = [System.Threading.Tasks.Task]::WaitAll(@($copyOut, $copyErr), 2000) } catch { }
+        try { $proc.Dispose() } catch { }
+        try { $outMs.Dispose() } catch { }
+        try { $errMs.Dispose() } catch { }
         return [PSCustomObject]@{
             StatusCode = 504; ContentType = 'text/plain; charset=utf-8'; Headers = @{}
             Body = [System.Text.Encoding]::UTF8.GetBytes("PHP-CGI timeout after $TimeoutSec seconds.")
