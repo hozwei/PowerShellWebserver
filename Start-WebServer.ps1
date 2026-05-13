@@ -1729,7 +1729,12 @@ function Send-DirectoryListing {
         if (-not [string]::IsNullOrEmpty($h)) { $hidden[$h.ToLowerInvariant()] = $true }
     }
 
-    $entries = Get-ChildItem -LiteralPath $DirPath -Force -ErrorAction SilentlyContinue |
+    # Drop -Force on purpose: items carrying the HIDDEN or SYSTEM attribute
+    # (.env, .htaccess, desktop.ini, Thumbs.db, …) stay invisible in the
+    # listing. Operators who really want to expose them can rename to
+    # plain visibility — DirectoryBrowsing is a casual file-server feature,
+    # not a full file manager, so information-disclosure-safe defaults win.
+    $entries = Get-ChildItem -LiteralPath $DirPath -ErrorAction SilentlyContinue |
         Where-Object {
             $name = $_.Name.ToLowerInvariant()
             -not $hidden.ContainsKey($name)
