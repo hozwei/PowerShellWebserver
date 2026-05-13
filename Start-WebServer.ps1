@@ -243,6 +243,14 @@ $cfg = @{
     PhpCgiEnabled            = $false  # serve .php files via an external PHP CGI binary (path = PhpCgiPath). Off by default.
     PhpCgiPath               = ''      # absolute path to php-cgi.exe — required when PhpCgiEnabled = $true
     PhpCgiTimeoutSec         = 60      # max seconds a PHP-CGI process may run before it is killed and HTTP 504 is returned
+    CustomErrorPages         = $false  # render <ErrorPagesRoot>/<code>.html instead of the JSON envelope for 4xx/5xx — only when client accepts text/html
+    ErrorPagesRoot           = ''      # empty = '<WebRoot>\_error' — directory containing 401.html, 403.html, 404.html, etc.
+}
+
+# CustomErrorPages root fallback — empty string means '<WebRoot>\_error'. Resolved here so the
+# Send-Response helper can use the path without recomputing per request.
+if ([string]::IsNullOrEmpty($cfg.ErrorPagesRoot)) {
+    $cfg.ErrorPagesRoot = Join-Path $cfg.WebRoot '_error'
 }
 
 # StaticRoot fallback — empty string means: reuse WebRoot. Resolved here rather than at
@@ -770,6 +778,24 @@ function Send-Response {
             if ($null -eq $AcceptEncoding) { $AcceptEncoding = '' }
         }
 
+        # Custom HTML error page override — when the client accepts text/html and a
+        # matching <code>.html file exists under ErrorPagesRoot, replace the JSON body
+        # with the HTML file's contents. Keeps clients that prefer JSON (Accept: */* or
+        # application/json) on the existing envelope.
+        if ($StatusCode -ge 400 -and $script:cfg.CustomErrorPages) {
+            $acceptType = $null
+            try { $acceptType = $script:acceptType } catch { }
+            if ($acceptType -and $acceptType.IndexOf('text/html', [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                $errPage = Resolve-ErrorPage -StatusCode $StatusCode
+                if ($null -ne $errPage) {
+                    try {
+                        $Body        = [System.IO.File]::ReadAllText($errPage, [System.Text.Encoding]::UTF8)
+                        $ContentType = 'text/html; charset=utf-8'
+                    } catch { }
+                }
+            }
+        }
+
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($Body)
 
         # GZIP compression — opt-in via $cfg.GzipEnabled, gated on three conditions:
@@ -1242,6 +1268,76 @@ function Send-StaticFile {
 }
 
 # ---------------------------------------------------------------------------
+# ConvertTo-PoshApiXml
+# Builds an XML response envelope compatible with the legacy PoSH Server
+# `New-PoSHAPIXML` helper. Webroot .psxml / .psapi endpoints can write the
+# returned string straight to stdout and the server will pass it through with
+# the appropriate Content-Type.
+#
+# Available in webroot scripts only when ExecutionMode = 'InProcess' — the
+# function is injected into the runspace by Invoke-ScriptInProcess via
+# InitialSessionState.Commands. Subprocess-mode scripts that need XML output
+# can either embed equivalent logic or use ConvertTo-Xml from the framework.
+# ---------------------------------------------------------------------------
+function ConvertTo-PoshApiXml {
+    param(
+        [int]         $Code    = 1,
+        [string]      $Message = 'ok',
+        [hashtable[]] $Items   = @(),
+        [string]      $Root    = 'Result',
+        [string]      $ItemTag = 'Item'
+    )
+
+    $doc      = [System.Xml.XmlDocument]::new()
+    $rootNode = $doc.CreateElement($Root)
+    $null     = $doc.AppendChild($rootNode)
+
+    $codeNode          = $doc.CreateElement('Code')
+    $codeNode.InnerText = [string]$Code
+    $null              = $rootNode.AppendChild($codeNode)
+
+    $msgNode           = $doc.CreateElement('Message')
+    $msgNode.InnerText = $Message
+    $null              = $rootNode.AppendChild($msgNode)
+
+    $itemsNode = $doc.CreateElement('Items')
+    $null      = $rootNode.AppendChild($itemsNode)
+
+    foreach ($item in $Items) {
+        if ($null -eq $item) { continue }
+        $itemNode = $doc.CreateElement($ItemTag)
+        foreach ($k in $item.Keys) {
+            $field          = $doc.CreateElement([string]$k)
+            $field.InnerText = [string]$item[$k]
+            $null            = $itemNode.AppendChild($field)
+        }
+        $null = $itemsNode.AppendChild($itemNode)
+    }
+
+    $sw  = [System.IO.StringWriter]::new()
+    $xtw = [System.Xml.XmlTextWriter]::new($sw)
+    $xtw.Formatting = [System.Xml.Formatting]::Indented
+    $doc.WriteTo($xtw)
+    $xtw.Flush()
+    return $sw.ToString()
+}
+
+# ---------------------------------------------------------------------------
+# Resolve-ErrorPage
+# Returns the absolute path of the HTML error page that matches a given HTTP
+# status code, or $null when CustomErrorPages is disabled / the file does not
+# exist. The Send-Response helper uses this to override the JSON envelope on
+# 4xx/5xx responses when the client advertises text/html via Accept.
+# ---------------------------------------------------------------------------
+function Resolve-ErrorPage {
+    param([int] $StatusCode)
+    if (-not $script:cfg.CustomErrorPages -or $StatusCode -lt 400) { return $null }
+    $path = Join-Path $script:cfg.ErrorPagesRoot ("{0}.html" -f $StatusCode)
+    if (Test-Path -LiteralPath $path -PathType Leaf) { return $path }
+    return $null
+}
+
+# ---------------------------------------------------------------------------
 # Test-IsScriptPath
 # Returns $true when the URL path ends in one of the configured script
 # extensions (.ps1, .psxml, .posh, .psapi by default). Comparison is
@@ -1313,6 +1409,14 @@ function Invoke-ScriptInProcess {
             $iss.Variables.Add($entry)
         }
     }
+
+    # Expose ConvertTo-PoshApiXml in the script's runspace — webroot .psxml / .psapi
+    # endpoints can call it directly instead of reimplementing the XML envelope.
+    try {
+        $apiFn = (Get-Command ConvertTo-PoshApiXml -ErrorAction Stop).ScriptBlock
+        $fnEntry = [System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new('ConvertTo-PoshApiXml', $apiFn.ToString())
+        $iss.Commands.Add($fnEntry)
+    } catch { } # if the helper failed to register globally, scripts can still implement their own XML
 
     $rs = $null
     $ps = $null
@@ -1815,6 +1919,8 @@ $shared = @{
     FnScriptCT       = ${function:Get-ScriptContentType}
     FnInvScriptIP    = ${function:Invoke-ScriptInProcess}
     FnInvPhpCgi      = ${function:Invoke-PhpCgi}
+    FnResolveError   = ${function:Resolve-ErrorPage}
+    FnToApiXml       = ${function:ConvertTo-PoshApiXml}
 }
 
 # ---------------------------------------------------------------------------
@@ -1849,6 +1955,8 @@ $requestHandler = {
     ${function:Get-ScriptContentType} = $shared.FnScriptCT
     ${function:Invoke-ScriptInProcess} = $shared.FnInvScriptIP
     ${function:Invoke-PhpCgi}    = $shared.FnInvPhpCgi
+    ${function:Resolve-ErrorPage} = $shared.FnResolveError
+    ${function:ConvertTo-PoshApiXml} = $shared.FnToApiXml
     $script:cfg              = $shared.Cfg
 
     # Live .NET objects were injected via InitialSessionState.Variables — plain names.
@@ -1868,6 +1976,10 @@ $requestHandler = {
         # and per-runspace, so $script:-scope is safe here.
         $script:acceptEncoding = $req.Headers['Accept-Encoding']
         if ($null -eq $script:acceptEncoding) { $script:acceptEncoding = '' }
+        # Same stashing pattern for the Accept header — used by Send-Response to decide
+        # whether to substitute a CustomErrorPages HTML response for 4xx/5xx envelopes.
+        $script:acceptType = $req.Headers['Accept']
+        if ($null -eq $script:acceptType) { $script:acceptType = '' }
 
         $clientIP    = $req.RemoteEndPoint.Address.ToString()
         $urlPath     = $req.Url.AbsolutePath

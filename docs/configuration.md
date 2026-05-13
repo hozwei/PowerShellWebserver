@@ -64,6 +64,8 @@ $cfg = @{
     PhpCgiEnabled            = $false
     PhpCgiPath               = ''
     PhpCgiTimeoutSec         = 60
+    CustomErrorPages         = $false
+    ErrorPagesRoot           = ''     # empty = '<WebRoot>\_error'
 }
 ```
 
@@ -123,6 +125,8 @@ $cfg = @{
     PhpCgiEnabled            = $true
     PhpCgiPath               = 'C:\Program Files\PHP\v8.3\php-cgi.exe'
     PhpCgiTimeoutSec         = 30
+    CustomErrorPages         = $true
+    ErrorPagesRoot           = 'D:\automation\posh\public\_error'
 }
 ```
 
@@ -214,6 +218,8 @@ These are passed on the command line when starting the server. `Register-Schedul
 | `PhpCgiEnabled` | `bool` | `$false` | Route `.php` URLs through an external `php-cgi.exe`. When enabled, `PhpCgiPath` must point at the binary. The server constructs the standard CGI/1.1 environment (`REQUEST_METHOD`, `SCRIPT_FILENAME`, `QUERY_STRING`, `HTTP_*`, …), streams POST bodies to PHP's stdin, parses the `Status:` / `Content-Type:` / `Location:` headers from PHP's stdout, and forwards the body as-is. PHP files resolving under `\Windows\` are refused (legacy PoSH hardening). |
 | `PhpCgiPath` | `string` | `''` | Absolute path to `php-cgi.exe`. Validated at startup when `PhpCgiEnabled = $true`. |
 | `PhpCgiTimeoutSec` | `integer` | `60` | Max seconds a PHP-CGI process may run. Long-running PHP scripts are killed and the caller receives HTTP 504 (analogous to `ScriptTimeoutSec` for `.ps1`). |
+| `CustomErrorPages` | `bool` | `$false` | When `$true` and the client's `Accept` header advertises `text/html`, 4xx/5xx responses serve `<ErrorPagesRoot>\<code>.html` instead of the JSON envelope. Clients that prefer JSON (`Accept: application/json` or `*/*` without `text/html`) still receive the existing envelope. |
+| `ErrorPagesRoot` | `string` | `''` (= `<WebRoot>\_error`) | Directory containing one HTML file per HTTP status code (`401.html`, `403.html`, `404.html`, `500.html`, …). Only consulted when `CustomErrorPages = $true`. The directory does not need to be pre-populated — missing files fall back to the JSON envelope. |
 
 ### Register-ScheduledTask.ps1 — Scheduled Task Options
 

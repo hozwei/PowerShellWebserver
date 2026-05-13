@@ -3,6 +3,10 @@
 ## [Unreleased]
 
 ### Added
+- **Custom HTML error pages** — new `CustomErrorPages` (default `$false`) and `ErrorPagesRoot` (default `<WebRoot>\_error`) configuration keys. When enabled and the client's `Accept` header advertises `text/html`, 4xx/5xx responses serve `<ErrorPagesRoot>\<code>.html` instead of the JSON envelope. Clients that prefer JSON still receive the existing envelope — content negotiation is per-request. Missing files fall back gracefully. New `Resolve-ErrorPage` helper; `Send-Response` consults it on every 4xx/5xx response.
+- **`ConvertTo-PoshApiXml`** function — builds an XML response envelope compatible with the legacy PoSH Server `New-PoSHAPIXML` helper. `Items` is a hashtable array; output is indented XML ready to write to stdout. Automatically injected into the script's runspace when `ExecutionMode = 'InProcess'`. Subprocess-mode scripts can use `ConvertTo-Xml` from the framework instead.
+- **`$script:acceptType`** per-request stash — parallel to `$script:acceptEncoding`, populated from the request's `Accept` header so `Send-Response` can decide whether to substitute an HTML error page without each call site forwarding the header.
+
 - **PHP-CGI handler** — new `PhpCgiEnabled` (default `$false`), `PhpCgiPath` (default `''`), and `PhpCgiTimeoutSec` (default `60`) configuration keys. When enabled, `.php` URLs are routed through an external `php-cgi.exe`: the server builds the CGI/1.1 environment (`REQUEST_METHOD`, `SCRIPT_FILENAME`, `QUERY_STRING`, `CONTENT_LENGTH`, `CONTENT_TYPE`, all request headers as `HTTP_*`), streams POST bodies to PHP's stdin, parses the `Status` / `Content-Type` / `Location` headers from PHP's stdout, and forwards the body verbatim. PHP files resolving under `\Windows\` are refused (legacy PoSH hardening). Startup validates that `PhpCgiPath` exists when the feature is enabled.
 - **`Invoke-PhpCgi`** function — handles the CGI/1.1 contract end-to-end including binary-safe header/body split (`\r\n\r\n` or `\n\n` separator) so PHP-generated images or downloads work correctly.
 
