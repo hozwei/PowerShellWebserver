@@ -362,6 +362,9 @@ $cfg = @{
     OpenApiEnabled           = $true   # F10: expose GET /openapi.json with an OpenAPI 3.1 spec auto-generated from webroot script metadata.
     OpenApiTitle             = 'posh'  # 'info.title' in the spec
     OpenApiVersion           = '1.0.0' # 'info.version' in the spec
+    HstsEnabled              = $false  # emit Strict-Transport-Security on HTTPS responses; browsers will then refuse HTTP for max-age. Only enable once HTTPS is verified — once a client cached the policy, it cannot downgrade until expiry.
+    HstsMaxAgeSec            = 31536000 # 1 year — recommended baseline (HSTS preload requires >= 1 year)
+    HstsIncludeSubdomains    = $false  # include 'includeSubDomains' directive; only enable when EVERY subdomain serves HTTPS
 }
 
 # ---------------------------------------------------------------------------
@@ -579,6 +582,7 @@ $numericBounds = @(
     @{ Key = 'RateLimitQueuePollMs';      Min = 10;  Max = 60000 }   # 10 ms .. 60 s
     @{ Key = 'RateLimitPenaltySec';       Min = 0;   Max = 86400 }   # 0 = no penalty (instant unblock), 24 h upper
     @{ Key = 'RunspacePoolMinSize';       Min = 1;   Max = 10000 }   # 1 = lazy start (cold-start latency on first req), higher = pre-warmed
+    @{ Key = 'HstsMaxAgeSec';             Min = 0;   Max = 63072000 } # 0 .. 2 years
 )
 foreach ($b in $numericBounds) {
     $v = $cfg[$b.Key]
@@ -2011,6 +2015,19 @@ function Send-Response {
         $Response.ContentLength64 = $bytes.Length
         # X-Request-Id header allows clients to correlate requests to log entries.
         if ($RequestId -ne '') { $Response.AddHeader('X-Request-Id', $RequestId) }
+        # HSTS — Strict-Transport-Security tells browsers to refuse plain-HTTP
+        # for the configured duration. Only emit on HTTPS responses ($isHttps
+        # captured per-request in the handler) so a same-host HTTP listener
+        # doesn't accidentally lock browsers out by serving the header.
+        if ($script:cfg.HstsEnabled) {
+            $isHttps = $false
+            try { $isHttps = [bool]$script:isHttpsRequest } catch { }
+            if ($isHttps) {
+                $hsts = "max-age=$([int]$script:cfg.HstsMaxAgeSec)"
+                if ($script:cfg.HstsIncludeSubdomains) { $hsts += '; includeSubDomains' }
+                $Response.AddHeader('Strict-Transport-Security', $hsts)
+            }
+        }
         $Response.OutputStream.Write($bytes, 0, $bytes.Length)
     } catch {
         # Connection may have been closed by the client before the response was sent.
@@ -3946,6 +3963,10 @@ $requestHandler = {
         # and per-runspace, so $script:-scope is safe here.
         $script:acceptEncoding = $req.Headers['Accept-Encoding']
         if ($null -eq $script:acceptEncoding) { $script:acceptEncoding = '' }
+        # Stash whether this request arrived over HTTPS so Send-Response can
+        # decide whether to emit HSTS without re-reaching into $context.
+        $script:isHttpsRequest = $false
+        try { $script:isHttpsRequest = [bool]$req.IsSecureConnection } catch { }
         # Same stashing pattern for the Accept header — used by Send-Response to decide
         # whether to substitute a CustomErrorPages HTML response for 4xx/5xx envelopes.
         $script:acceptType = $req.Headers['Accept']
