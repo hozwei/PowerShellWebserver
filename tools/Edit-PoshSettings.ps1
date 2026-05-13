@@ -233,10 +233,12 @@ function Build-EffectiveSchema {
                 if ($m.ContainsKey($k)) { $field[$k] = $m[$k] }
             }
         } else {
-            # User-added var (literal, no schema entry) — route to "Sonstige".
+            # User-added var (literal, no schema entry) — same globalvars tab,
+            # no special metadata. Operators work with variables, so the
+            # label IS the variable name.
             $field.Label = '$' + $def.Name
-            $field.Group = 'other'
-            $field.Help  = 'Auto-erkannt aus globalvars.ps1 (nicht im Schema dokumentiert).'
+            $field.Group = 'globalvars'
+            $field.Help  = 'Selbst in globalvars.ps1 angelegt (keine Schema-Validierung).'
         }
         $null = $fields.Add($field)
     }

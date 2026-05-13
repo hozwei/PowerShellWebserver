@@ -312,7 +312,7 @@
             <h3>Neue Variable in globalvars.ps1 anlegen</h3>
             <div class="body">
                 <p style="margin-top:0; color:var(--muted); font-size:13px;">
-                    Wird am Ende der Service-Endpoints-Sektion eingefügt. Beim nächsten Reload erscheint sie automatisch im Tab <strong>Sonstige</strong>.
+                    Wird am Ende der Service-Endpoints-Sektion eingefügt. Beim nächsten Reload erscheint sie im Tab <strong>globalvars.ps1</strong>.
                 </p>
                 <form class="add-form" id="addvar-form">
                     <label>Variablenname (ohne <code>$</code>) — A-Z, 0-9, _; nicht mit Ziffer beginnen
@@ -856,11 +856,11 @@
         closeAddVarModal();
         await loadAll();
         renderTabs();
-        // Jump to "Sonstige" tab so the user immediately sees the new var
-        const otherTab = state.schema.Groups.find(g => g.Id === 'other');
-        if (otherTab) {
-            state.active = 'other';
-            $$('#tabs button').forEach(b => b.classList.toggle('active', b.dataset.id === 'other'));
+        // Jump to globalvars.ps1 tab so the new var is immediately visible.
+        const gvTab = state.schema.Groups.find(g => g.Id === 'globalvars');
+        if (gvTab) {
+            state.active = 'globalvars';
+            $$('#tabs button').forEach(b => b.classList.toggle('active', b.dataset.id === 'globalvars'));
         }
         renderGroup(state.active);
     };

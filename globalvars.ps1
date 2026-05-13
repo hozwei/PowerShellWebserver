@@ -40,32 +40,22 @@ param()
 
 # ===========================================================================
 #  Section 1 — Service endpoints and identifiers
+#  Minimal baseline that fits almost every install. Add your own vars
+#  (Jira, vCenter, WSUS, Veeam, Lansweeper, …) directly in this section
+#  or via tools\Edit-PoshSettings.ps1 → "+ Variable".
 # ===========================================================================
 
 # Active Directory
 $DomainController     = 'dc-01.example.local'
 $DomainDnsSuffix      = 'example.local'
 
-# Mail / Exchange
-$ExchangeServer       = 'mail.example.local'
-$ExchangePsUri        = "https://$ExchangeServer/PowerShell/"
+# Mail
 $SmtpRelay            = 'mail-relay.example.local'
 $AdminMail            = 'it-admins@example.local'
-
-# Virtualisation / Backup / Asset / Patching
-$VCenterFqdn          = 'vcenter.example.local'
-$VeeamBackupServer    = 'backup.example.local'
-$LansweeperUri        = 'https://lansweeper.example.local/'
-$WsusServer           = 'wsus.example.local'
-$WsusPort             = 8531
-$SccmSiteCode         = 'XYZ'
 
 # posh itself
 $PoshServerFqdn       = 'posh.example.local'
 $PoshServerUri        = "https://$PoshServerFqdn"
-
-# Ticketing
-$JiraServerUri        = 'https://jira.example.local'
 
 # LDAP base DNs
 $LdapUsers            = 'OU=Users,DC=example,DC=local'
