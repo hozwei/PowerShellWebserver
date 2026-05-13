@@ -147,7 +147,7 @@ $cfg = @{
     RateLimitMode            = 'reject' # 'reject' = immediate HTTP 429 | 'queue' = wait up to RateLimitQueueTimeoutSec
     RateLimitPerIdentity     = $false   # F4: key the rate-limit table by API-key label (when authenticated) instead of client IP. Anonymous/auth-exempt requests still keyed by IP.
     RateLimitQueueTimeoutSec = 10     # 'queue' mode only: seconds to wait before returning HTTP 429
-    RateLimitExemptPaths     = @('/health', '/metrics') # paths excluded from rate limiting — always an array
+    RateLimitExemptPaths     = @('/health', '/metrics', '/metrics-prom', '/openapi.json') # paths excluded from rate limiting — always an array
     MinRequestIntervalSec    = 1      # minimum seconds between dispatched requests, globally — 0 = disabled. /health and /metrics are always exempt.
     AllowedIPs               = @()    # IP allowlist — empty = all IPs allowed; non-empty = only listed IPs pass (except /health)
     BlockedIPs               = @()    # IP blocklist — always rejected before AllowedIPs check (except /health); empty = no blocks
@@ -262,6 +262,7 @@ $cfg = @{
     SlowRequestThresholdMs   = 0       # F6: requests >= this many ms (after Invoke-Script returns) get an extra line in SlowLogFile. 0 = disabled.
     SlowLogFile              = ''      # absolute path to slow.log; empty = '<LogDir>\slow.log'
     IndexShowMetadata        = $true   # F7: GET / returns enriched objects with synopsis + parameters parsed from each script's AST. Set $false to revert to the flat path list.
+    PromMetricsEnabled       = $true   # F8: expose GET /metrics-prom in Prometheus text-format. Same auth-exempt treatment as /metrics.
 }
 
 # ---------------------------------------------------------------------------
@@ -2235,6 +2236,46 @@ function Get-ScriptMetadata {
     return $metadata
 }
 
+# ---------------------------------------------------------------------------
+# Format-PromMetrics (F8)
+# Builds a Prometheus text-format body from the live counters/gauges. Same
+# numbers /metrics already exposes — just expressed in the format Prometheus
+# (and Grafana, VictoriaMetrics, etc.) scrape natively.
+#
+# Cheap to call; runs in the request thread on demand. No background scrape.
+# ---------------------------------------------------------------------------
+function Format-PromMetrics {
+    $uptimeSec   = [int][math]::Floor($startTime.Elapsed.TotalSeconds)
+    $total       = [System.Threading.Interlocked]::Read($requestsTotal)
+    $rateLimited = [System.Threading.Interlocked]::Read($script:rateLimitedTotal)
+    # SemaphoreSlim.CurrentCount = remaining slots; in-flight = MaxConcurrent - remaining.
+    $inFlight    = $script:cfg.MaxConcurrent - $semaphore.CurrentCount
+    if ($inFlight -lt 0) { $inFlight = 0 }
+    $tableSize   = $script:rateLimitTable.Count
+    $cacheSize   = $script:metadataCache.Count
+
+    $sb = [System.Text.StringBuilder]::new(1024)
+    $null = $sb.AppendLine('# HELP posh_uptime_seconds Server uptime since process start.')
+    $null = $sb.AppendLine('# TYPE posh_uptime_seconds gauge')
+    $null = $sb.AppendLine("posh_uptime_seconds $uptimeSec")
+    $null = $sb.AppendLine('# HELP posh_requests_total Number of completed script requests.')
+    $null = $sb.AppendLine('# TYPE posh_requests_total counter')
+    $null = $sb.AppendLine("posh_requests_total $total")
+    $null = $sb.AppendLine('# HELP posh_rate_limited_total Per-identity/IP rate-limit rejections from Test-RateLimit.')
+    $null = $sb.AppendLine('# TYPE posh_rate_limited_total counter')
+    $null = $sb.AppendLine("posh_rate_limited_total $rateLimited")
+    $null = $sb.AppendLine('# HELP posh_in_flight_requests Currently occupied request slots.')
+    $null = $sb.AppendLine('# TYPE posh_in_flight_requests gauge')
+    $null = $sb.AppendLine("posh_in_flight_requests $inFlight")
+    $null = $sb.AppendLine('# HELP posh_rate_limit_table_size Per-key/IP rate-limit table entries.')
+    $null = $sb.AppendLine('# TYPE posh_rate_limit_table_size gauge')
+    $null = $sb.AppendLine("posh_rate_limit_table_size $tableSize")
+    $null = $sb.AppendLine('# HELP posh_script_metadata_cache_size Cached AST metadata entries.')
+    $null = $sb.AppendLine('# TYPE posh_script_metadata_cache_size gauge')
+    $null = $sb.AppendLine("posh_script_metadata_cache_size $cacheSize")
+    return $sb.ToString()
+}
+
 function Get-ScriptIndex {
     # @() forces array serialisation even on an empty result — prevents $null instead of [].
     # Indexes every extension registered in ScriptExtensionMap (.ps1, .psxml, .posh, .psapi
@@ -2499,6 +2540,7 @@ $shared = @{
     FnAuditLog       = ${function:Write-AuditLog}
     FnSlowLog        = ${function:Write-SlowLog}
     FnScriptMeta     = ${function:Get-ScriptMetadata}
+    FnPromMetrics    = ${function:Format-PromMetrics}
     FnGetMime        = ${function:Get-MimeType}
     FnSendStatic     = ${function:Send-StaticFile}
     FnAddCors        = ${function:Add-CorsHeaders}
@@ -2540,6 +2582,7 @@ $requestHandler = {
     ${function:Write-AuditLog}   = $shared.FnAuditLog
     ${function:Write-SlowLog}    = $shared.FnSlowLog
     ${function:Get-ScriptMetadata} = $shared.FnScriptMeta
+    ${function:Format-PromMetrics} = $shared.FnPromMetrics
     ${function:Get-MimeType}     = $shared.FnGetMime
     ${function:Send-StaticFile}  = $shared.FnSendStatic
     ${function:Add-CorsHeaders}  = $shared.FnAddCors
@@ -2821,6 +2864,23 @@ $requestHandler = {
             } | ConvertTo-Json -Compress
             Send-Response -Response $resp -StatusCode 200 -Body $body -RequestId $requestId
             Write-Log -ClientIP $clientIP -Request $requestLine -Status 'METRICS' -ExitCode '-' -RequestId $requestId
+            return
+        }
+
+        # --------------------------------------------------------------
+        # F8: GET /metrics-prom -> Prometheus text-format scrape endpoint.
+        # Same auth-exempt treatment as /metrics so scrapers don't need credentials.
+        # --------------------------------------------------------------
+        if ($urlPath -eq '/metrics-prom') {
+            if (-not $script:cfg.PromMetricsEnabled) {
+                $body = New-JsonResponse -ExitCode 404 -Output '' -Err 'Prometheus metrics endpoint disabled.'
+                Send-Response -Response $resp -StatusCode 404 -Body $body -RequestId $requestId
+                Write-Log -ClientIP $clientIP -Request $requestLine -Status 'NOT FOUND' -ExitCode '-' -RequestId $requestId
+                return
+            }
+            $promBody = Format-PromMetrics
+            Send-Response -Response $resp -StatusCode 200 -Body $promBody -RequestId $requestId -ContentType 'text/plain; version=0.0.4; charset=utf-8'
+            Write-Log -ClientIP $clientIP -Request $requestLine -Status 'METRICS-PROM' -ExitCode '-' -RequestId $requestId
             return
         }
 
