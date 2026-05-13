@@ -257,6 +257,8 @@ $cfg = @{
     JobsLogFile              = ''      # absolute path to the jobs log file; empty = '<LogDir>\jobs.log'
     DirectoryBrowsing        = $false  # render an HTML index listing when a static directory has no DefaultDocuments match. Requires StaticServingEnabled.
     DirectoryBrowsingHidden  = @('_error', '.git', '.gitignore') # entries hidden from the directory listing (case-insensitive match on file/folder name)
+    AuditLogEnabled          = $false  # F5: write security-relevant events (AUTH_FAIL, IP_BLOCKED, RATE_LIMITED) as NDJSON to AuditLogFile
+    AuditLogFile             = ''      # absolute path to audit.log; empty = '<LogDir>\audit.log'
 }
 
 # ---------------------------------------------------------------------------
@@ -317,6 +319,10 @@ if ([string]::IsNullOrEmpty($cfg.ErrorPagesRoot)) {
 if ([string]::IsNullOrEmpty($cfg.JobsLogFile)) {
     $cfg.JobsLogFile = Join-Path $cfg.LogDir 'jobs.log'
 }
+# F5: audit-log file path fallback.
+if ([string]::IsNullOrEmpty($cfg.AuditLogFile)) {
+    $cfg.AuditLogFile = Join-Path $cfg.LogDir 'audit.log'
+}
 
 # StaticRoot fallback — empty string means: reuse WebRoot. Resolved here rather than at
 # request time so the static handler can compare full paths without per-request work.
@@ -340,6 +346,10 @@ $script:rateLimitTable = [System.Collections.Concurrent.ConcurrentDictionary[str
 # Mutex serializes concurrent write access to the log file.
 # Global\ makes the mutex unique across process boundaries.
 $script:logMutex = [System.Threading.Mutex]::new($false, 'Global\PoshWebserverLog')
+
+# F5: separate Mutex for the audit log so AUTH_FAIL bursts cannot block normal
+# request-log writes. Same Global\ naming convention.
+$script:auditMutex = [System.Threading.Mutex]::new($false, 'Global\PoshWebserverAudit')
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -479,6 +489,47 @@ function Write-Log {
 
     # Also to stdout — appears in Scheduled Task history output.
     Write-Output $line
+}
+
+# ---------------------------------------------------------------------------
+# Write-AuditLog (F5)
+# Appends an NDJSON event to <cfg.AuditLogFile> when AuditLogEnabled = $true.
+# One JSON object per line, ISO-8601 timestamp with offset, fixed schema:
+#   { ts, event, identity, ip, path, detail }
+#
+# Only security-relevant events are logged (AUTH_FAIL, IP_BLOCKED, RATE_LIMITED) —
+# the regular request log already covers successful auth.
+#
+# Serialised via a dedicated Mutex so AUTH_FAIL bursts cannot block normal
+# request-log writes.
+# ---------------------------------------------------------------------------
+function Write-AuditLog {
+    param(
+        [Parameter(Mandatory)][string] $Event,
+        [string] $Identity = '-',
+        [string] $ClientIP = '-',
+        [string] $Path     = '-',
+        [string] $Detail   = ''
+    )
+    if (-not $script:cfg.AuditLogEnabled) { return }
+
+    $obj = [ordered]@{
+        ts       = (Get-Date).ToString('o')
+        event    = $Event
+        identity = $Identity
+        ip       = $ClientIP
+        path     = $Path
+        detail   = $Detail
+    }
+    $line = $obj | ConvertTo-Json -Compress -Depth 3
+
+    $acquired = $false
+    try {
+        $acquired = $script:auditMutex.WaitOne(500)
+        Add-Content -LiteralPath $script:cfg.AuditLogFile -Value $line -Encoding UTF8
+    } catch { } finally {
+        try { if ($acquired) { $script:auditMutex.ReleaseMutex() } } catch { }
+    }
 }
 
 # Startup events (before the listener) are written to a separate startup.log.
@@ -2300,6 +2351,7 @@ $shared = @{
     FnGetIndex       = ${function:Get-ScriptIndex}
     FnRateLimit      = ${function:Test-RateLimit}
     FnAuthResolve    = ${function:Resolve-ApiKeyIdentity}
+    FnAuditLog       = ${function:Write-AuditLog}
     FnGetMime        = ${function:Get-MimeType}
     FnSendStatic     = ${function:Send-StaticFile}
     FnAddCors        = ${function:Add-CorsHeaders}
@@ -2338,6 +2390,7 @@ $requestHandler = {
     ${function:Get-ScriptIndex}  = $shared.FnGetIndex
     ${function:Test-RateLimit}   = $shared.FnRateLimit
     ${function:Resolve-ApiKeyIdentity} = $shared.FnAuthResolve
+    ${function:Write-AuditLog}   = $shared.FnAuditLog
     ${function:Get-MimeType}     = $shared.FnGetMime
     ${function:Send-StaticFile}  = $shared.FnSendStatic
     ${function:Add-CorsHeaders}  = $shared.FnAddCors
@@ -2355,6 +2408,7 @@ $requestHandler = {
     # Map them to $script: scope so injected functions (Write-Log, Test-RateLimit, etc.)
     # can access them via $script:logMutex / $script:rateLimitTable etc.
     $script:logMutex         = $logMutex
+    $script:auditMutex       = $auditMutex
     $script:rateLimitTable   = $rateLimitTable
     $script:rateLimitedTotal = $rateLimitedTotal
     # $semaphore, $startTime, $requestsTotal are used directly (no $script: needed)
@@ -2489,7 +2543,9 @@ $requestHandler = {
                 $body = New-JsonResponse -ExitCode 429 -Output '' -Err 'Too many requests. Please slow down.'
                 $resp.AddHeader('Retry-After', [string]$rl.RetryAfterSec)
                 Send-Response -Response $resp -StatusCode 429 -Body $body -RequestId $requestId
-                Write-Log -ClientIP $clientIP -Request $requestLine -Status 'RATE LIMITED' -ExitCode '-' -RequestId $requestId
+                $rlIdentity = if (-not [string]::IsNullOrEmpty($rateLimitIdentity)) { $rateLimitIdentity } else { '-' }
+                Write-Log -ClientIP $clientIP -Request $requestLine -Status 'RATE LIMITED' -ExitCode '-' -RequestId $requestId -Identity $rlIdentity
+                Write-AuditLog -Event 'RATE_LIMITED' -Identity $rlIdentity -ClientIP $clientIP -Path $urlPath -Detail ("retryAfter={0}" -f $rl.RetryAfterSec)
                 $null = [System.Threading.Interlocked]::Increment($script:rateLimitedTotal)
                 return
             }
@@ -2556,6 +2612,8 @@ $requestHandler = {
                 }
                 Send-Response -Response $resp -StatusCode 401 -Body $body -RequestId $requestId
                 Write-Log -ClientIP $clientIP -Request $requestLine -Status 'UNAUTHORIZED' -ExitCode '-' -RequestId $requestId -Identity '-'
+                # F5: audit security-relevant denial — operators can correlate with brute-force attempts.
+                Write-AuditLog -Event 'AUTH_FAIL' -ClientIP $clientIP -Path $urlPath -Detail ("mode=$authMode")
                 return
             }
         }
@@ -2936,6 +2994,7 @@ foreach ($entry in @(
     [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('startTime',        $startTime,                  $null),
     [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('requestsTotal',    $script:requestsTotal,       $null),
     [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('logMutex',         $script:logMutex,            $null),
+    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('auditMutex',       $script:auditMutex,          $null),
     [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('rateLimitTable',   $script:rateLimitTable,      $null),
     [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('rateLimitedTotal', $script:rateLimitedTotal,    $null)
 )) { $iss.Variables.Add($entry) }
@@ -3158,6 +3217,26 @@ try {
                     try { if ($ipMutexHeld) { $script:logMutex.ReleaseMutex() } } catch { }
                 }
                 Write-Output $ipLogLine
+                # F5: audit IP rejections so the audit log captures all main-thread denials too.
+                # Identity is unknown at this point (auth never runs for blocked IPs).
+                if ($cfg.AuditLogEnabled) {
+                    $auditObj = [ordered]@{
+                        ts       = (Get-Date).ToString('o')
+                        event    = 'IP_BLOCKED'
+                        identity = '-'
+                        ip       = $reqClientIP
+                        path     = $reqUrlPath
+                        detail   = $ipStatus
+                    }
+                    $auditLine = $auditObj | ConvertTo-Json -Compress -Depth 3
+                    $auditHeld = $false
+                    try {
+                        $auditHeld = $script:auditMutex.WaitOne(500)
+                        [System.IO.File]::AppendAllText($cfg.AuditLogFile, $auditLine + [System.Environment]::NewLine, [System.Text.Encoding]::UTF8)
+                    } catch { } finally {
+                        try { if ($auditHeld) { $script:auditMutex.ReleaseMutex() } } catch { }
+                    }
+                }
                 continue
             }
         }
@@ -3257,6 +3336,7 @@ try {
     try { $runspacePool.Dispose()                         } catch { }
     try { $semaphore.Dispose()                            } catch { }
     try { $script:logMutex.Dispose()                      } catch { }
+    try { $script:auditMutex.Dispose()                    } catch { }
     try { Write-StartupLog 'Web server stopped.'          } catch { }
     try { Write-Output 'Web server stopped.'              } catch { }
 }
