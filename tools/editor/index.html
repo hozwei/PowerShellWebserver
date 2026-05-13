@@ -312,11 +312,11 @@
             <h3>Neue Variable in globalvars.ps1 anlegen</h3>
             <div class="body">
                 <p style="margin-top:0; color:var(--muted); font-size:13px;">
-                    Wird am Ende der Service-Endpoints-Sektion eingefügt. Beim nächsten Reload erscheint sie im Tab <strong>globalvars.ps1</strong>.
+                    Wird am Ende der globalvars.ps1-Service-Variablen eingefügt (vor den Filesystem-Pfaden). Beim nächsten Reload erscheint sie im Tab <strong>globalvars.ps1</strong>.
                 </p>
                 <form class="add-form" id="addvar-form">
                     <label>Variablenname (ohne <code>$</code>) — A-Z, 0-9, _; nicht mit Ziffer beginnen
-                        <input type="text" id="addvar-name" pattern="^[A-Za-z_][A-Za-z0-9_]*$" required autocomplete="off">
+                        <input type="text" id="addvar-name" autocomplete="off">
                     </label>
                     <label>Typ
                         <select id="addvar-type">
@@ -327,7 +327,7 @@
                         </select>
                     </label>
                     <label>Wert
-                        <input type="text" id="addvar-value" autocomplete="off">
+                        <textarea id="addvar-value" rows="1" autocomplete="off" style="resize:vertical; font-family:ui-monospace, Consolas, monospace;"></textarea>
                     </label>
                     <p id="addvar-hint" style="color:var(--muted); font-size:12px; margin-top:8px;">
                         Hinweise: <em>string-array</em> = eine Zeile pro Eintrag, <em>bool</em> = <code>true</code> oder <code>false</code>.
@@ -814,10 +814,32 @@
         renderGroup(state.active);
     };
 
+    // Adapts the value input to the selected type: one row + placeholder
+    // for scalars, four rows + multi-line hint for string-array, fixed
+    // 'true'/'false' hint for bool.
+    const syncAddVarValueShape = () => {
+        const type = $('#addvar-type').value;
+        const v    = $('#addvar-value');
+        if (type === 'string-array') {
+            v.rows = 4;
+            v.placeholder = 'Eine Zeile pro Eintrag';
+        } else if (type === 'bool') {
+            v.rows = 1;
+            v.placeholder = 'true oder false';
+        } else if (type === 'int') {
+            v.rows = 1;
+            v.placeholder = 'Ganzzahl (z.B. 8080)';
+        } else {
+            v.rows = 1;
+            v.placeholder = '';
+        }
+    };
+
     const openAddVarModal = () => {
         $('#addvar-name').value = '';
         $('#addvar-type').value = 'string';
         $('#addvar-value').value = '';
+        syncAddVarValueShape();
         $('#addvar-modal').classList.add('shown');
         setTimeout(() => $('#addvar-name').focus(), 50);
     };
@@ -872,6 +894,7 @@
         $('#addvar-btn').addEventListener('click', openAddVarModal);
         $('#addvar-cancel').addEventListener('click', closeAddVarModal);
         $('#addvar-confirm').addEventListener('click', confirmAddVar);
+        $('#addvar-type').addEventListener('change', syncAddVarValueShape);
         $('#quit-btn').addEventListener('click', async () => {
             if (!confirm('Editor beenden?')) return;
             try { await api('POST', '/api/quit', {}); } catch (e) { /* server is shutting down, that is fine */ }

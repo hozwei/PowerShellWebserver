@@ -63,13 +63,13 @@ Threat model: a local script on the same machine, or a malicious browser tab nav
 The editor **scans `globalvars.ps1` per load** via the PowerShell AST. The visible fields are exactly what the file currently defines — nothing more, nothing less.
 
 - Delete a `$Var = ...` line → field is gone on next reload, `Save` will never resurrect it.
-- Add a `$Var = ...` line by hand → field appears automatically (in **Sonstige (selbst hinzugefügt)** if not in the editor's metadata).
+- Add a `$Var = ...` line by hand → field appears automatically in the `globalvars.ps1` tab on next reload (no schema entry needed).
 - Click **+ Variable** in the header → opens a modal, creates a new line in `globalvars.ps1`.
 - Click **✕ aus globalvars.ps1 entfernen** under any editable field → backs the file up, removes the line.
 
 Variables whose RHS isn't a plain literal (`Join-Path ...`, `"https://$Foo/..."`, `$env:...`) are **computed**: shown read-only when documented in the editor's metadata, filtered out otherwise (internal path derivations aren't settings). Saving them returns HTTP 422.
 
-[`tools/editor/schema.psd1`](../tools/editor/schema.psd1) is the **metadata layer**: it supplies Label, Help, Group, Validator, Min/Max, Choices for known names. Anything in `globalvars.ps1` that isn't in the schema still renders — under **Sonstige**, with the AST-inferred type.
+[`tools/editor/schema.psd1`](../tools/editor/schema.psd1) is the **metadata layer**: it supplies Help, Validator, Min/Max, Choices for known names. Anything in `globalvars.ps1` that isn't in the schema still renders in the same `globalvars.ps1` tab with the AST-inferred type and no custom validator. Field labels are always the literal `$VarName` — operators are editing PowerShell variables.
 
 ### config.psd1 — schema-driven
 

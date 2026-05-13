@@ -250,17 +250,39 @@ function Add-PoshGlobalvar {
     $ast = [System.Management.Automation.Language.Parser]::ParseFile($s.Globalvars, [ref]$null, [ref]$errs)
     if ($errs -and $errs.Count -gt 0) { throw 'globalvars.ps1 has parse errors — fix manually first.' }
 
-    # Find the last literal top-level assignment so we land in Section 1.
-    # Stop at the first non-literal — that is typically the start of Section 2
-    # ($PoshBaseDir = $PSScriptRoot etc).
+    # We want to land at the END of Section 1 (service endpoints) and
+    # BEFORE Section 2 (filesystem paths derived from $PSScriptRoot).
+    #
+    # Old approach broke on the first non-literal in Section 1 — but the
+    # baseline contains `$PoshServerUri = "https://$PoshServerFqdn"` in
+    # the middle of Section 1, which is non-literal (interpolated). So we
+    # used to insert between $PoshServerFqdn and $PoshServerUri instead
+    # of after the LDAP block.
+    #
+    # New approach: first locate the first path-derivation statement
+    # (anything whose RHS text mentions $PSScriptRoot or Join-Path —
+    # those are the Section-2 markers). Then walk all statements before
+    # that boundary and remember the last LITERAL one. Non-literals in
+    # Section 1 ($PoshServerUri, $DefaultTargetHost) are skipped but no
+    # longer truncate the scan.
+    $sectionTwoStart = $null
+    foreach ($stmt in $ast.EndBlock.Statements) {
+        if ($stmt -isnot [System.Management.Automation.Language.AssignmentStatementAst]) { continue }
+        if ($stmt.Left -isnot [System.Management.Automation.Language.VariableExpressionAst]) { continue }
+        if ($stmt.Right.Extent.Text -match '\$PSScriptRoot|Join-Path') {
+            $sectionTwoStart = $stmt.Extent.StartOffset
+            break
+        }
+    }
     $lastLiteralAssign = $null
     foreach ($stmt in $ast.EndBlock.Statements) {
         if ($stmt -isnot [System.Management.Automation.Language.AssignmentStatementAst]) { continue }
         if ($stmt.Left -isnot [System.Management.Automation.Language.VariableExpressionAst]) { continue }
         $n = $stmt.Left.VariablePath.UserPath
         if ($n -eq 'key') { continue }
+        if ($null -ne $sectionTwoStart -and $stmt.Extent.StartOffset -ge $sectionTwoStart) { break }
         $info = Get-PoshRhsTypeInfo -RhsStatement $stmt.Right
-        if ($info.IsLiteral) { $lastLiteralAssign = $stmt } else { break }
+        if ($info.IsLiteral) { $lastLiteralAssign = $stmt }
     }
 
     $content = [System.IO.File]::ReadAllText($s.Globalvars)

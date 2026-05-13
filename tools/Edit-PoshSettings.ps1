@@ -11,7 +11,7 @@
     confirm — or after 10 minutes of inactivity.
 
     Covered settings (see tools\editor\schema.psd1):
-      - globalvars.ps1: service endpoints, AD/LDAP, mail, infra
+      - globalvars.ps1: AD, LDAP base DNs, SMTP relay, AdminMail, posh FQDN, defaults
       - config.psd1:    ports, auth mode, limits, logging, features
       - Setup-Helpers:  AES key generation, encrypted-secret storage,
                         POSH_API_KEY machine-scope env var (admin only)
@@ -83,13 +83,36 @@ $indexTemplate = [System.IO.File]::ReadAllText($indexPath)
 # Initialise IO with our repo root so the path whitelist anchors here.
 Initialize-PoshSettingsIO -RepoRoot $RepoRoot
 
-# Pre-flight: config.psd1 must exist. Initialise-Config.ps1 from PR 1
-# is the canonical seeder; we point the user there rather than silently
-# creating one.
-$configPath = (Get-PoshIoState).ConfigPsd1
-if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
-    Write-Host "ABORT: config.psd1 not found at $configPath" -ForegroundColor Red
+# Pre-flight: globalvars.ps1 + config.psd1 must exist and parse cleanly.
+# Failing at startup is friendlier than failing on the first /api/config
+# request with an opaque JS toast. Initialize-Config.ps1 from PR 1
+# is the canonical seeder for config.psd1; globalvars.ps1 is shipped in
+# the repo.
+$ioState = Get-PoshIoState
+if (-not (Test-Path -LiteralPath $ioState.Globalvars -PathType Leaf)) {
+    Write-Host "ABORT: globalvars.ps1 not found at $($ioState.Globalvars)" -ForegroundColor Red
+    Write-Host '       The editor needs the file to read AD/LDAP/mail variables.'
+    exit 1
+}
+if (-not (Test-Path -LiteralPath $ioState.ConfigPsd1 -PathType Leaf)) {
+    Write-Host "ABORT: config.psd1 not found at $($ioState.ConfigPsd1)" -ForegroundColor Red
     Write-Host '       Run tools\Initialize-Config.ps1 first.'
+    exit 1
+}
+try {
+    $null = Get-PoshGlobalvarDefinitions
+} catch {
+    Write-Host "ABORT: globalvars.ps1 has parse errors:" -ForegroundColor Red
+    Write-Host "       $_"
+    Write-Host '       Fix the file by hand before launching the editor.'
+    exit 1
+}
+try {
+    $null = Get-PoshConfigValues
+} catch {
+    Write-Host "ABORT: config.psd1 is unreadable:" -ForegroundColor Red
+    Write-Host "       $_"
+    Write-Host '       Regenerate via tools\Initialize-Config.ps1 -Force.'
     exit 1
 }
 
@@ -144,14 +167,6 @@ $lifecycle = [pscustomobject]@{
     Reason     = $null
 }
 
-function Stop-EditorAfterDelay {
-    param([int] $DelaySec, [string] $Reason)
-    $lifecycle.Reason = $Reason
-    Start-Sleep -Seconds $DelaySec
-    $lifecycle.ShouldStop = $true
-    try { $listener.Stop() } catch { $null = $_ }
-}
-
 # ---------------------------------------------------------------------------
 # Idle watchdog. Runs in its own runspace because the main thread sits
 # inside HttpListener.GetContextAsync() and would otherwise miss the tick.
@@ -194,9 +209,9 @@ function Update-Activity {
 # actually present and joining them with the static schema metadata.
 # globalvars.ps1 is the single source of truth for "which variables exist"
 # — deleting a $Var line drops the field on the next reload, adding one
-# makes it appear. Schema metadata (label, help, validator, group) is
-# layered on for matched names; unmatched names land in the "Sonstige"
-# group as auto-discovered with a permissive default type.
+# makes it appear. Schema metadata (help, validator, min/max, choices) is
+# layered on for matched names. Unmatched names render in the same
+# 'globalvars.ps1' tab with the AST-inferred type and no validator.
 function Build-EffectiveSchema {
     $defs       = Get-PoshGlobalvarDefinitions
     $configAll  = Get-PoshConfigValues
@@ -209,7 +224,7 @@ function Build-EffectiveSchema {
         # Skip non-literal vars that aren't in the schema. These are server
         # internals (computed paths like $PoshBaseDir = Join-Path ...,
         # interpolated strings, $env:... refs). They are not "settings" —
-        # showing them in a "Sonstige" bucket only confuses operators.
+        # showing them in the globalvars tab only confuses operators.
         # Non-literal vars that ARE in the schema (e.g. DefaultTargetHost
         # = $env:COMPUTERNAME) stay visible as read-only so the user can
         # see the live value.
