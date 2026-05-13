@@ -43,6 +43,15 @@ if ([string]::IsNullOrWhiteSpace($id)) {
     exit 1
 }
 
+# Defensive input shape — $id is one URL path segment captured by the route
+# table (F9), so the server has already URL-decoded it. Reject characters
+# that have no business in a user id; this script is a demo, so the
+# tightest realistic charset is the safest default.
+if ($id -notmatch '^[A-Za-z0-9._-]{1,64}$') {
+    Write-Error "Invalid user id format: '$id' (allowed: letters, digits, dot, underscore, hyphen; max 64 chars)."
+    exit 1
+}
+
 # Toy in-script "DB". A real endpoint would query AD against $LdapUsers
 # using credentials decrypted from encrypted_pw\ with the $key already
 # in scope (both supplied by globalvars.ps1):
