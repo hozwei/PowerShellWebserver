@@ -263,6 +263,16 @@
             Max       = 1000
         }
         @{
+            Name      = 'RunspacePoolOverprovision'
+            File      = 'config.psd1'
+            Group     = 'auth'
+            Type      = 'int'
+            Label     = 'RunspacePoolOverprovision'
+            Help      = "RunspacePool max size = MaxConcurrent x this. Needs >= 2 to absorb the gap between semaphore.Release() and Dispose() under burst; raise for slow-request profiles. 1 = no headroom (risk of dispatch hang)."
+            Min       = 1
+            Max       = 16
+        }
+        @{
             Name      = 'ScriptTimeoutSec'
             File      = 'config.psd1'
             Group     = 'auth'
@@ -344,6 +354,36 @@
             Help      = "Global minimum seconds between dispatched requests (coarse throttle, applies to all callers). 0 = disabled."
             Min       = 0
             Max       = 3600
+        }
+        @{
+            Name      = 'RateLimitSweepIntervalSec'
+            File      = 'config.psd1'
+            Group     = 'auth'
+            Type      = 'int'
+            Label     = 'RateLimitSweepIntervalSec'
+            Help      = "How often the rate-limit ConcurrentDictionary is swept for stale entries (request-driven, in the main loop). 0 = disabled (table grows unbounded)."
+            Min       = 0
+            Max       = 86400
+        }
+        @{
+            Name      = 'RateLimitTableSizeWarnThreshold'
+            File      = 'config.psd1'
+            Group     = 'auth'
+            Type      = 'int'
+            Label     = 'RateLimitTableSizeWarnThreshold'
+            Help      = "Emit WARN + AUDIT entry when the rate-limit table stays above this size after a sweep (DoS-by-IP-spray indicator). 0 = disabled."
+            Min       = 0
+            Max       = 100000000
+        }
+        @{
+            Name      = 'RateLimitQueuePollMs'
+            File      = 'config.psd1'
+            Group     = 'auth'
+            Type      = 'int'
+            Label     = 'RateLimitQueuePollMs'
+            Help      = "Re-check interval (ms) while the request waits in queue mode. Lower = faster pickup of window-reset, higher = less CPU."
+            Min       = 10
+            Max       = 60000
         }
         @{
             Name      = 'AcceptedContentTypes'
@@ -460,6 +500,46 @@
             Type      = 'bool'
             Label     = 'LogIntegrityHash'
             Help      = "Writes <logfile>.md5 next to every completed log file (audit trail)."
+        }
+        @{
+            Name      = 'LogMutexTimeoutMs'
+            File      = 'config.psd1'
+            Group     = 'logging'
+            Type      = 'int'
+            Label     = 'LogMutexTimeoutMs'
+            Help      = "Max ms a log writer waits for the mutex. On timeout the line is DROPPED (and posh_log_drops_total ticks)."
+            Min       = 1
+            Max       = 60000
+        }
+        @{
+            Name      = 'AuditLogMaxBytes'
+            File      = 'config.psd1'
+            Group     = 'logging'
+            Type      = 'int'
+            Label     = 'AuditLogMaxBytes'
+            Help      = "audit.log size limit. At startup, files >= this byte size are rotated to .<timestamp>. 0 = unbounded."
+            Min       = 0
+            Max       = 10737418240
+        }
+        @{
+            Name      = 'SlowLogMaxBytes'
+            File      = 'config.psd1'
+            Group     = 'logging'
+            Type      = 'int'
+            Label     = 'SlowLogMaxBytes'
+            Help      = "slow.log size limit. Same rotation as AuditLogMaxBytes. 0 = unbounded."
+            Min       = 0
+            Max       = 10737418240
+        }
+        @{
+            Name      = 'JobsLogMaxBytes'
+            File      = 'config.psd1'
+            Group     = 'logging'
+            Type      = 'int'
+            Label     = 'JobsLogMaxBytes'
+            Help      = "jobs.log size limit. Same rotation as AuditLogMaxBytes. 0 = unbounded."
+            Min       = 0
+            Max       = 10737418240
         }
 
         # -- Quality-of-life features (config.psd1) -------------------------
