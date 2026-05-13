@@ -2271,8 +2271,15 @@ $requestHandler = {
             $authMode    = $script:cfg.AuthMode
             $authPassed  = $false
 
+            # IMPORTANT: PowerShell's -eq operator on strings is case-INSENSITIVE by default.
+            # Credentials MUST be compared case-sensitively (otherwise an API key of 'Abc123'
+            # would also accept 'aBC123', cutting the effective keyspace dramatically).
+            # [string]::Equals with StringComparison.Ordinal is explicit and ordinal-binary.
             if ($authMode -eq 'ApiKey' -or $authMode -eq 'Both') {
-                if ($req.Headers['X-Api-Key'] -eq $script:cfg.ApiKey) { $authPassed = $true }
+                $providedKey = $req.Headers['X-Api-Key']
+                if ($null -ne $providedKey -and [string]::Equals($providedKey, $script:cfg.ApiKey, [System.StringComparison]::Ordinal)) {
+                    $authPassed = $true
+                }
             }
             if (-not $authPassed -and ($authMode -eq 'Basic' -or $authMode -eq 'Both')) {
                 $authHeader = $req.Headers['Authorization']
@@ -2284,7 +2291,8 @@ $requestHandler = {
                         if ($colonIx -ge 0) {
                             $providedUser = $decoded.Substring(0, $colonIx)
                             $providedPass = $decoded.Substring($colonIx + 1)
-                            if ($providedUser -eq $script:cfg.BasicAuthUser -and $providedPass -eq $script:cfg.BasicAuthPass) {
+                            if ([string]::Equals($providedUser, $script:cfg.BasicAuthUser, [System.StringComparison]::Ordinal) -and
+                                [string]::Equals($providedPass, $script:cfg.BasicAuthPass, [System.StringComparison]::Ordinal)) {
                                 $authPassed = $true
                             }
                         }
