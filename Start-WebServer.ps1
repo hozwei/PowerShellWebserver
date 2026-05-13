@@ -263,6 +263,7 @@ $cfg = @{
     SlowLogFile              = ''      # absolute path to slow.log; empty = '<LogDir>\slow.log'
     IndexShowMetadata        = $true   # F7: GET / returns enriched objects with synopsis + parameters parsed from each script's AST. Set $false to revert to the flat path list.
     PromMetricsEnabled       = $true   # F8: expose GET /metrics-prom in Prometheus text-format. Same auth-exempt treatment as /metrics.
+    PathPlaceholders         = $false  # F9: match webroot/users/[id].ps1 (Next.js-style) against /users/<anything>. Placeholders are injected as named -Key Value args.
 }
 
 # ---------------------------------------------------------------------------
@@ -355,6 +356,13 @@ $script:rateLimitTable = [System.Collections.Concurrent.ConcurrentDictionary[str
 # Key: absolute script path. Value: PSCustomObject { Mtime [long]; Metadata [hashtable] }.
 # Mtime-keyed invalidation re-parses a file when its LastWriteTimeUtc changes.
 $script:metadataCache = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
+
+# F9: placeholder-route cache built by Get-RouteTable on first call. Key 'routes'
+# (single-entry use of the dictionary so all runspaces share the same table).
+# Invalidated when WebRoot's LastWriteTimeUtc changes — captures add/remove of
+# top-level subdirectories. Deeper edits below the top level are intentionally
+# NOT detected; restart needed to pick those up.
+$script:routeCache = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
 
 # Mutex serializes concurrent write access to the log file.
 # Global\ makes the mutex unique across process boundaries.
@@ -1638,6 +1646,89 @@ function Resolve-ErrorPage {
 # case-insensitive. Used by the routing branch to decide between the static
 # branch (PR-2) and the executable branch (PR-5).
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Get-RouteTable (F9)
+# Builds (and caches) a list of webroot scripts whose filenames contain
+# `[name]` placeholders (Next.js-style). Each entry exposes the regex used
+# to match incoming URLs and the placeholder names captured by that regex.
+#
+# Caches under the single key 'routes' in $script:routeCache. Invalidated
+# when WebRoot's LastWriteTimeUtc changes — top-level add/remove of
+# subdirectories is detected; deeper edits are not (operator restarts to
+# refresh).
+#
+# Sorting heuristic: more literal segments before placeholders, so
+# /users/admin.ps1 wins over /users/[id].ps1 when both match.
+# ---------------------------------------------------------------------------
+function Get-RouteTable {
+    if (-not (Test-Path -LiteralPath $script:cfg.WebRoot -PathType Container)) {
+        return @()
+    }
+    $wrMtime = (Get-Item -LiteralPath $script:cfg.WebRoot).LastWriteTimeUtc.Ticks
+    $cached  = $null
+    if ($script:routeCache.TryGetValue('routes', [ref]$cached) -and $cached.Mtime -eq $wrMtime) {
+        return $cached.Table
+    }
+
+    $exts = @($script:cfg.ScriptExtensionMap.Keys)
+    $entries = @()
+    Get-ChildItem -Path $script:cfg.WebRoot -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object {
+            if ($_.Name -notmatch '\[[^\[\]]+\]') { return $false }
+            foreach ($e in $exts) {
+                if ([string]::Equals($_.Extension, $e, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+            }
+            return $false
+        } |
+        ForEach-Object {
+            $rel  = '/' + $_.FullName.Substring($script:cfg.WebRoot.Length).TrimStart('\').Replace('\','/')
+            $names    = [System.Collections.Generic.List[string]]::new()
+            # Escape literal regex chars first, then turn each escaped \[name\] into a named
+            # group (?<name>[^/]+) that captures one path segment.
+            $escaped = [regex]::Escape($rel)
+            $pattern = [regex]::Replace($escaped, '\\\[([^\[\]]+)\\\]', {
+                param($m)
+                $nm = $m.Groups[1].Value
+                $null = $names.Add($nm)
+                "(?<$nm>[^/]+)"
+            })
+            $entries += [PSCustomObject]@{
+                Pattern          = $rel
+                Regex            = '^' + $pattern + '$'
+                ScriptPath       = $_.FullName
+                PlaceholderNames = $names.ToArray()
+            }
+        }
+
+    # Specificity: literal segments first. Count placeholder occurrences and sort
+    # ascending so routes with fewer placeholders are preferred matches.
+    $sorted = $entries | Sort-Object @{ Expression = { ([regex]::Matches($_.Pattern, '\[[^\[\]]+\]')).Count } }
+    $script:routeCache['routes'] = [PSCustomObject]@{ Mtime = $wrMtime; Table = @($sorted) }
+    return @($sorted)
+}
+
+# ---------------------------------------------------------------------------
+# Resolve-RoutedScript (F9)
+# Try a placeholder-route match for $UrlPath. Returns the absolute script path
+# and the captured placeholder values as a hashtable, or $null when no route
+# matches or the feature is disabled.
+# ---------------------------------------------------------------------------
+function Resolve-RoutedScript {
+    param([string] $UrlPath)
+    if (-not $script:cfg.PathPlaceholders) { return $null }
+    if ([string]::IsNullOrEmpty($UrlPath)) { return $null }
+    foreach ($route in (Get-RouteTable)) {
+        if ($UrlPath -match $route.Regex) {
+            $placeholders = [ordered]@{}
+            foreach ($nm in $route.PlaceholderNames) {
+                $placeholders[$nm] = $Matches[$nm]
+            }
+            return [PSCustomObject]@{ ScriptPath = $route.ScriptPath; Placeholders = $placeholders }
+        }
+    }
+    return $null
+}
+
 function Test-IsScriptPath {
     param([string] $Path)
     if ([string]::IsNullOrEmpty($Path)) { return $false }
@@ -2541,6 +2632,8 @@ $shared = @{
     FnSlowLog        = ${function:Write-SlowLog}
     FnScriptMeta     = ${function:Get-ScriptMetadata}
     FnPromMetrics    = ${function:Format-PromMetrics}
+    FnRouteTable     = ${function:Get-RouteTable}
+    FnResolveRoute   = ${function:Resolve-RoutedScript}
     FnGetMime        = ${function:Get-MimeType}
     FnSendStatic     = ${function:Send-StaticFile}
     FnAddCors        = ${function:Add-CorsHeaders}
@@ -2583,6 +2676,8 @@ $requestHandler = {
     ${function:Write-SlowLog}    = $shared.FnSlowLog
     ${function:Get-ScriptMetadata} = $shared.FnScriptMeta
     ${function:Format-PromMetrics} = $shared.FnPromMetrics
+    ${function:Get-RouteTable}   = $shared.FnRouteTable
+    ${function:Resolve-RoutedScript} = $shared.FnResolveRoute
     ${function:Get-MimeType}     = $shared.FnGetMime
     ${function:Send-StaticFile}  = $shared.FnSendStatic
     ${function:Add-CorsHeaders}  = $shared.FnAddCors
@@ -2603,6 +2698,7 @@ $requestHandler = {
     $script:auditMutex       = $auditMutex
     $script:rateLimitTable   = $rateLimitTable
     $script:metadataCache    = $metadataCache
+    $script:routeCache       = $routeCache
     $script:rateLimitedTotal = $rateLimitedTotal
     # $semaphore, $startTime, $requestsTotal are used directly (no $script: needed)
 
@@ -2946,6 +3042,16 @@ $requestHandler = {
         }
 
         # --------------------------------------------------------------
+        # F9: Path-Placeholders — if the URL has no script extension but matches a
+        # placeholder route (e.g. /users/123 → webroot/users/[id].ps1), treat it as
+        # a script request. This runs BEFORE the static branch so REST-style routes
+        # do not fall into static-file handling. $routedFromPath is consumed in the
+        # script branch below to skip the exact-match Test-Path step.
+        $routedFromPath = $null
+        if ($script:cfg.PathPlaceholders -and -not (Test-IsScriptPath -Path $urlPath)) {
+            $routedFromPath = Resolve-RoutedScript -UrlPath $urlPath
+        }
+
         # Non-script path → static file branch (opt-in via StaticServingEnabled).
         # "Script path" = any URL ending in one of the extensions registered in
         # ScriptExtensionMap (.ps1, .psxml, .posh, .psapi by default).
@@ -2953,7 +3059,7 @@ $requestHandler = {
         # GET-only by design and POST would otherwise silently no-op.
         # When StaticServingEnabled is off, fall back to the legacy HTTP 400.
         # --------------------------------------------------------------
-        if (-not (Test-IsScriptPath -Path $urlPath)) {
+        if (-not (Test-IsScriptPath -Path $urlPath) -and $null -eq $routedFromPath) {
 
             if (-not $script:cfg.StaticServingEnabled) {
                 $body = New-JsonResponse -ExitCode 400 -Output '' -Err "Only registered script extensions are allowed. Requested: $urlPath"
@@ -3036,13 +3142,29 @@ $requestHandler = {
         }
 
         # --------------------------------------------------------------
-        # Script file must exist
+        # Script file must exist. F9: when an exact match fails, fall back to the
+        # placeholder route table — either the pre-resolved hit from the route
+        # block above (URL had no script extension) OR a fresh resolve for URLs
+        # that DO end in a script extension (e.g. literal /users/[id].ps1).
+        # Captured placeholder values flow into $scriptParams below.
         # --------------------------------------------------------------
-        if (-not (Test-Path -LiteralPath $resolvedPath -PathType Leaf)) {
-            $body = New-JsonResponse -ExitCode 404 -Output '' -Err "Script not found: $urlPath"
-            Send-Response -Response $resp -StatusCode 404 -Body $body -RequestId $requestId
-            Write-Log -ClientIP $clientIP -Request $requestLine -Status 'NOT FOUND' -ExitCode '-' -RequestId $requestId
-            return
+        $routePlaceholders = $null
+        if ($null -ne $routedFromPath) {
+            # Pre-resolved from the no-script-extension path above; bypass the
+            # exact-match Test-Path step (path came from file enumeration).
+            $resolvedPath = $routedFromPath.ScriptPath
+            $routePlaceholders = $routedFromPath.Placeholders
+        } elseif (-not (Test-Path -LiteralPath $resolvedPath -PathType Leaf)) {
+            $routed = Resolve-RoutedScript -UrlPath $urlPath
+            if ($null -ne $routed) {
+                $resolvedPath = $routed.ScriptPath
+                $routePlaceholders = $routed.Placeholders
+            } else {
+                $body = New-JsonResponse -ExitCode 404 -Output '' -Err "Script not found: $urlPath"
+                Send-Response -Response $resp -StatusCode 404 -Body $body -RequestId $requestId
+                Write-Log -ClientIP $clientIP -Request $requestLine -Status 'NOT FOUND' -ExitCode '-' -RequestId $requestId
+                return
+            }
         }
 
         # --------------------------------------------------------------
@@ -3087,6 +3209,15 @@ $requestHandler = {
             $jsonFilePath = Save-PostJson -RawJson $bodyResult.RawJson -RequestId $requestId
         } else {
             $scriptParams = Get-QueryParams -QueryString $req.QueryString
+        }
+
+        # F9: when a placeholder route matched, merge the captured placeholders into the
+        # script params alongside (or in addition to) query-string args. Placeholders win
+        # on key collision — the URL is the authoritative source for those names.
+        if ($null -ne $routePlaceholders) {
+            foreach ($k in $routePlaceholders.Keys) {
+                $scriptParams[$k] = $routePlaceholders[$k]
+            }
         }
 
         # Env vars / context vars passed into the child process or runspace.
@@ -3215,7 +3346,8 @@ foreach ($entry in @(
     [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('auditMutex',       $script:auditMutex,          $null),
     [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('rateLimitTable',   $script:rateLimitTable,      $null),
     [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('rateLimitedTotal', $script:rateLimitedTotal,    $null),
-    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('metadataCache',    $script:metadataCache,       $null)
+    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('metadataCache',    $script:metadataCache,       $null),
+    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('routeCache',       $script:routeCache,          $null)
 )) { $iss.Variables.Add($entry) }
 
 # RunspacePool max = MaxConcurrent * 2.
