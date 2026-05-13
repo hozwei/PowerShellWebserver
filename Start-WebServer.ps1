@@ -2402,6 +2402,30 @@ function Send-StaticFile {
     $rangeEnd   = $fi.Length - 1L
     $isRange    = $false
     $rawRange   = $Request.Headers['Range']
+    # If-Range guard (RFC 7233 §3.2): if the client supplies an ETag/date and it does NOT
+    # match the current resource, the Range must be ignored — otherwise resume-style clients
+    # (download managers, video players) would silently stitch together bytes from the old
+    # entity and the new entity, corrupting the file. On a match we proceed with Range;
+    # on a mismatch we drop $rawRange so the full 200 path runs.
+    if ($rawRange) {
+        $ifRange = $Request.Headers['If-Range']
+        if ($ifRange) {
+            # Local name to avoid clobbering the $matches automatic from regex operators.
+            $ifRangeOk = $false
+            if ($ifRange.StartsWith('"') -or $ifRange.StartsWith('W/"')) {
+                # ETag form — exact string match (strong comparison per RFC 7232 §2.3.2).
+                if ($ifRange -eq $etag) { $ifRangeOk = $true }
+            } else {
+                # HTTP-date form — strong validation: Last-Modified must equal the date.
+                try {
+                    $irDate = [datetime]::Parse($ifRange, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal).ToUniversalTime()
+                    $lm     = [datetime]::new($lastModifiedUtc.Year, $lastModifiedUtc.Month, $lastModifiedUtc.Day, $lastModifiedUtc.Hour, $lastModifiedUtc.Minute, $lastModifiedUtc.Second, [System.DateTimeKind]::Utc)
+                    if ($lm.Ticks -eq $irDate.Ticks) { $ifRangeOk = $true }
+                } catch { }
+            }
+            if (-not $ifRangeOk) { $rawRange = $null }
+        }
+    }
     if ($rawRange -and $rawRange.StartsWith('bytes=', [System.StringComparison]::OrdinalIgnoreCase)) {
         $spec = $rawRange.Substring(6).Trim()
         # Multi-range like 'bytes=0-100,200-300' — fall back to full content instead of
@@ -2459,8 +2483,31 @@ function Send-StaticFile {
                 }
             }
             if ($mimeMatched) {
-                $wantsBrotli = $script:cfg.BrotliEnabled -and $accept.IndexOf('br',   [System.StringComparison]::OrdinalIgnoreCase) -ge 0
-                $wantsGzip   = $script:cfg.GzipEnabled   -and $accept.IndexOf('gzip', [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+                # Parse Accept-Encoding into tokens with q-values; substring IndexOf would
+                # incorrectly match 'gzip;q=0' (RFC 7231 §5.3.1 explicit rejection) and
+                # compress despite the client opting out. Crash-reporters and some older
+                # proxies break when they get gzipped responses against their q=0 wishes.
+                $acceptedEncodings = @{}
+                foreach ($token in ($accept -split ',')) {
+                    $segs = $token.Trim() -split ';'
+                    if ($segs.Count -eq 0) { continue }
+                    $coding = $segs[0].Trim().ToLowerInvariant()
+                    if ([string]::IsNullOrEmpty($coding)) { continue }
+                    $q = 1.0
+                    for ($si = 1; $si -lt $segs.Count; $si++) {
+                        $param = $segs[$si].Trim()
+                        if ($param.StartsWith('q=', [System.StringComparison]::OrdinalIgnoreCase)) {
+                            $qv = $param.Substring(2)
+                            $parsed = 0.0
+                            if ([double]::TryParse($qv, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$parsed)) {
+                                $q = $parsed
+                            }
+                        }
+                    }
+                    $acceptedEncodings[$coding] = $q
+                }
+                $wantsBrotli = $script:cfg.BrotliEnabled -and $acceptedEncodings.ContainsKey('br')   -and $acceptedEncodings['br']   -gt 0
+                $wantsGzip   = $script:cfg.GzipEnabled   -and $acceptedEncodings.ContainsKey('gzip') -and $acceptedEncodings['gzip'] -gt 0
                 if ($wantsBrotli) {
                     $ms = $null
                     $br = $null
@@ -2761,6 +2808,40 @@ function Test-IsScriptPath {
 }
 
 # ---------------------------------------------------------------------------
+# Test-PathContainsReparsePoint
+# Returns $true if the resolved $FullPath or any of its parent directories up
+# to (and including) $RootFull is a reparse point — a symbolic link, junction,
+# or mount point. [System.IO.Path]::GetFullPath normalises '..' segments but
+# does NOT resolve reparse points, so a symlink placed inside WebRoot/StaticRoot
+# would pass the StartsWith() path-confinement check while the actual read
+# happens at the target outside the configured root. Walking each parent
+# component closes that bypass without forcing a full Get-Item lookup.
+# Returns $true on any I/O error too (fail-closed).
+# ---------------------------------------------------------------------------
+function Test-PathContainsReparsePoint {
+    param(
+        [Parameter(Mandatory)][string] $FullPath,
+        [Parameter(Mandatory)][string] $RootFull
+    )
+    $rootPrefix = $RootFull.TrimEnd('\') + '\'
+    $current    = $FullPath
+    # Cap iterations at 64 — even pathological deep trees rarely exceed 32 segments.
+    for ($i = 0; $i -lt 64; $i++) {
+        try {
+            if ([System.IO.File]::Exists($current) -or [System.IO.Directory]::Exists($current)) {
+                $attrs = [System.IO.File]::GetAttributes($current)
+                if ($attrs.HasFlag([System.IO.FileAttributes]::ReparsePoint)) { return $true }
+            }
+        } catch { return $true }
+        if ($current.Length -le $rootPrefix.Length - 1) { break }
+        $parent = [System.IO.Path]::GetDirectoryName($current)
+        if ([string]::IsNullOrEmpty($parent) -or $parent -eq $current) { break }
+        $current = $parent
+    }
+    return $false
+}
+
+# ---------------------------------------------------------------------------
 # Get-ScriptContentType
 # Returns the configured Content-Type for the matched script extension, or
 # an empty string when no override applies (caller defaults to the JSON
@@ -3033,7 +3114,12 @@ function Invoke-PhpCgi {
     }
 
     $null = $proc.WaitForExit(5000)
-    $null = [System.Threading.Tasks.Task]::WaitAll(@($copyOut, $copyErr), 5000)
+    # WaitAll throws AggregateException when ANY of the copy tasks is faulted
+    # (e.g. broken pipe if PHP closed stdout abruptly). Without this guard the
+    # whole request would crash and the caller would see a generic 500 instead
+    # of whatever partial output was captured. Outer try lets us still emit
+    # the response from whatever bytes did make it into the MemoryStreams.
+    try { $null = [System.Threading.Tasks.Task]::WaitAll(@($copyOut, $copyErr), 5000) } catch { }
     $exitCode = $proc.ExitCode
     $proc.Dispose()
 
@@ -3929,6 +4015,7 @@ $shared = @{
     FnAddCors        = ${function:Add-CorsHeaders}
     FnCorsPreflight  = ${function:Send-CorsPreflight}
     FnIsScriptPath   = ${function:Test-IsScriptPath}
+    FnReparseCheck   = ${function:Test-PathContainsReparsePoint}
     FnScriptCT       = ${function:Get-ScriptContentType}
     FnInvScriptIP    = ${function:Invoke-ScriptInProcess}
     FnInvPhpCgi      = ${function:Invoke-PhpCgi}
@@ -4006,6 +4093,7 @@ $requestHandler = {
     ${function:Add-CorsHeaders}  = $shared.FnAddCors
     ${function:Send-CorsPreflight} = $shared.FnCorsPreflight
     ${function:Test-IsScriptPath} = $shared.FnIsScriptPath
+    ${function:Test-PathContainsReparsePoint} = $shared.FnReparseCheck
     ${function:Get-ScriptContentType} = $shared.FnScriptCT
     ${function:Invoke-ScriptInProcess} = $shared.FnInvScriptIP
     ${function:Invoke-PhpCgi}    = $shared.FnInvPhpCgi
@@ -4431,6 +4519,12 @@ $requestHandler = {
                 Write-Log -ClientIP $clientIP -Request $requestLine -Status 'FORBIDDEN' -ExitCode '-' -RequestId $requestId
                 return
             }
+            if (Test-PathContainsReparsePoint -FullPath $phpFull -RootFull $rootFull) {
+                $body = New-JsonResponse -ExitCode 403 -Output '' -Err 'Access denied.'
+                Send-Response -Response $resp -StatusCode 403 -Body $body -RequestId $requestId
+                Write-Log -ClientIP $clientIP -Request $requestLine -Status 'FORBIDDEN' -ExitCode '-' -RequestId $requestId
+                return
+            }
 
             # Defense in depth: never execute PHP files that resolve under the Windows folder —
             # this is the same hardening the legacy PoSH Server applied.
@@ -4514,6 +4608,15 @@ $requestHandler = {
                 Write-Log -ClientIP $clientIP -Request $requestLine -Status 'FORBIDDEN' -ExitCode '-' -RequestId $requestId
                 return
             }
+            # Symlink/junction guard: GetFullPath() normalises '..' but does not resolve
+            # reparse points. A symlink inside StaticRoot pointing to C:\Windows\System32
+            # would pass the StartsWith check above and leak the target file's content.
+            if (Test-PathContainsReparsePoint -FullPath $staticFull -RootFull $rootFull) {
+                $body = New-JsonResponse -ExitCode 403 -Output '' -Err 'Access denied.'
+                Send-Response -Response $resp -StatusCode 403 -Body $body -RequestId $requestId
+                Write-Log -ClientIP $clientIP -Request $requestLine -Status 'FORBIDDEN' -ExitCode '-' -RequestId $requestId
+                return
+            }
 
             # Directory request: try configured default documents (index.html, …) in order.
             # If none exist AND DirectoryBrowsing is enabled, render an HTML listing.
@@ -4560,6 +4663,13 @@ $requestHandler = {
         $webrootFull  = [System.IO.Path]::GetFullPath($script:cfg.WebRoot)
 
         if (-not $resolvedPath.StartsWith($webrootFull + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+            $body = New-JsonResponse -ExitCode 403 -Output '' -Err 'Access denied.'
+            Send-Response -Response $resp -StatusCode 403 -Body $body -RequestId $requestId
+            Write-Log -ClientIP $clientIP -Request $requestLine -Status 'FORBIDDEN' -ExitCode '-' -RequestId $requestId
+            return
+        }
+        # Symlink/junction guard — see static branch above for rationale.
+        if (Test-PathContainsReparsePoint -FullPath $resolvedPath -RootFull $webrootFull) {
             $body = New-JsonResponse -ExitCode 403 -Output '' -Err 'Access denied.'
             Send-Response -Response $resp -StatusCode 403 -Body $body -RequestId $requestId
             Write-Log -ClientIP $clientIP -Request $requestLine -Status 'FORBIDDEN' -ExitCode '-' -RequestId $requestId
@@ -5261,10 +5371,10 @@ try {
                 $h = $null
                 try {
                     $h = $bg.Ps.BeginStop($null, $null)
-                    $stopHandles.Add([pscustomobject]@{ Bg = $bg; Handle = $h; Stopped = $false })
+                    $stopHandles.Add([pscustomobject]@{ Bg = $bg; Handle = $h })
                 } catch {
                     try { Write-StartupLog "WARN: bg-job '$($bg.Path)' BeginStop() threw: $($_.Exception.Message)" } catch { }
-                    $stopHandles.Add([pscustomobject]@{ Bg = $bg; Handle = $null; Stopped = $false })
+                    $stopHandles.Add([pscustomobject]@{ Bg = $bg; Handle = $null })
                 }
             }
             foreach ($item in $stopHandles) {
@@ -5273,7 +5383,7 @@ try {
                         if ($item.Handle.AsyncWaitHandle.WaitOne(3000)) {
                             # Complete the APM pair so PowerShell can release the
                             # async wait handle and surface any inner exception.
-                            try { $item.Bg.Ps.EndStop($item.Handle); $item.Stopped = $true } catch {
+                            try { $item.Bg.Ps.EndStop($item.Handle) } catch {
                                 try { Write-StartupLog "WARN: bg-job '$($item.Bg.Path)' EndStop() threw: $($_.Exception.Message)" } catch { }
                             }
                         } else {
@@ -5281,10 +5391,9 @@ try {
                         }
                     } catch { }
                 }
-                # Dispose only when the runspace is actually stopped or never started cleanly.
-                # Dispose on a still-stopping runspace blocks until Stop completes — which is
-                # the very hang we're trying to avoid. The Rs.Dispose may still hang in that
-                # edge case, but we've already issued the stop, logged, and skipped EndStop.
+                # Dispose unconditionally. Process is exiting anyway; if Rs.Dispose blocks
+                # on a still-stopping runspace, the OS reaps it when the process terminates.
+                # Gating Dispose on confirmed-stopped would leak handles on the timeout path.
                 try { $item.Bg.Ps.Dispose() } catch { }
                 try { $item.Bg.Rs.Dispose() } catch { }
             }
