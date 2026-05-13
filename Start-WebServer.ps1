@@ -145,6 +145,7 @@ $cfg = @{
     RateLimitWindowSec       = 600    # fixed window size in seconds (10 minutes)
     RateLimitPenaltySec      = 300    # penalty duration after first 429 in seconds (5 minutes)
     RateLimitMode            = 'reject' # 'reject' = immediate HTTP 429 | 'queue' = wait up to RateLimitQueueTimeoutSec
+    RateLimitPerIdentity     = $false   # F4: key the rate-limit table by API-key label (when authenticated) instead of client IP. Anonymous/auth-exempt requests still keyed by IP.
     RateLimitQueueTimeoutSec = 10     # 'queue' mode only: seconds to wait before returning HTTP 429
     RateLimitExemptPaths     = @('/health', '/metrics') # paths excluded from rate limiting — always an array
     MinRequestIntervalSec    = 1      # minimum seconds between dispatched requests, globally — 0 = disabled. /health and /metrics are always exempt.
@@ -2201,7 +2202,8 @@ function Test-IpMatch {
 function Test-RateLimit {
     param(
         [string] $ClientIP,
-        [string] $Path
+        [string] $Path,
+        [string] $Identity = ''
     )
 
     # Rate limiting disabled — 0 means no limit.
@@ -2214,7 +2216,20 @@ function Test-RateLimit {
         return [PSCustomObject]@{ Allowed = $true; RetryAfterSec = 0 }
     }
 
-    # Retrieve or create entry for this IP.
+    # F4: key the table by API-key label (when RateLimitPerIdentity = $true AND the
+    # request carries an authenticated label) or by client IP otherwise. Distinct
+    # scopes ('id:' vs 'ip:') ensure label and IP namespaces never collide — important
+    # because the table is shared and an IP literally named like a key label
+    # ('default', say) must not aggregate with the label's quota.
+    $rateLimitKey = if ($script:cfg.RateLimitPerIdentity -and
+                       -not [string]::IsNullOrEmpty($Identity) -and
+                       $Identity -ne 'anonymous' -and $Identity -ne '-') {
+        "id:$Identity"
+    } else {
+        "ip:$ClientIP"
+    }
+
+    # Retrieve or create entry for this rate-limit key.
     # GetOrAdd requires a direct value — a ScriptBlock is stored as-is, not invoked.
     # Two threads may create $newEntry simultaneously, but GetOrAdd guarantees only one
     # is stored; both callers receive the same winner object.
@@ -2223,7 +2238,7 @@ function Test-RateLimit {
         WindowStart  = [datetime]::UtcNow
         PenaltyUntil = [datetime]::MinValue   # MinValue = no active penalty
     }
-    $entry = $script:rateLimitTable.GetOrAdd($ClientIP, $newEntry)
+    $entry = $script:rateLimitTable.GetOrAdd($rateLimitKey, $newEntry)
 
     # --- Step 1: active penalty check ---
     # Read PenaltyUntil once to avoid a race between the comparison and the calculation.
@@ -2444,7 +2459,20 @@ $requestHandler = {
         # MaxConcurrent. New arrivals beyond that receive HTTP 503 as usual.
         # --------------------------------------------------------------
         if ($script:cfg.RateLimitRequests -gt 0) {
-            $rl = Test-RateLimit -ClientIP $clientIP -Path $urlPath
+            # F4: when RateLimitPerIdentity is on AND the request carries a valid X-Api-Key,
+            # account against the key's label instead of the IP. Wrong / missing keys fall
+            # back to per-IP — so brute-force attempts on the auth still hit the IP quota.
+            # Resolve here without setting $script:authIdentity; the auth block below does
+            # that authoritatively (same Resolve-ApiKeyIdentity call).
+            $rateLimitIdentity = ''
+            if ($script:cfg.RateLimitPerIdentity) {
+                $earlyKey = $req.Headers['X-Api-Key']
+                if (-not [string]::IsNullOrEmpty($earlyKey)) {
+                    $earlyLabel = Resolve-ApiKeyIdentity -ProvidedKey $earlyKey
+                    if ($null -ne $earlyLabel) { $rateLimitIdentity = $earlyLabel }
+                }
+            }
+            $rl = Test-RateLimit -ClientIP $clientIP -Path $urlPath -Identity $rateLimitIdentity
 
             if (-not $rl.Allowed -and $script:cfg.RateLimitMode -eq 'queue') {
                 # Queue mode: poll until the window resets or timeout expires.
@@ -2453,7 +2481,7 @@ $requestHandler = {
                 $queueDeadlineTicks = [datetime]::UtcNow.Ticks + ($script:cfg.RateLimitQueueTimeoutSec * [timespan]::TicksPerSecond)
                 while (-not $rl.Allowed -and [datetime]::UtcNow.Ticks -lt $queueDeadlineTicks) {
                     Start-Sleep -Milliseconds 200
-                    $rl = Test-RateLimit -ClientIP $clientIP -Path $urlPath
+                    $rl = Test-RateLimit -ClientIP $clientIP -Path $urlPath -Identity $rateLimitIdentity
                 }
             }
 
