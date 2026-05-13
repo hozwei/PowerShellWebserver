@@ -1083,10 +1083,16 @@ function Save-PoshFieldChanges {
         # Capture the pre-edit content so we can roll back on partial failure.
         # Backup-PoshFile creates the on-disk .bak but doesn't return content;
         # an in-memory snapshot guarantees the rollback even if .bak rotation
-        # is misconfigured.
+        # is misconfigured. Use UTF8 without BOM consistently with the rest of
+        # the module so a rollback doesn't silently flip the file's encoding.
+        $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
         $preEdit = $null
         if (Test-Path -LiteralPath $abs -PathType Leaf) {
-            try { $preEdit = [System.IO.File]::ReadAllText($abs) } catch { $preEdit = $null }
+            # If the snapshot read fails, we cannot guarantee rollback — abort the
+            # whole batch BEFORE any write happens so the file stays untouched.
+            # Better a hard error here than a half-applied file with no recovery.
+            try { $preEdit = [System.IO.File]::ReadAllText($abs, $utf8NoBom) }
+            catch { throw ("{0}: cannot snapshot for atomic rollback -> {1}" -f $file, $_.Exception.Message) }
         }
         $bk = $null
         if ($PSCmdlet.ShouldProcess($abs, "Backup before edit")) {
@@ -1109,7 +1115,7 @@ function Save-PoshFieldChanges {
                 # the pre-batch snapshot so the file is exactly as it was before
                 # this save started.
                 if ($null -ne $preEdit) {
-                    try { [System.IO.File]::WriteAllText($abs, $preEdit) } catch { }
+                    try { [System.IO.File]::WriteAllText($abs, $preEdit, $utf8NoBom) } catch { }
                 }
                 throw ("{0}: writing '{1}' failed -> {2}" -f $file, $field.Name, $_.Exception.Message)
             }

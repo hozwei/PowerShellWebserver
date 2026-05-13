@@ -4625,7 +4625,15 @@ $requestHandler = {
             if ($isDir -or $urlPath.EndsWith('/')) {
                 $resolvedDefault = $null
                 foreach ($candidate in $script:cfg.DefaultDocuments) {
-                    $probe = Join-Path $staticFull $candidate
+                    # Resolve via GetFullPath so a misconfigured candidate like '../etc/passwd'
+                    # is normalised and the StartsWith containment + reparse-point checks below
+                    # can re-validate the candidate against StaticRoot. Without this, an operator
+                    # typo in DefaultDocuments could exfiltrate any file the service account reads.
+                    $probe = [System.IO.Path]::GetFullPath((Join-Path $staticFull $candidate))
+                    $probeInsideRoot = $probe -eq $rootFull -or
+                                       $probe.StartsWith($rootFull + '\', [System.StringComparison]::OrdinalIgnoreCase)
+                    if (-not $probeInsideRoot) { continue }
+                    if (Test-PathContainsReparsePoint -FullPath $probe -RootFull $rootFull) { continue }
                     if (Test-Path -LiteralPath $probe -PathType Leaf) { $resolvedDefault = $probe; break }
                 }
                 if ($null -eq $resolvedDefault) {
