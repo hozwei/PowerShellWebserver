@@ -1186,13 +1186,19 @@ function Send-StaticFile {
             $parts = $spec.Split('-', 2)
             if ($parts.Length -eq 2) {
                 try {
-                    if ($parts[0] -ne '') { $rangeStart = [long]$parts[0] }
-                    if ($parts[1] -ne '') { $rangeEnd   = [long]$parts[1] }
-                    elseif ($parts[0] -eq '') {
-                        # Suffix range 'bytes=-N' — last N bytes.
-                        $suffix = [long]$parts[1]
+                    if ($parts[0] -eq '') {
+                        # Suffix range 'bytes=-N' — last N bytes. Empty prefix means
+                        # "the last N bytes of the entity". An RFC-7233 suffix length of
+                        # 0 is technically a valid request that must return 416 (no bytes
+                        # to serve); the rangeStart/rangeEnd checks below catch that.
+                        $suffix     = [long]$parts[1]
                         $rangeStart = [long][math]::Max(0L, $fi.Length - $suffix)
                         $rangeEnd   = $fi.Length - 1L
+                    } else {
+                        # Regular range 'bytes=N-M' or open-ended 'bytes=N-'.
+                        $rangeStart = [long]$parts[0]
+                        if ($parts[1] -ne '') { $rangeEnd = [long]$parts[1] }
+                        # else: rangeEnd already initialised to $fi.Length - 1L (open-ended).
                     }
                     if ($rangeStart -lt 0 -or $rangeEnd -ge $fi.Length -or $rangeStart -gt $rangeEnd) {
                         $Response.StatusCode = 416
