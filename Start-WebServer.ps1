@@ -150,6 +150,7 @@ $cfg = @{
     AllowedIPs               = @()    # IP allowlist — empty = all IPs allowed; non-empty = only listed IPs pass (except /health)
     BlockedIPs               = @()    # IP blocklist — always rejected before AllowedIPs check (except /health); empty = no blocks
     GzipEnabled              = $true  # GZIP response compression — only applied when client sent Accept-Encoding: gzip AND body >= GzipMinBytes AND Content-Type matches GzipMimeTypes
+    BrotliEnabled            = $true  # Brotli compression — preferred over GZIP when both client supports them. Reuses GzipMinBytes / GzipMaxBytes / GzipMimeTypes for eligibility.
     GzipMinBytes             = 1024   # responses smaller than this byte count are never compressed (compression overhead exceeds savings)
     GzipMaxBytes             = 10MB   # responses larger than this are streamed uncompressed instead of buffered in memory for gzip — guards against OOM on big text payloads
     GzipMimeTypes            = @(     # response Content-Types eligible for compression — checked via StartsWith, so 'application/json' covers 'application/json; charset=utf-8'
@@ -895,38 +896,53 @@ function Send-Response {
 
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($Body)
 
-        # GZIP compression — opt-in via $cfg.GzipEnabled, gated on three conditions:
-        #   1. Client advertised gzip via Accept-Encoding.
-        #   2. Body is large enough that compression actually saves bytes (GzipMinBytes).
-        #   3. Content-Type matches one of the configured prefixes — only text-ish payloads
-        #      benefit; pre-compressed binary types (PNG, JPEG, ZIP) would only inflate.
-        # The comparison uses StartsWith so 'application/json' covers 'application/json; charset=utf-8'.
-        if ($script:cfg.GzipEnabled -and
-            $AcceptEncoding -and
-            $AcceptEncoding.IndexOf('gzip', [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -and
-            $bytes.Length -ge $script:cfg.GzipMinBytes) {
-
-            $mimeOk = $false
+        # Negotiate compression: Brotli is preferred when both Brotli + GZIP are enabled
+        # on the server AND the client advertised both. Eligibility (size + MIME prefix
+        # list) is shared between the two so a request either qualifies for both or
+        # neither. The comparison uses StartsWith so 'application/json' covers
+        # 'application/json; charset=utf-8'.
+        $sizeOk = $bytes.Length -ge $script:cfg.GzipMinBytes -and $bytes.Length -le $script:cfg.GzipMaxBytes
+        $mimeOk = $false
+        if ($sizeOk -and $AcceptEncoding) {
             foreach ($mime in $script:cfg.GzipMimeTypes) {
                 if ($ContentType.StartsWith($mime, [System.StringComparison]::OrdinalIgnoreCase)) {
                     $mimeOk = $true
                     break
                 }
             }
-            if ($mimeOk) {
-                $ms = $null
-                $gz = $null
-                try {
-                    $ms = [System.IO.MemoryStream]::new()
-                    $gz = [System.IO.Compression.GZipStream]::new($ms, [System.IO.Compression.CompressionLevel]::Optimal, $true)
-                    $gz.Write($bytes, 0, $bytes.Length)
-                    $gz.Dispose(); $gz = $null
-                    $bytes = $ms.ToArray()
-                    $Response.AddHeader('Content-Encoding', 'gzip')
-                } finally {
-                    if ($null -ne $gz) { try { $gz.Dispose() } catch { } }
-                    if ($null -ne $ms) { try { $ms.Dispose() } catch { } }
-                }
+        }
+
+        if ($mimeOk -and $script:cfg.BrotliEnabled -and
+            $AcceptEncoding.IndexOf('br', [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            # Brotli path — ~15-25 % smaller than gzip for text payloads.
+            $ms = $null
+            $br = $null
+            try {
+                $ms = [System.IO.MemoryStream]::new()
+                $br = [System.IO.Compression.BrotliStream]::new($ms, [System.IO.Compression.CompressionLevel]::Optimal, $true)
+                $br.Write($bytes, 0, $bytes.Length)
+                $br.Dispose(); $br = $null
+                $bytes = $ms.ToArray()
+                $Response.AddHeader('Content-Encoding', 'br')
+            } finally {
+                if ($null -ne $br) { try { $br.Dispose() } catch { } }
+                if ($null -ne $ms) { try { $ms.Dispose() } catch { } }
+            }
+        } elseif ($mimeOk -and $script:cfg.GzipEnabled -and
+                  $AcceptEncoding.IndexOf('gzip', [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            # GZIP fallback path — broader client support, slightly larger output.
+            $ms = $null
+            $gz = $null
+            try {
+                $ms = [System.IO.MemoryStream]::new()
+                $gz = [System.IO.Compression.GZipStream]::new($ms, [System.IO.Compression.CompressionLevel]::Optimal, $true)
+                $gz.Write($bytes, 0, $bytes.Length)
+                $gz.Dispose(); $gz = $null
+                $bytes = $ms.ToArray()
+                $Response.AddHeader('Content-Encoding', 'gzip')
+            } finally {
+                if ($null -ne $gz) { try { $gz.Dispose() } catch { } }
+                if ($null -ne $ms) { try { $ms.Dispose() } catch { } }
             }
         }
 
@@ -1298,24 +1314,44 @@ function Send-StaticFile {
 
     $contentLength = $rangeEnd - $rangeStart + 1L
 
-    # GZIP compression for static text content — only when no Range was requested.
+    # Compression for static text content — only when no Range was requested.
     # Range + Content-Encoding is a thorny combination (clients differ on whether ranges
     # apply to compressed or original bytes); skipping compression for ranges sidesteps
     # the issue and matches the behavior of most production servers.
-    $compressBody = $null
-    $useGzip      = $false
+    # Brotli is preferred over GZIP when both server-enabled and client-advertised.
+    $compressBody     = $null
+    $compressEncoding = $null   # 'br', 'gzip', or $null when uncompressed
     if (-not $isRange -and
-        $script:cfg.GzipEnabled -and
         $contentLength -ge $script:cfg.GzipMinBytes -and
         $contentLength -le $script:cfg.GzipMaxBytes) {
         $accept = $Request.Headers['Accept-Encoding']
-        if ($accept -and $accept.IndexOf('gzip', [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+        if ($accept) {
+            $mimeMatched = $false
             foreach ($prefix in $script:cfg.GzipMimeTypes) {
                 if ($mime.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
-                    # Load + compress in-memory. Acceptable for text content where bodies are
-                    # typically small (HTML/CSS/JS); GzipMinBytes still gates against tiny payloads.
-                    # Wrap allocations in try/finally so MemoryStream cannot leak when
-                    # ReadAllBytes / GZipStream constructor / Write throws.
+                    $mimeMatched = $true
+                    break
+                }
+            }
+            if ($mimeMatched) {
+                $wantsBrotli = $script:cfg.BrotliEnabled -and $accept.IndexOf('br',   [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+                $wantsGzip   = $script:cfg.GzipEnabled   -and $accept.IndexOf('gzip', [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+                if ($wantsBrotli) {
+                    $ms = $null
+                    $br = $null
+                    try {
+                        $allBytes     = [System.IO.File]::ReadAllBytes($FilePath)
+                        $ms           = [System.IO.MemoryStream]::new()
+                        $br           = [System.IO.Compression.BrotliStream]::new($ms, [System.IO.Compression.CompressionLevel]::Optimal, $true)
+                        $br.Write($allBytes, 0, $allBytes.Length)
+                        $br.Dispose(); $br = $null
+                        $compressBody     = $ms.ToArray()
+                        $compressEncoding = 'br'
+                    } finally {
+                        if ($null -ne $br) { try { $br.Dispose() } catch { } }
+                        if ($null -ne $ms) { try { $ms.Dispose() } catch { } }
+                    }
+                } elseif ($wantsGzip) {
                     $ms = $null
                     $gz = $null
                     try {
@@ -1324,17 +1360,17 @@ function Send-StaticFile {
                         $gz           = [System.IO.Compression.GZipStream]::new($ms, [System.IO.Compression.CompressionLevel]::Optimal, $true)
                         $gz.Write($allBytes, 0, $allBytes.Length)
                         $gz.Dispose(); $gz = $null
-                        $compressBody = $ms.ToArray()
-                        $useGzip      = $true
+                        $compressBody     = $ms.ToArray()
+                        $compressEncoding = 'gzip'
                     } finally {
                         if ($null -ne $gz) { try { $gz.Dispose() } catch { } }
                         if ($null -ne $ms) { try { $ms.Dispose() } catch { } }
                     }
-                    break
                 }
             }
         }
     }
+    $useCompressed = $null -ne $compressBody
 
     # Common headers
     $Response.StatusCode    = if ($isRange) { 206 } else { 200 }
@@ -1348,17 +1384,17 @@ function Send-StaticFile {
     if ($isRange) {
         $Response.AddHeader('Content-Range', ('bytes {0}-{1}/{2}' -f $rangeStart, $rangeEnd, $fi.Length))
     }
-    if ($useGzip -and $null -ne $compressBody) {
-        $Response.AddHeader('Content-Encoding', 'gzip')
+    if ($useCompressed) {
+        $Response.AddHeader('Content-Encoding', $compressEncoding)
         $Response.AddHeader('Vary',             'Accept-Encoding')
         $Response.ContentLength64 = $compressBody.Length
     } else {
         $Response.ContentLength64 = $contentLength
     }
 
-    # Body stream — gzip path uses the in-memory buffer; otherwise stream from disk
+    # Body stream — compressed path uses the in-memory buffer; otherwise stream from disk
     # with a 64 KB buffer to avoid loading large media files entirely into memory.
-    if ($useGzip -and $null -ne $compressBody) {
+    if ($useCompressed) {
         try { $Response.OutputStream.Write($compressBody, 0, $compressBody.Length) } catch { }
     } else {
         $fs = $null

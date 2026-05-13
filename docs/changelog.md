@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Added (post-parity feature wave)
+- **Brotli compression alongside GZIP** — new `BrotliEnabled` configuration key (default `$true`). When both Brotli and GZIP are server-enabled and the client advertises both, Brotli wins (~15-25 % smaller text payloads). Same eligibility gates as GZIP (`GzipMinBytes`, `GzipMaxBytes`, `GzipMimeTypes`). Implemented in both `Send-Response` and `Send-StaticFile`. `Content-Encoding: br` is emitted on the response; `Vary: Accept-Encoding` is set on static responses. Falls back to GZIP, then uncompressed.
 - **External configuration file (`config.psd1`)** — opt-in override for the inline `$cfg` defaults. Default path: `<baseDir>\config.psd1`; override via the new `-ConfigFile` script parameter. Values from the file override defaults; missing keys keep their default. `Import-PowerShellDataFile` parses only static data (no script execution). Malformed files abort startup with a clear message. A documented sample lives at `config.psd1.example` in the repo root.
 
 ### Fixed (post-feature review pass)
