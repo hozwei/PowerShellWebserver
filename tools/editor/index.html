@@ -117,15 +117,32 @@
         .btn {
             border: 1px solid var(--border);
             background: var(--panel);
-            padding: 6px 14px;
+            padding: 8px 16px;
             border-radius: 6px;
             font: inherit;
+            line-height: 1.2;
             cursor: pointer;
+            /* Prevent the I-beam cursor inside the button. Without this,
+               clicking on the text label can start a text-selection drag
+               instead of firing the click — a single click "swallowed" by
+               the selection logic looks like the button does nothing. */
+            user-select: none;
+            -webkit-user-select: none;
+            -ms-user-select: none;
+            /* Keep the label on one line so the hit-area stays predictable. */
+            white-space: nowrap;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
         }
+        /* Children of a .btn never intercept clicks — every pointer event
+           goes to the button itself. Belt-and-suspenders for future markup. */
+        .btn * { pointer-events: none; }
         .btn:hover { background: var(--bg); }
         .btn-primary { background: var(--accent); color: white; border-color: var(--accent); }
         .btn-primary:hover { background: #0860c8; }
         .btn-primary:disabled { background: var(--muted); border-color: var(--muted); cursor: not-allowed; }
+        .btn:disabled { cursor: not-allowed; opacity: 0.7; }
         .btn-danger { color: var(--danger); }
 
         .modal-bg {
