@@ -678,6 +678,13 @@ $script:runspaceDisposeFailures = [ref] 0L
 # or near MaxConcurrent means the next traffic spike will see 503s.
 $script:inFlightPeak = [ref] 0L
 
+# Counts requests that failed authentication (HTTP 401). Exposed as
+# posh_auth_failures_total in /metrics-prom; a spike correlates with
+# brute-force scanning, expired keys after rotation, or misconfigured
+# clients. Separate counter from rateLimitedTotal because 401s don't
+# touch the rate-limit subsystem (auth check runs after rate-limit).
+$script:authFailuresTotal = [ref] 0L
+
 # Rate-limit state — ConcurrentDictionary for lock-free access from RunspacePool Runspaces.
 # Key: 'ip:<address>' or 'id:<api-key-label>' depending on RateLimitPerIdentity (F4).
 # Value: PSCustomObject { Count [ref]; WindowStart [datetime]; PenaltyUntil [datetime] }.
@@ -3474,6 +3481,7 @@ function Format-PromMetrics {
     $slowDrops   = [System.Threading.Interlocked]::Read($script:slowLogDropsTotal)
     $rsFails     = [System.Threading.Interlocked]::Read($script:runspaceDisposeFailures)
     $peak        = [System.Threading.Interlocked]::Read($script:inFlightPeak)
+    $authFails   = [System.Threading.Interlocked]::Read($script:authFailuresTotal)
 
     $sb = [System.Text.StringBuilder]::new(1024)
     $null = $sb.AppendLine('# HELP posh_uptime_seconds Server uptime since process start.')
@@ -3509,6 +3517,9 @@ function Format-PromMetrics {
     $null = $sb.AppendLine('# HELP posh_in_flight_peak High-water mark of concurrently in-flight requests since process start.')
     $null = $sb.AppendLine('# TYPE posh_in_flight_peak gauge')
     $null = $sb.AppendLine("posh_in_flight_peak $peak")
+    $null = $sb.AppendLine('# HELP posh_auth_failures_total Number of requests that failed authentication (HTTP 401).')
+    $null = $sb.AppendLine('# TYPE posh_auth_failures_total counter')
+    $null = $sb.AppendLine("posh_auth_failures_total $authFails")
     # posh_rate_limit_penalty_active: count of rate-limit entries currently in
     # active penalty (PenaltyUntil > now). Spike = active throttling /
     # spray. Computed on demand because penalty windows are short and a
@@ -3910,6 +3921,7 @@ $requestHandler = {
     $script:slowLogDropsTotal       = $slowLogDropsTotal
     $script:runspaceDisposeFailures = $runspaceDisposeFailures
     $script:inFlightPeak            = $inFlightPeak
+    $script:authFailuresTotal       = $authFailuresTotal
     # $semaphore, $startTime, $requestsTotal are used directly (no $script: needed)
 
     try {
@@ -4165,6 +4177,7 @@ $requestHandler = {
                 # so a forensics review of audit.log shows the attack surface without secret leakage.
                 $attemptsStr = if ($authAttempts.Count -gt 0) { $authAttempts -join ',' } else { 'none' }
                 Write-AuditLog -EventName 'AUTH_FAIL' -ClientIP $clientIP -Path $urlPath -Detail ("mode=$authMode;attempts=$attemptsStr")
+                $null = [System.Threading.Interlocked]::Increment($script:authFailuresTotal)
                 return
             }
         }
@@ -4220,6 +4233,7 @@ $requestHandler = {
             $slowDrops   = [System.Threading.Interlocked]::Read($script:slowLogDropsTotal)
             $rsFails     = [System.Threading.Interlocked]::Read($script:runspaceDisposeFailures)
             $peak        = [System.Threading.Interlocked]::Read($script:inFlightPeak)
+            $authFails   = [System.Threading.Interlocked]::Read($script:authFailuresTotal)
             $body        = [ordered]@{
                 uptime                       = $uptimeStr
                 requestsTotal                = $total
@@ -4229,6 +4243,7 @@ $requestHandler = {
                 slowLogDropsTotal            = $slowDrops
                 runspaceDisposeFailuresTotal = $rsFails
                 inFlightPeak                 = $peak
+                authFailuresTotal            = $authFails
             } | ConvertTo-Json -Compress
             Send-Response -Response $resp -StatusCode 200 -Body $body -RequestId $requestId
             Write-Log -ClientIP $clientIP -Request $requestLine -Status 'METRICS' -ExitCode '-' -RequestId $requestId
@@ -4651,7 +4666,8 @@ foreach ($entry in @(
     [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('auditLogDropsTotal',        $script:auditLogDropsTotal,       $null),
     [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('slowLogDropsTotal',         $script:slowLogDropsTotal,        $null),
     [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('runspaceDisposeFailures',   $script:runspaceDisposeFailures,  $null),
-    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('inFlightPeak',              $script:inFlightPeak,             $null)
+    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('inFlightPeak',              $script:inFlightPeak,             $null),
+    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('authFailuresTotal',         $script:authFailuresTotal,        $null)
 )) { $iss.Variables.Add($entry) }
 
 # RunspacePool max = MaxConcurrent * RunspacePoolOverprovision (default 2).
