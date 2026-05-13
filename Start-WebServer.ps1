@@ -4887,20 +4887,33 @@ if ($cfg.BackgroundJobs -and $cfg.BackgroundJobs.Count -gt 0) {
                     $null = $proc.Start()
                     $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
                     $stderrTask = $proc.StandardError.ReadToEndAsync()
-                    # Poll WaitForExit so the parent shutdown can stop the runspace
-                    # within ~1s of calling Ps.Stop(). A blocking WaitForExit() with
-                    # no timeout pins the runspace until the subprocess exits naturally,
-                    # which can hang the entire shutdown if the BG script itself stalls.
-                    while (-not $proc.HasExited) {
-                        $null = $proc.WaitForExit(1000)
+                    # Inner try/finally ensures we kill the subprocess if a Stop()
+                    # cancellation unwinds us mid-loop. Without this, the runspace
+                    # exits but pwsh.exe keeps running, holding the stream handles
+                    # backing stdoutTask/stderrTask until the OS reaps them.
+                    $exitCode = $null
+                    $stderr   = ''
+                    try {
+                        # Poll WaitForExit so the parent shutdown can stop the runspace
+                        # within ~1s of calling Ps.Stop(). A blocking WaitForExit() with
+                        # no timeout pins the runspace until the subprocess exits naturally,
+                        # which can hang the entire shutdown if the BG script itself stalls.
+                        while (-not $proc.HasExited) {
+                            $null = $proc.WaitForExit(1000)
+                        }
+                        # stdout is drained but intentionally discarded — reading it is required to
+                        # prevent the child from blocking on a full pipe buffer; the actual content
+                        # is only of interest in stderr (errors) and the exit code.
+                        $null     = $stdoutTask.GetAwaiter().GetResult()
+                        $stderr   = $stderrTask.GetAwaiter().GetResult()
+                        $exitCode = $proc.ExitCode
+                    } finally {
+                        # If unwinding because of a Stop() cancellation, $proc may still
+                        # be running. Kill it so the OS reclaims the streams and we don't
+                        # leak a pwsh.exe per cancelled iteration.
+                        try { if (-not $proc.HasExited) { $proc.Kill() } } catch { }
+                        try { $proc.Dispose() } catch { }
                     }
-                    # stdout is drained but intentionally discarded — reading it is required to
-                    # prevent the child from blocking on a full pipe buffer; the actual content
-                    # is only of interest in stderr (errors) and the exit code.
-                    $null   = $stdoutTask.GetAwaiter().GetResult()
-                    $stderr = $stderrTask.GetAwaiter().GetResult()
-                    $exitCode = $proc.ExitCode
-                    $proc.Dispose()
 
                     $logLine = '{0} | JOB | {1} | EXIT:{2}' -f $startTime.ToString('yyyy-MM-dd HH:mm:ss'), $Path, $exitCode
                     & $writeLog $logLine
@@ -5091,8 +5104,12 @@ try {
                 $resp403.AddHeader('X-Request-Id', $ipReqId)
                 # HSTS on HTTPS fast-paths: same policy as Send-Response. Without this,
                 # a browser hitting a blocked IP over HTTPS would never see the header
-                # and could downgrade-attack the same origin via HTTP.
-                if ($cfg.HstsEnabled -and $context.Request.IsSecureConnection) {
+                # and could downgrade-attack the same origin via HTTP. IsSecureConnection
+                # is wrapped because the property can throw ObjectDisposedException on
+                # a connection that the client RST'd between accept and this branch.
+                $isHttpsFast = $false
+                try { $isHttpsFast = [bool]$context.Request.IsSecureConnection } catch { }
+                if ($cfg.HstsEnabled -and $isHttpsFast) {
                     $h = "max-age=$([int]$cfg.HstsMaxAgeSec)"
                     if ($cfg.HstsIncludeSubdomains) { $h += '; includeSubDomains' }
                     try { $resp403.AddHeader('Strict-Transport-Security', $h) } catch { }
@@ -5137,7 +5154,9 @@ try {
                 $resp429.ContentLength64 = $bodyBytes.Length
                 $resp429.AddHeader('Retry-After', [string]$retryAfter)
                 $resp429.AddHeader('X-Request-Id', $throttleReqId)
-                if ($cfg.HstsEnabled -and $context.Request.IsSecureConnection) {
+                $isHttpsFast = $false
+                try { $isHttpsFast = [bool]$context.Request.IsSecureConnection } catch { }
+                if ($cfg.HstsEnabled -and $isHttpsFast) {
                     $h = "max-age=$([int]$cfg.HstsMaxAgeSec)"
                     if ($cfg.HstsIncludeSubdomains) { $h += '; includeSubDomains' }
                     try { $resp429.AddHeader('Strict-Transport-Security', $h) } catch { }
@@ -5166,7 +5185,9 @@ try {
             $resp503.ContentType     = 'application/json; charset=utf-8'
             $resp503.ContentLength64 = $bodyBytes.Length
             $resp503.AddHeader('X-Request-Id', $overloadReqId)
-            if ($cfg.HstsEnabled -and $context.Request.IsSecureConnection) {
+            $isHttpsFast = $false
+            try { $isHttpsFast = [bool]$context.Request.IsSecureConnection } catch { }
+            if ($cfg.HstsEnabled -and $isHttpsFast) {
                 $h = "max-age=$([int]$cfg.HstsMaxAgeSec)"
                 if ($cfg.HstsIncludeSubdomains) { $h += '; includeSubDomains' }
                 try { $resp503.AddHeader('Strict-Transport-Security', $h) } catch { }
@@ -5233,24 +5254,37 @@ try {
     # cancellation signal is only checked at PowerShell pipeline boundaries.
     try {
         if ($null -ne $bgJobInstances) {
-            $stopHandles = @()
+            $stopHandles = [System.Collections.Generic.List[object]]::new()
             foreach ($bg in $bgJobInstances) {
+                # Init per-iteration: a thrown BeginStop must not carry a stale $h
+                # from the previous iteration into the (Handle=$null) catch branch.
+                $h = $null
                 try {
                     $h = $bg.Ps.BeginStop($null, $null)
-                    $stopHandles += [pscustomobject]@{ Bg = $bg; Handle = $h }
+                    $stopHandles.Add([pscustomobject]@{ Bg = $bg; Handle = $h; Stopped = $false })
                 } catch {
                     try { Write-StartupLog "WARN: bg-job '$($bg.Path)' BeginStop() threw: $($_.Exception.Message)" } catch { }
-                    $stopHandles += [pscustomobject]@{ Bg = $bg; Handle = $null }
+                    $stopHandles.Add([pscustomobject]@{ Bg = $bg; Handle = $null; Stopped = $false })
                 }
             }
             foreach ($item in $stopHandles) {
                 if ($null -ne $item.Handle) {
                     try {
-                        if (-not $item.Handle.AsyncWaitHandle.WaitOne(3000)) {
-                            try { Write-StartupLog "WARN: bg-job '$($item.Bg.Path)' did not stop within 3s — disposing forcefully" } catch { }
+                        if ($item.Handle.AsyncWaitHandle.WaitOne(3000)) {
+                            # Complete the APM pair so PowerShell can release the
+                            # async wait handle and surface any inner exception.
+                            try { $item.Bg.Ps.EndStop($item.Handle); $item.Stopped = $true } catch {
+                                try { Write-StartupLog "WARN: bg-job '$($item.Bg.Path)' EndStop() threw: $($_.Exception.Message)" } catch { }
+                            }
+                        } else {
+                            try { Write-StartupLog "WARN: bg-job '$($item.Bg.Path)' did not stop within 3s — skipping EndStop and disposing forcefully" } catch { }
                         }
                     } catch { }
                 }
+                # Dispose only when the runspace is actually stopped or never started cleanly.
+                # Dispose on a still-stopping runspace blocks until Stop completes — which is
+                # the very hang we're trying to avoid. The Rs.Dispose may still hang in that
+                # edge case, but we've already issued the stop, logged, and skipped EndStop.
                 try { $item.Bg.Ps.Dispose() } catch { }
                 try { $item.Bg.Rs.Dispose() } catch { }
             }

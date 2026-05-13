@@ -75,8 +75,16 @@ if ($showDetail) {
                 freePct  = if ($_.Size -gt 0) { [math]::Round(($_.FreeSpace / $_.Size) * 100, 1) } else { 0 }
             }
         }
-    $result.cpuModel    = $cpu.Name.Trim()
-    $result.cpuLoadPct  = $cpu.LoadPercentage
+    # Win32_Processor returns an empty collection on hosts that block CIM (rare
+    # but seen on hardened core servers). Without the null guard, .Name.Trim()
+    # throws NRE and the whole endpoint 500s even though disks/RAM were fine.
+    if ($null -ne $cpu) {
+        $result.cpuModel   = $cpu.Name.Trim()
+        $result.cpuLoadPct = $cpu.LoadPercentage
+    } else {
+        $result.cpuModel   = $null
+        $result.cpuLoadPct = $null
+    }
     $result.disks       = @($disks)
 }
 
