@@ -7,17 +7,43 @@
     <script>const POSH_TOKEN = '__POSH_TOKEN__';</script>
     <style>
         :root {
-            --bg:        #f7f8fa;
-            --panel:     #ffffff;
-            --text:      #1f2328;
-            --muted:     #6b7380;
-            --border:    #d8dee4;
-            --accent:    #0969da;
-            --accent-dim:#54aeff;
-            --danger:    #cf222e;
-            --ok:        #1a7f37;
-            --warn-bg:   #fff8c5;
-            --warn-bd:   #eac54f;
+            --bg:         #f7f8fa;
+            --panel:      #ffffff;
+            --text:       #1f2328;
+            --muted:      #6b7380;
+            --border:     #d8dee4;
+            --accent:     #0969da;
+            --accent-hov: #0860c8;
+            --accent-dim: #54aeff;
+            --danger:     #cf222e;
+            --danger-bg:  #ffeef0;
+            --ok:         #1a7f37;
+            --ok-bg:      #dcfce7;
+            --warn-bg:    #fff8c5;
+            --warn-bd:    #eac54f;
+            --warn-fg:    #875000;
+            --field-disabled-bg: #f0f1f4;
+        }
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --bg:         #0d1117;
+                --panel:      #161b22;
+                --text:       #e6edf3;
+                --muted:      #8b949e;
+                --border:     #30363d;
+                --accent:     #2f81f7;
+                --accent-hov: #1f6feb;
+                --accent-dim: #58a6ff;
+                --danger:     #f85149;
+                --danger-bg:  #25171c;
+                --ok:         #3fb950;
+                --ok-bg:      #0f2f1d;
+                --warn-bg:    #3d2e0a;
+                --warn-bd:    #9e6a03;
+                --warn-fg:    #d29922;
+                --field-disabled-bg: #1a1f26;
+            }
+            color-scheme: dark;
         }
         * { box-sizing: border-box; }
         body {
@@ -89,7 +115,7 @@
             outline-offset: 0;
             border-color: var(--accent);
         }
-        .field input.invalid { border-color: var(--danger); background: #ffeef0; }
+        .field input.invalid { border-color: var(--danger); background: var(--danger-bg); }
         .field textarea { min-height: 72px; resize: vertical; font-family: ui-monospace, Consolas, monospace; }
         .field .dirty-marker {
             display: inline-block;
@@ -140,10 +166,12 @@
         .btn * { pointer-events: none; }
         .btn:hover { background: var(--bg); }
         .btn-primary { background: var(--accent); color: white; border-color: var(--accent); }
-        .btn-primary:hover { background: #0860c8; }
+        .btn-primary:hover { background: var(--accent-hov); border-color: var(--accent-hov); }
         .btn-primary:disabled { background: var(--muted); border-color: var(--muted); cursor: not-allowed; }
         .btn:disabled { cursor: not-allowed; opacity: 0.7; }
         .btn-danger { color: var(--danger); }
+        .btn-danger.btn-primary { background: var(--danger); border-color: var(--danger); color: white; }
+        .btn-danger.btn-primary:hover { background: #a31b2a; border-color: #a31b2a; }
 
         .modal-bg {
             position: fixed; inset: 0;
@@ -208,9 +236,9 @@
             background: var(--bg);
             color: var(--muted);
         }
-        .badge-ok    { background: #dcfce7; color: var(--ok); }
-        .badge-warn  { background: var(--warn-bg); color: #875000; }
-        .badge-err   { background: #ffeef0; color: var(--danger); }
+        .badge-ok    { background: var(--ok-bg); color: var(--ok); }
+        .badge-warn  { background: var(--warn-bg); color: var(--warn-fg); }
+        .badge-err   { background: var(--danger-bg); color: var(--danger); }
 
         .warn-banner {
             background: var(--warn-bg);
@@ -231,11 +259,11 @@
             font-size: 11px;
             cursor: pointer;
         }
-        .field .remove-btn:hover { background: #ffeef0; }
+        .field .remove-btn:hover { background: var(--danger-bg); }
         .field input:disabled,
         .field textarea:disabled,
         .field select:disabled {
-            background: #f0f1f4;
+            background: var(--field-disabled-bg);
             color: var(--muted);
             cursor: not-allowed;
         }
@@ -301,7 +329,7 @@
             line-height: 1;
         }
         .keymap-row .icon-btn:hover { background: var(--bg); color: var(--text); }
-        .keymap-row .icon-btn.danger:hover { background: #ffeef0; color: var(--danger); border-color: var(--danger); }
+        .keymap-row .icon-btn.danger:hover { background: var(--danger-bg); color: var(--danger); border-color: var(--danger); }
         .keymap-empty {
             margin-top: 8px;
             padding: 16px;
@@ -320,6 +348,74 @@
             font-size: 12px;
             margin-top: -2px;
         }
+
+        .search-wrap { position: relative; flex: 0 0 280px; }
+        .search-wrap input {
+            width: 100%;
+            padding: 6px 32px 6px 10px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            font: inherit;
+            background: var(--panel);
+            color: var(--text);
+        }
+        .search-wrap input:focus { outline: 2px solid var(--accent-dim); border-color: var(--accent); }
+        .search-wrap .search-kbd {
+            position: absolute;
+            right: 8px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: var(--muted);
+            font-size: 11px;
+            pointer-events: none;
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            padding: 1px 5px;
+            background: var(--bg);
+        }
+        nav.tabs button .tab-badge {
+            float: right;
+            font-size: 11px;
+            font-weight: 500;
+            background: var(--bg);
+            color: var(--muted);
+            border-radius: 999px;
+            padding: 0 7px;
+            margin-left: 8px;
+            min-width: 18px;
+            text-align: center;
+            line-height: 18px;
+        }
+        nav.tabs button.active .tab-badge { background: var(--accent); color: white; }
+        nav.tabs button .tab-dirty {
+            display: inline-block;
+            width: 7px;
+            height: 7px;
+            background: var(--accent);
+            border-radius: 50%;
+            margin-left: 8px;
+            vertical-align: middle;
+        }
+        .empty-state {
+            padding: 32px 16px;
+            text-align: center;
+            color: var(--muted);
+        }
+        .empty-state .em-title { color: var(--text); font-weight: 600; margin-bottom: 4px; }
+
+        .field-reset {
+            display: none;
+            border: 1px solid var(--border);
+            background: transparent;
+            color: var(--muted);
+            border-radius: 4px;
+            padding: 2px 8px;
+            font-size: 11px;
+            margin-top: 6px;
+            cursor: pointer;
+        }
+        .field-reset:hover { background: var(--bg); color: var(--text); }
+        .field.dirty .field-reset { display: inline-block; }
     </style>
 </head>
 <body>
@@ -327,6 +423,10 @@
         <div>
             <h1>posh settings</h1>
             <div class="meta" id="meta-line">loading …</div>
+        </div>
+        <div class="search-wrap">
+            <input type="search" id="field-search" placeholder="Search settings…" autocomplete="off" spellcheck="false">
+            <span class="search-kbd">/</span>
         </div>
         <div style="display:flex; gap:8px;">
             <button class="btn" id="addvar-btn" title="Create a new variable in globalvars.ps1">+ Variable</button>
@@ -364,6 +464,17 @@
             <div class="actions">
                 <button class="btn" id="prompt-cancel">Cancel</button>
                 <button class="btn btn-primary" id="prompt-confirm">OK</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal-bg" id="confirm-modal">
+        <div class="modal">
+            <h3 id="confirm-title">Confirm</h3>
+            <div class="body" id="confirm-body"></div>
+            <div class="actions">
+                <button class="btn" id="confirm-cancel">Cancel</button>
+                <button class="btn btn-primary" id="confirm-ok">Confirm</button>
             </div>
         </div>
     </div>
@@ -420,6 +531,52 @@
         current:  {},      // server-side current values, flat
         proposed: {},      // user edits, flat (only dirty keys)
         active:   null,    // active tab id
+        search:   '',      // active search query (case-insensitive substring match)
+    };
+
+    // Promise-based confirm. Replaces window.confirm() so all confirmation
+    // UI stays in the editor's visual language and doesn't show the
+    // browser-chrome dialog (which on some Chromium builds focuses oddly
+    // and steals keyboard focus from the rest of the page).
+    const confirmAsync = (message, title, opts) => {
+        title = title || 'Confirm';
+        opts  = opts  || {};
+        return new Promise(resolve => {
+            const modal  = $('#confirm-modal');
+            const titleEl = $('#confirm-title');
+            const bodyEl  = $('#confirm-body');
+            const okBtn  = $('#confirm-ok');
+            const cancelBtn = $('#confirm-cancel');
+            titleEl.textContent = title;
+            bodyEl.textContent  = message;
+            okBtn.textContent     = opts.okLabel     || 'Confirm';
+            cancelBtn.textContent = opts.cancelLabel || 'Cancel';
+            okBtn.classList.toggle('btn-danger', Boolean(opts.danger));
+            const cleanup = (result) => {
+                modal.classList.remove('shown');
+                okBtn.removeEventListener('click', onOk);
+                cancelBtn.removeEventListener('click', onCancel);
+                resolve(result);
+            };
+            const onOk     = () => cleanup(true);
+            const onCancel = () => cleanup(false);
+            okBtn.addEventListener('click', onOk);
+            cancelBtn.addEventListener('click', onCancel);
+            modal.classList.add('shown');
+            // Move focus to the affirmative button so Enter confirms.
+            setTimeout(() => okBtn.focus(), 30);
+        });
+    };
+
+    // True when the field matches the active search query. Tab grouping
+    // is honoured by the caller — this only looks at field-intrinsic
+    // text so the same predicate drives both per-tab badge counts AND
+    // per-row visibility in the active tab.
+    const fieldMatchesSearch = (field) => {
+        const q = state.search;
+        if (!q) return true;
+        const hay = ((field.Name || '') + ' ' + (field.Label || '') + ' ' + (field.Help || '')).toLowerCase();
+        return hay.includes(q);
     };
 
     const toast = (msg, kind = 'ok') => {
@@ -502,6 +659,7 @@
         const n = dirtyFieldsCount();
         $('#save-btn').disabled = (n === 0);
         $('#dirty-status').textContent = n === 0 ? 'No changes.' : (n + (n === 1 ? ' change' : ' changes') + ' ready to save.');
+        refreshTabDirtyMarkers();
         for (const field of state.schema.Fields) {
             const row = document.querySelector('.field[data-name="' + field.Name + '"]');
             if (!row) continue;
@@ -717,6 +875,18 @@
             def.className = 'help';
             def.innerHTML = 'current value in file: <code>' + formatCurrent(field).replace(/</g, '&lt;') + '</code>';
             right.appendChild(def);
+            const reset = document.createElement('button');
+            reset.type = 'button';
+            reset.className = 'field-reset';
+            reset.textContent = '↶ Discard changes';
+            reset.title = 'Revert to the current value in the file';
+            reset.addEventListener('click', () => {
+                delete state.proposed[field.Name];
+                const fresh = renderField(field);
+                row.parentNode.replaceChild(fresh, row);
+                updateSaveButton();
+            });
+            right.appendChild(reset);
             row.append(left, right);
             return row;
         }
@@ -799,14 +969,29 @@
             hint.className = 'computed-hint';
             hint.textContent = 'Computed value (e.g. Join-Path or $env:...) — only editable directly in globalvars.ps1.';
             right.appendChild(hint);
-        } else if (field.File === 'globalvars.ps1') {
-            const rm = document.createElement('button');
-            rm.className = 'remove-btn';
-            rm.type = 'button';
-            rm.textContent = '✕ remove from globalvars.ps1';
-            rm.title = 'Delete variable from globalvars.ps1';
-            rm.addEventListener('click', () => removeGlobalvar(field.Name));
-            right.appendChild(rm);
+        } else {
+            const reset = document.createElement('button');
+            reset.type = 'button';
+            reset.className = 'field-reset';
+            reset.textContent = '↶ Discard changes';
+            reset.title = 'Revert to the current value in the file';
+            reset.addEventListener('click', () => {
+                delete state.proposed[field.Name];
+                const fresh = renderField(field);
+                row.parentNode.replaceChild(fresh, row);
+                updateSaveButton();
+            });
+            right.appendChild(reset);
+
+            if (field.File === 'globalvars.ps1') {
+                const rm = document.createElement('button');
+                rm.className = 'remove-btn';
+                rm.type = 'button';
+                rm.textContent = '✕ remove from globalvars.ps1';
+                rm.title = 'Delete variable from globalvars.ps1';
+                rm.addEventListener('click', () => removeGlobalvar(field.Name));
+                right.appendChild(rm);
+            }
         }
 
         row.append(left, right);
@@ -832,8 +1017,18 @@
         desc.textContent = 'Values are not saved immediately. Clicking "Save" first shows a diff preview and creates a backup before writing.';
         main.appendChild(desc);
 
-        const fields = state.schema.Fields.filter(f => f.Group === groupId);
-        for (const f of fields) main.appendChild(renderField(f));
+        const allFields = state.schema.Fields.filter(f => f.Group === groupId);
+        const fields    = allFields.filter(fieldMatchesSearch);
+        if (fields.length === 0 && state.search) {
+            const empty = document.createElement('div');
+            empty.className = 'empty-state';
+            empty.innerHTML =
+                '<div class="em-title">No fields match "' + state.search.replace(/</g, '&lt;') + '" in this tab.</div>' +
+                '<div>Try another tab or clear the search.</div>';
+            main.appendChild(empty);
+        } else {
+            for (const f of fields) main.appendChild(renderField(f));
+        }
         updateSaveButton();
     };
 
@@ -861,9 +1056,13 @@
         $('#aes-gen').addEventListener('click', async () => {
             const force = aes.Initialised ? Boolean(document.getElementById('aes-force')?.checked) : false;
             if (aes.Initialised && !force) { toast('Please tick "Overwrite existing key" first.', 'err'); return; }
-            const sure = confirm(aes.Initialised
-                ? 'The existing AES key will be replaced. Previously encrypted secrets will NOT be readable afterwards. Really continue?'
-                : 'Generate an AES key with 32 random bytes?');
+            const sure = await confirmAsync(
+                aes.Initialised
+                    ? 'The existing AES key will be replaced. Previously encrypted secrets will NOT be readable afterwards. Really continue?'
+                    : 'Generate an AES key with 32 random bytes?',
+                aes.Initialised ? 'Regenerate AES key' : 'Generate AES key',
+                aes.Initialised ? { danger: true, okLabel: 'Regenerate' } : { okLabel: 'Generate' }
+            );
             if (!sure) return;
             try {
                 const r = await api('POST', '/api/initkey', { force });
@@ -931,7 +1130,7 @@
             $('#env-save').addEventListener('click', async () => {
                 const v = $('#env-val').value.trim();
                 if (!v) { toast('API key must not be empty.', 'err'); return; }
-                if (!confirm('Overwrite POSH_API_KEY at machine scope?')) return;
+                if (!await confirmAsync('Overwrite POSH_API_KEY at machine scope?', 'Set POSH_API_KEY', { okLabel: 'Overwrite' })) return;
                 try {
                     await api('POST', '/api/setenv', { value: v });
                     toast('POSH_API_KEY set. Restart the scheduled task for the new value to take effect.');
@@ -948,15 +1147,54 @@
         nav.innerHTML = '';
         for (const g of state.schema.Groups) {
             const b = document.createElement('button');
-            b.textContent = g.Title;
             b.dataset.id = g.Id;
             if (g.Id === state.active) b.classList.add('active');
+            const titleSpan = document.createElement('span');
+            titleSpan.textContent = g.Title;
+            b.appendChild(titleSpan);
+            // Setup helpers aren't searchable; everything else shows a
+            // match-count badge while a search is active.
+            if (state.search && g.Id !== 'setup') {
+                const matches = state.schema.Fields
+                    .filter(f => f.Group === g.Id)
+                    .filter(fieldMatchesSearch).length;
+                const badge = document.createElement('span');
+                badge.className = 'tab-badge';
+                badge.textContent = matches;
+                if (matches === 0) badge.style.opacity = '0.4';
+                b.appendChild(badge);
+            }
+            // Unsaved-changes indicator — visibility is recomputed every
+            // time updateSaveButton() fires (i.e. on every field edit).
+            const dirtyDot = document.createElement('span');
+            dirtyDot.className = 'tab-dirty';
+            dirtyDot.title = 'Unsaved changes in this tab';
+            dirtyDot.style.display = 'none';
+            b.appendChild(dirtyDot);
             b.addEventListener('click', () => {
                 state.active = g.Id;
-                $$('#tabs button').forEach(x => x.classList.toggle('active', x.dataset.id === g.Id));
+                renderTabs();
                 renderGroup(g.Id);
             });
             nav.appendChild(b);
+        }
+        refreshTabDirtyMarkers();
+    };
+
+    // Cheap update path called from updateSaveButton — touches only the
+    // dot span on each tab so we don't rebuild the whole nav on every
+    // keystroke.
+    const refreshTabDirtyMarkers = () => {
+        if (!state.schema) return;
+        for (const g of state.schema.Groups) {
+            const tab = document.querySelector('#tabs button[data-id="' + g.Id + '"]');
+            if (!tab) continue;
+            const marker = tab.querySelector('.tab-dirty');
+            if (!marker) continue;
+            const hasDirty = g.Id !== 'setup' && state.schema.Fields
+                .filter(f => f.Group === g.Id)
+                .some(isFieldDirty);
+            marker.style.display = hasDirty ? 'inline-block' : 'none';
         }
     };
 
@@ -1032,7 +1270,12 @@
     };
 
     const removeGlobalvar = async (name) => {
-        if (!confirm("Really remove variable $" + name + " from globalvars.ps1?\n\nA backup will be created first.")) return;
+        const ok = await confirmAsync(
+            'Variable $' + name + ' will be deleted from globalvars.ps1. A backup is created first.',
+            'Delete $' + name + '?',
+            { danger: true, okLabel: 'Delete' }
+        );
+        if (!ok) return;
         try {
             await api('POST', '/api/globalvar/remove', { name });
             toast('$' + name + ' removed.');
@@ -1122,6 +1365,21 @@
         renderGroup(state.active);
     };
 
+    // Debounce the search input so we don't re-render on every keystroke.
+    // The render walks every field; for ~60 fields that's cheap, but the
+    // input event fires per character and a tiny delay still smooths it.
+    let searchTimer = null;
+    const onSearchInput = (e) => {
+        const next = (e.target.value || '').trim().toLowerCase();
+        if (next === state.search) return;
+        clearTimeout(searchTimer);
+        searchTimer = setTimeout(() => {
+            state.search = next;
+            renderTabs();
+            renderGroup(state.active);
+        }, 80);
+    };
+
     const init = async () => {
         $('#diff-cancel').addEventListener('click', () => $('#diff-modal').classList.remove('shown'));
         $('#diff-confirm').addEventListener('click', confirmDiffSave);
@@ -1130,8 +1388,53 @@
         $('#addvar-cancel').addEventListener('click', closeAddVarModal);
         $('#addvar-confirm').addEventListener('click', confirmAddVar);
         $('#addvar-type').addEventListener('change', syncAddVarValueShape);
+        $('#field-search').addEventListener('input', onSearchInput);
+
+        // Global keyboard shortcuts. Bound on document so they fire from
+        // anywhere except when the user is typing into the search input
+        // itself (Esc inside search clears the field instead of closing
+        // a modal, which is the expected SaaS pattern).
+        document.addEventListener('keydown', (e) => {
+            // Esc: close the topmost modal that's currently shown.
+            if (e.key === 'Escape') {
+                const open = $$('.modal-bg.shown');
+                if (open.length > 0) {
+                    open[open.length - 1].classList.remove('shown');
+                    e.preventDefault();
+                    return;
+                }
+                // Esc inside the search field clears it.
+                if (document.activeElement && document.activeElement.id === 'field-search') {
+                    const sv = $('#field-search');
+                    if (sv.value) {
+                        sv.value = '';
+                        sv.dispatchEvent(new Event('input', { bubbles: true }));
+                        e.preventDefault();
+                    }
+                }
+                return;
+            }
+            // Ctrl/Cmd + S: open the save flow (only when there are
+            // dirty fields — otherwise it's a no-op rather than
+            // showing an empty diff modal).
+            if ((e.ctrlKey || e.metaKey) && (e.key === 's' || e.key === 'S')) {
+                e.preventDefault();
+                if (!$('#save-btn').disabled) openDiffModal();
+                return;
+            }
+            // "/" focuses the search field. Skip when the user is
+            // already typing into another input/textarea/contentEditable.
+            if (e.key === '/' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+                const tag = (document.activeElement && document.activeElement.tagName) || '';
+                if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+                if (document.activeElement && document.activeElement.isContentEditable) return;
+                e.preventDefault();
+                $('#field-search').focus();
+                $('#field-search').select();
+            }
+        });
         $('#quit-btn').addEventListener('click', async () => {
-            if (!confirm('Quit editor?')) return;
+            if (!await confirmAsync('Quit the editor? Any unsaved changes will be lost.', 'Quit editor', { okLabel: 'Quit', danger: true })) return;
             try { await api('POST', '/api/quit', {}); } catch (e) { /* server is shutting down, that is fine */ }
             document.body.innerHTML = '<p style="padding:24px">Editor has stopped. You can close this browser window.</p>';
         });
