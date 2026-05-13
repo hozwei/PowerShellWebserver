@@ -164,7 +164,7 @@ $cfg = @{
     ApiKeys             = [ordered]@{}                               # multi-key map: label → key. Populate via config.psd1: @{ ApiKeys = @{ 'ci' = 'k1'; 'mon' = 'k2' } }
     ScriptTimeoutSec         = 300    # 5 minutes — scripts running longer are terminated (HTTP 504)
     MaxConcurrent            = 10     # maximum parallel requests — excess requests receive HTTP 503
-    LogRetentionDays         = 180    # log files older than N days are deleted at startup (0 = disabled)
+    LogRetentionDays         = 180    # date-stemmed request logs (YYYY-MM-DD.log / YYYY-MM-DDTHH.log) older than N days are deleted at startup; single-file logs (audit/slow/jobs/startup) are exempt — they have separate size-based rotation. 0 = disabled.
     PostJsonDir              = Join-Path $baseDir 'postjson' # directory where POST body JSON files are stored
     PostJsonRetentionDays    = 30     # POST JSON files older than N days are deleted at startup (0 = disabled)
     MaxRequestBodyBytes      = 20MB   # maximum POST body size in bytes — larger requests: HTTP 413
@@ -198,6 +198,7 @@ $cfg = @{
     LogIntegrityHash         = $false # write <logfile>.md5 next to every completed log file at startup (legacy PoSH Server parity); current day's file is left alone
     LogSchedule              = 'Daily' # 'Daily' = YYYY-MM-DD.log | 'Hourly' = YYYY-MM-DDTHH.log
     LogFormat                = 'Native' # 'Native' = current pipe-delimited format | 'IIS-W3C' = W3C Extended Log File Format with #Fields header
+    LogMutexTimeoutMs        = 500     # max ms Write-Log / Write-AuditLog / Write-SlowLog wait for the log mutex; on timeout the line is dropped and posh_*_drops_total ticks. Raise (1000-5000) for high-contention deployments where dropping is worse than blocking briefly; lower (50-100) for latency-sensitive workloads
     StaticServingEnabled     = $false # serve non-.ps1 files (HTML, CSS, JS, images, …) from StaticRoot — opt-in for backward compatibility
     StaticRoot               = ''     # static file root; empty string = use WebRoot (so static files live alongside .ps1 endpoints by default)
     DefaultDocuments         = @('index.html', 'index.htm')  # served when StaticServing handles a directory request (e.g. GET /docs/); PR-9 (DirectoryBrowsing) takes over when none of these exist
@@ -289,6 +290,9 @@ $cfg = @{
     DirectoryBrowsingHidden  = @('_error', '.git', '.gitignore') # entries hidden from the directory listing (case-insensitive match on file/folder name)
     AuditLogEnabled          = $false  # F5: write security-relevant events (AUTH_FAIL, IP_BLOCKED, RATE_LIMITED) as NDJSON to AuditLogFile
     AuditLogFile             = ''      # absolute path to audit.log; empty = '<LogDir>\audit.log'
+    AuditLogMaxBytes         = 100MB   # at startup, audit.log files larger than this are rotated to audit.log.<yyyyMMdd-HHmmss>; 0 = disabled (unbounded growth)
+    SlowLogMaxBytes          = 50MB    # at startup, slow.log files larger than this are rotated; 0 = disabled
+    JobsLogMaxBytes          = 50MB    # at startup, jobs.log files larger than this are rotated; 0 = disabled
     SlowRequestThresholdMs   = 0       # F6: requests >= this many ms (after Invoke-Script returns) get an extra line in SlowLogFile. 0 = disabled.
     SlowLogFile              = ''      # absolute path to slow.log; empty = '<LogDir>\slow.log'
     IndexShowMetadata        = $true   # F7: GET / returns enriched objects with synopsis + parameters parsed from each script's AST. Set $false to revert to the flat path list.
@@ -495,6 +499,10 @@ $numericBounds = @(
     @{ Key = 'PhpCgiTimeoutSec';         Min = 1;    Max = 86400 }
     @{ Key = 'CorsMaxAgeSec';            Min = 0;    Max = 86400 }
     @{ Key = 'SlowRequestThresholdMs';   Min = 0;    Max = 3600000 } # 0 = disabled, 1 h upper
+    @{ Key = 'LogMutexTimeoutMs';        Min = 1;    Max = 60000 }   # 1 ms .. 60 s
+    @{ Key = 'AuditLogMaxBytes';         Min = 0;    Max = 10GB }    # 0 = disabled, 10 GB upper
+    @{ Key = 'SlowLogMaxBytes';          Min = 0;    Max = 10GB }
+    @{ Key = 'JobsLogMaxBytes';          Min = 0;    Max = 10GB }
 )
 foreach ($b in $numericBounds) {
     $v = $cfg[$b.Key]
@@ -599,13 +607,55 @@ $script:metadataCache = [System.Collections.Concurrent.ConcurrentDictionary[stri
 # NOT detected; restart needed to pick those up.
 $script:routeCache = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
 
-# Mutex serializes concurrent write access to the log file.
-# Global\ makes the mutex unique across process boundaries.
-$script:logMutex = [System.Threading.Mutex]::new($false, 'Global\PoshWebserverLog')
+# ---------------------------------------------------------------------------
+# Logging subsystem at a glance
+# ---------------------------------------------------------------------------
+# Four writers, three mutexes:
+#   Write-Log        -> <LogDir>\YYYY-MM-DD.log (or YYYY-MM-DDTHH)   [logMutex]
+#   Write-AuditLog   -> <AuditLogFile>            (NDJSON, security)  [auditMutex]
+#   Write-SlowLog    -> <SlowLogFile>             (pipe-delimited)    [logMutex]
+#   Write-StartupLog -> <LogDir>\startup.log      (process-wide,      no mutex; called
+#                                                  startup phase only)
+#                                                  main thread + bg-runspaces share file
+#                                                  but startup writes are serialised
+#                                                  naturally by single-threaded flow)
+#
+# Mutex names are Global\PoshWebserverLog-<hash>, Global\PoshWebserverAudit-<hash>,
+# and Global\PoshWebserverJobsLog-<hash>. The hash is sha1(LogDir).Substring(0,16)
+# so two posh instances pointing at DIFFERENT directories never contend; two
+# instances on the SAME directory share the same kernel object and serialise
+# correctly. Without the hash, a second posh instance would unnecessarily
+# block on a mutex protecting a log file it has no business writing to.
+#
+# Contention handling: WaitOne(LogMutexTimeoutMs) returns $false under load;
+# rather than writing without the mutex (which interleaves bytes across
+# runspaces) the writer DROPS the line and increments posh_log_drops_total /
+# posh_audit_log_drops_total / posh_slow_log_drops_total — these are exposed
+# in /metrics and /metrics-prom so operators can see logging starvation.
+# ---------------------------------------------------------------------------
+
+# Mutex serializes concurrent write access to the log file. Global\ makes
+# the mutex unique across process boundaries. The mutex name is keyed on a
+# hash of the LogDir path so two posh instances pointing at *different*
+# directories don't contend with each other — but two instances pointing
+# at the *same* LogDir still share the same Windows kernel object and
+# correctly serialise.
+$logDirKey = [System.BitConverter]::ToString(
+    [System.Security.Cryptography.SHA1]::HashData([System.Text.Encoding]::UTF8.GetBytes($cfg.LogDir.ToLowerInvariant()))
+).Replace('-', '').Substring(0, 16)
+$script:logMutex = [System.Threading.Mutex]::new($false, "Global\PoshWebserverLog-$logDirKey")
 
 # F5: separate Mutex for the audit log so AUTH_FAIL bursts cannot block normal
-# request-log writes. Same Global\ naming convention.
-$script:auditMutex = [System.Threading.Mutex]::new($false, 'Global\PoshWebserverAudit')
+# request-log writes. Keyed the same way for the same multi-instance reason.
+$script:auditMutex = [System.Threading.Mutex]::new($false, "Global\PoshWebserverAudit-$logDirKey")
+
+# Drop counters for the three log writers. WaitOne(500) returns $false under
+# heavy contention; rather than write without the mutex (which can interleave
+# bytes across runspaces) we now skip the write and tick this counter. The
+# value is exposed via /metrics so operators can spot logging starvation.
+$script:logDropsTotal       = [ref] 0L
+$script:auditLogDropsTotal  = [ref] 0L
+$script:slowLogDropsTotal   = [ref] 0L
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -674,16 +724,19 @@ function Write-Log {
         }
         if ($HttpStatus -le 0) {
             # Map textual $Status onto sc-status when caller did not pass an explicit HTTP code.
+            # "HTTP NNN" call sites (e.g. body-validation errors) parse the number out so
+            # the W3C record reflects the actual code instead of folding everything to 400.
             $HttpStatus = switch -Regex ($Status) {
-                '^OK$|^INDEX$|^HEALTH$|^METRICS$' { 200; break }
+                '^OK$|^INDEX$|^HEALTH$|^METRICS$|^OPENAPI$|^METRICS-PROM$' { 200; break }
                 '^METHOD NOT ALLOWED$'            { 405; break }
                 '^UNAUTHORIZED$'                  { 401; break }
                 '^FORBIDDEN$|^IP BLOCKED$|^IP NOT ALLOWED$' { 403; break }
                 '^NOT FOUND$'                     { 404; break }
                 '^RATE LIMITED$'                  { 429; break }
                 '^TIMEOUT$'                       { 504; break }
-                '^BAD REQUEST$|^HTTP \d+$'        { 400; break }
-                '^ERROR$|^REQUEST-ERROR'          { 500; break }
+                '^BAD REQUEST$'                   { 400; break }
+                '^HTTP\s+(\d+)$'                  { [int]$Matches[1]; break }
+                '^ERROR$|^REQUEST-ERROR|^SEND-ERROR' { 500; break }
                 default                           { 0 }
             }
         }
@@ -720,30 +773,39 @@ function Write-Log {
             $RequestId
     }
 
-    # Mutex prevents corrupted lines from parallel writes across RunspacePool Runspaces.
-    # WaitOne(500): wait at most 500ms — on failure continue silently, never kill the process.
+    # Mutex prevents interleaved bytes from parallel writes across RunspacePool
+    # Runspaces. WaitOne(500) returns $false on contention; when that happens
+    # we DROP the log line (and tick the drop counter for /metrics) rather
+    # than writing without the mutex — the latter mixes partial records across
+    # runspaces and corrupts the log file.
     # Track $acquired: ReleaseMutex() must only be called when WaitOne() succeeded —
     # otherwise ApplicationException because the calling thread does not hold the mutex.
-    $acquired = $false
+    $acquired   = $false
+    $waitMs     = if ($script:cfg.LogMutexTimeoutMs -gt 0) { $script:cfg.LogMutexTimeoutMs } else { 500 }
     try {
-        $acquired = $script:logMutex.WaitOne(500)
-        if ($format -eq 'IIS-W3C' -and -not (Test-Path -LiteralPath $logFile -PathType Leaf)) {
-            # Emit W3C header block once per file — the #Fields line is what tools like
-            # logparser require to interpret subsequent records.
-            $header = @(
-                '#Software: posh-webserver'
-                '#Version: 1.0'
-                ('#Date: {0}' -f $now.ToString('yyyy-MM-dd HH:mm:ss'))
-                '#Fields: date time c-ip cs-method cs-uri-stem cs-uri-query sc-status cs(User-Agent) cs(identity) time-taken x-request-id'
-            ) -join [System.Environment]::NewLine
-            Add-Content -LiteralPath $logFile -Value $header -Encoding UTF8
+        $acquired = $script:logMutex.WaitOne($waitMs)
+        if ($acquired) {
+            if ($format -eq 'IIS-W3C' -and -not (Test-Path -LiteralPath $logFile -PathType Leaf)) {
+                # Emit W3C header block once per file — the #Fields line is what tools like
+                # logparser require to interpret subsequent records.
+                $header = @(
+                    '#Software: posh-webserver'
+                    '#Version: 1.0'
+                    ('#Date: {0}' -f $now.ToString('yyyy-MM-dd HH:mm:ss'))
+                    '#Fields: date time c-ip cs-method cs-uri-stem cs-uri-query sc-status cs(User-Agent) cs(identity) time-taken x-request-id'
+                ) -join [System.Environment]::NewLine
+                Add-Content -LiteralPath $logFile -Value $header -Encoding UTF8
+            }
+            Add-Content -LiteralPath $logFile -Value $line -Encoding UTF8
+        } else {
+            [System.Threading.Interlocked]::Increment($script:logDropsTotal) | Out-Null
         }
-        Add-Content -LiteralPath $logFile -Value $line -Encoding UTF8
     } catch { } finally {
         try { if ($acquired) { $script:logMutex.ReleaseMutex() } } catch { }
     }
 
-    # Also to stdout — appears in Scheduled Task history output.
+    # Also to stdout — appears in Scheduled Task history output. Stdout is its
+    # own (process-wide) lock so we emit it even when the file write was dropped.
     Write-Output $line
 }
 
@@ -769,8 +831,16 @@ function Write-AuditLog {
     )
     if (-not $script:cfg.AuditLogEnabled) { return }
 
+    # v: schema version. Bumped on any breaking change to the field set;
+    # additive fields keep v unchanged. Today (2026-05): v=1, fields ts,
+    # event, identity, ip, path, detail. pid is additive — its absence
+    # in older lines means "unknown process", not a v=0 record.
+    # pid: PID of the posh process that emitted the line. Disambiguates
+    # entries when several posh instances share an audit log target.
     $obj = [ordered]@{
+        v        = 1
         ts       = (Get-Date).ToString('o')
+        pid      = $PID
         event    = $EventName
         identity = $Identity
         ip       = $ClientIP
@@ -780,9 +850,14 @@ function Write-AuditLog {
     $line = $obj | ConvertTo-Json -Compress -Depth 3
 
     $acquired = $false
+    $waitMs   = if ($script:cfg.LogMutexTimeoutMs -gt 0) { $script:cfg.LogMutexTimeoutMs } else { 500 }
     try {
-        $acquired = $script:auditMutex.WaitOne(500)
-        Add-Content -LiteralPath $script:cfg.AuditLogFile -Value $line -Encoding UTF8
+        $acquired = $script:auditMutex.WaitOne($waitMs)
+        if ($acquired) {
+            Add-Content -LiteralPath $script:cfg.AuditLogFile -Value $line -Encoding UTF8
+        } else {
+            [System.Threading.Interlocked]::Increment($script:auditLogDropsTotal) | Out-Null
+        }
     } catch { } finally {
         try { if ($acquired) { $script:auditMutex.ReleaseMutex() } } catch { }
     }
@@ -818,9 +893,14 @@ function Write-SlowLog {
         $RequestId
 
     $acquired = $false
+    $waitMs   = if ($script:cfg.LogMutexTimeoutMs -gt 0) { $script:cfg.LogMutexTimeoutMs } else { 500 }
     try {
-        $acquired = $script:logMutex.WaitOne(500)
-        Add-Content -LiteralPath $script:cfg.SlowLogFile -Value $line -Encoding UTF8
+        $acquired = $script:logMutex.WaitOne($waitMs)
+        if ($acquired) {
+            Add-Content -LiteralPath $script:cfg.SlowLogFile -Value $line -Encoding UTF8
+        } else {
+            [System.Threading.Interlocked]::Increment($script:slowLogDropsTotal) | Out-Null
+        }
     } catch { } finally {
         try { if ($acquired) { $script:logMutex.ReleaseMutex() } } catch { }
     }
@@ -828,10 +908,23 @@ function Write-SlowLog {
 
 # Startup events (before the listener) are written to a separate startup.log.
 function Write-StartupLog {
-    param([string] $Message)
+    param(
+        [string] $Message,
+        # INFO is the default for legacy callers. New code can pass WARN/ERROR
+        # explicitly; if the message itself starts with 'ERROR:' or 'WARN:' the
+        # severity is auto-promoted so existing call sites get correct tagging
+        # without a per-site edit.
+        [ValidateSet('INFO', 'WARN', 'ERROR')]
+        [string] $Severity = 'INFO'
+    )
+
+    if ($Severity -eq 'INFO') {
+        if     ($Message -match '^\s*ERROR\b') { $Severity = 'ERROR' }
+        elseif ($Message -match '^\s*WARN\b')  { $Severity = 'WARN' }
+    }
 
     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $line = "$timestamp | STARTUP | $Message"
+    $line = "$timestamp | STARTUP | $Severity | $Message"
 
     # LogDir is already ensured in the startup flow — no Test-Path needed.
     try {
@@ -859,8 +952,14 @@ function Remove-OldLogs {
     $cutoff  = (Get-Date).AddDays(-$RetentionDays)
     $deleted = 0
 
+    # Continuously-appended single-file logs (audit/slow/jobs/startup) must be
+    # exempt from date-based retention — deleting them mid-life would drop
+    # audit-trail data the operator expects to keep around. Only date-stemmed
+    # request logs (YYYY-MM-DD.log / YYYY-MM-DDTHH.log) are retention targets.
+    $stemPattern = '^\d{4}-\d{2}-\d{2}(T\d{2})?$'
+
     Get-ChildItem -Path $LogDir -Filter '*.log' -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.LastWriteTime -lt $cutoff } |
+        Where-Object { $_.BaseName -match $stemPattern -and $_.LastWriteTime -lt $cutoff } |
         ForEach-Object {
             try {
                 Remove-Item -LiteralPath $_.FullName -Force
@@ -905,19 +1004,33 @@ function Save-LogIntegrityHashes {
     $currentStem = if ($Schedule -eq 'Hourly') { (Get-Date).ToString('yyyy-MM-ddTHH') } else { (Get-Date).ToString('yyyy-MM-dd') }
     $created     = 0
 
+    # Restrict hashing to the date-stemmed request logs only. audit.log /
+    # slow.log / startup.log / jobs.log are continuously appended single
+    # files; hashing them produces an integrity tag that goes stale on the
+    # very next write. Match either YYYY-MM-DD or YYYY-MM-DDTHH stems.
+    $stemPattern = '^\d{4}-\d{2}-\d{2}(T\d{2})?$'
+
     Get-ChildItem -Path $LogDir -Filter '*.log' -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.BaseName -ne $currentStem -and $_.BaseName -ne 'startup' -and $_.BaseName -ne 'jobs' } |
+        Where-Object { $_.BaseName -match $stemPattern -and $_.BaseName -ne $currentStem } |
         ForEach-Object {
-            $hashFile = $_.FullName + '.md5'
+            # Capture name/fullname before try{} so the catch block can reference
+            # them — inside catch, $_ rebinds to the ErrorRecord.
+            $fileName = $_.Name
+            $fileFull = $_.FullName
+            $hashFile = $fileFull + '.md5'
             if (Test-Path -LiteralPath $hashFile -PathType Leaf) { return }
             try {
                 # Get-FileHash is the canonical way; .NET MD5 wrapper avoids spawning Format-* pipelines.
-                $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm MD5).Hash.ToLowerInvariant()
+                $hash = (Get-FileHash -LiteralPath $fileFull -Algorithm MD5).Hash.ToLowerInvariant()
                 # Format mirrors `md5sum` so the file is consumable by standard audit tools.
-                $line = '{0}  {1}' -f $hash, $_.Name
+                $line = '{0}  {1}' -f $hash, $fileName
                 [System.IO.File]::WriteAllText($hashFile, $line + [System.Environment]::NewLine, [System.Text.Encoding]::UTF8)
                 $created++
-            } catch { }
+            } catch {
+                # Surface the failure so the operator can investigate (locked file, perms, ...)
+                # instead of wondering why a .md5 was silently missing.
+                Write-StartupLog ("WARN: log integrity hash failed for '{0}': {1}" -f $fileName, $_.Exception.Message)
+            }
         }
 
     return $created
@@ -1402,6 +1515,9 @@ foreach ($logKey in @('JobsLogFile', 'AuditLogFile', 'SlowLogFile')) {
 $deletedLogs = Remove-OldLogs -LogDir $cfg.LogDir -RetentionDays $cfg.LogRetentionDays
 if ($deletedLogs -gt 0) {
     Write-StartupLog "Log rotation: $deletedLogs file(s) older than $($cfg.LogRetentionDays) days deleted."
+    if ($cfg.AuditLogEnabled) {
+        Write-AuditLog -EventName 'LOG_ROTATION' -Detail "deleted=$deletedLogs; retentionDays=$($cfg.LogRetentionDays)"
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -1424,6 +1540,66 @@ if ($cfg.LogIntegrityHash) {
 $deletedPostJson = Remove-OldPostJsonFiles -PostJsonDir $cfg.PostJsonDir -RetentionDays $cfg.PostJsonRetentionDays
 if ($deletedPostJson -gt 0) {
     Write-StartupLog "POST JSON cleanup: $deletedPostJson file(s) older than $($cfg.PostJsonRetentionDays) days deleted."
+    # Bulk file deletion is security-relevant (could hide forensic evidence).
+    # Emit an audit-log entry when enabled so the cleanup is part of the
+    # tamper-evident trail. $script:cfg resolves to the top-level $cfg in a
+    # script's main scope, so Write-AuditLog's internal $script:cfg.AuditLogFile
+    # lookup sees the right value without an explicit mirror.
+    if ($cfg.AuditLogEnabled) {
+        Write-AuditLog -EventName 'POSTJSON_CLEANUP' -Detail "deleted=$deletedPostJson; retentionDays=$($cfg.PostJsonRetentionDays)"
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Size-based rotation for the secondary log files (audit/slow/jobs). Their
+# primary log counterparts already rotate by date (LogSchedule), but these
+# are append-only single files with no built-in cap — left alone, an
+# attacker who can trigger AUTH_FAIL bursts (audit) or operators with a
+# very low SlowRequestThresholdMs (slow) could grow them without bound.
+# Rotation only at startup keeps the runtime write path branchless.
+# ---------------------------------------------------------------------------
+function Invoke-LogSizeRotation {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',
+        Justification = 'Internal helper; rotation is unconditional when the size threshold is met.')]
+    [OutputType([bool])]
+    param(
+        [string] $LogFile,
+        [long]   $MaxBytes,
+        [string] $LabelForLog
+    )
+    if ($MaxBytes -le 0 -or [string]::IsNullOrWhiteSpace($LogFile)) { return $false }
+    if (-not (Test-Path -LiteralPath $LogFile -PathType Leaf)) { return $false }
+    try {
+        $sz = (Get-Item -LiteralPath $LogFile).Length
+        if ($sz -ge $MaxBytes) {
+            $stamp   = Get-Date -Format 'yyyyMMdd-HHmmss'
+            $rotated = '{0}.{1}' -f $LogFile, $stamp
+            Move-Item -LiteralPath $LogFile -Destination $rotated -Force
+            Write-StartupLog "$LabelForLog rotated: $sz bytes >= $MaxBytes; archived as $rotated."
+            return $true
+        }
+    } catch {
+        Write-StartupLog "WARN: $LabelForLog rotation failed for '$LogFile': $($_.Exception.Message)"
+    }
+    return $false
+}
+
+if ($cfg.AuditLogEnabled) {
+    if (Invoke-LogSizeRotation -LogFile $cfg.AuditLogFile -MaxBytes $cfg.AuditLogMaxBytes -LabelForLog 'Audit log') {
+        # Write the rotation marker into the NEW (post-rotation) audit log so
+        # the trail can be cross-referenced with the .<timestamp> archive.
+        Write-AuditLog -EventName 'AUDIT_LOG_ROTATED' -Detail "maxBytes=$($cfg.AuditLogMaxBytes)"
+    }
+}
+if ($cfg.SlowRequestThresholdMs -gt 0) {
+    if ((Invoke-LogSizeRotation -LogFile $cfg.SlowLogFile -MaxBytes $cfg.SlowLogMaxBytes -LabelForLog 'Slow log') -and $cfg.AuditLogEnabled) {
+        Write-AuditLog -EventName 'SLOW_LOG_ROTATED' -Detail "maxBytes=$($cfg.SlowLogMaxBytes)"
+    }
+}
+if ($cfg.BackgroundJobs -and $cfg.BackgroundJobs.Count -gt 0) {
+    if ((Invoke-LogSizeRotation -LogFile $cfg.JobsLogFile -MaxBytes $cfg.JobsLogMaxBytes -LabelForLog 'Jobs log') -and $cfg.AuditLogEnabled) {
+        Write-AuditLog -EventName 'JOBS_LOG_ROTATED' -Detail "maxBytes=$($cfg.JobsLogMaxBytes)"
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -3043,6 +3219,9 @@ function Format-PromMetrics {
     if ($inFlight -lt 0) { $inFlight = 0 }
     $tableSize   = $script:rateLimitTable.Count
     $cacheSize   = $script:metadataCache.Count
+    $logDrops    = [System.Threading.Interlocked]::Read($script:logDropsTotal)
+    $auditDrops  = [System.Threading.Interlocked]::Read($script:auditLogDropsTotal)
+    $slowDrops   = [System.Threading.Interlocked]::Read($script:slowLogDropsTotal)
 
     $sb = [System.Text.StringBuilder]::new(1024)
     $null = $sb.AppendLine('# HELP posh_uptime_seconds Server uptime since process start.')
@@ -3063,6 +3242,15 @@ function Format-PromMetrics {
     $null = $sb.AppendLine('# HELP posh_script_metadata_cache_size Cached AST metadata entries.')
     $null = $sb.AppendLine('# TYPE posh_script_metadata_cache_size gauge')
     $null = $sb.AppendLine("posh_script_metadata_cache_size $cacheSize")
+    $null = $sb.AppendLine('# HELP posh_log_drops_total Log lines skipped because the request-log mutex was contended for >500ms.')
+    $null = $sb.AppendLine('# TYPE posh_log_drops_total counter')
+    $null = $sb.AppendLine("posh_log_drops_total $logDrops")
+    $null = $sb.AppendLine('# HELP posh_audit_log_drops_total Audit-log lines skipped because the audit mutex was contended for >500ms.')
+    $null = $sb.AppendLine('# TYPE posh_audit_log_drops_total counter')
+    $null = $sb.AppendLine("posh_audit_log_drops_total $auditDrops")
+    $null = $sb.AppendLine('# HELP posh_slow_log_drops_total Slow-log lines skipped because the request-log mutex was contended for >500ms.')
+    $null = $sb.AppendLine('# TYPE posh_slow_log_drops_total counter')
+    $null = $sb.AppendLine("posh_slow_log_drops_total $slowDrops")
     return $sb.ToString()
 }
 
@@ -3397,12 +3585,15 @@ $requestHandler = {
     # Live .NET objects were injected via InitialSessionState.Variables — plain names.
     # Map them to $script: scope so injected functions (Write-Log, Test-RateLimit, etc.)
     # can access them via $script:logMutex / $script:rateLimitTable etc.
-    $script:logMutex         = $logMutex
-    $script:auditMutex       = $auditMutex
-    $script:rateLimitTable   = $rateLimitTable
-    $script:metadataCache    = $metadataCache
-    $script:routeCache       = $routeCache
-    $script:rateLimitedTotal = $rateLimitedTotal
+    $script:logMutex            = $logMutex
+    $script:auditMutex          = $auditMutex
+    $script:rateLimitTable      = $rateLimitTable
+    $script:metadataCache       = $metadataCache
+    $script:routeCache          = $routeCache
+    $script:rateLimitedTotal    = $rateLimitedTotal
+    $script:logDropsTotal       = $logDropsTotal
+    $script:auditLogDropsTotal  = $auditLogDropsTotal
+    $script:slowLogDropsTotal   = $slowLogDropsTotal
     # $semaphore, $startTime, $requestsTotal are used directly (no $script: needed)
 
     try {
@@ -3659,10 +3850,16 @@ $requestHandler = {
             $uptimeStr   = '{0}h {1}m {2}s' -f $h, $m, $s
             $total       = [System.Threading.Interlocked]::Read($requestsTotal)
             $rateLimited = [System.Threading.Interlocked]::Read($script:rateLimitedTotal)
+            $logDrops    = [System.Threading.Interlocked]::Read($script:logDropsTotal)
+            $auditDrops  = [System.Threading.Interlocked]::Read($script:auditLogDropsTotal)
+            $slowDrops   = [System.Threading.Interlocked]::Read($script:slowLogDropsTotal)
             $body        = [ordered]@{
-                uptime           = $uptimeStr
-                requestsTotal    = $total
-                rateLimitedTotal = $rateLimited
+                uptime              = $uptimeStr
+                requestsTotal       = $total
+                rateLimitedTotal    = $rateLimited
+                logDropsTotal       = $logDrops
+                auditLogDropsTotal  = $auditDrops
+                slowLogDropsTotal   = $slowDrops
             } | ConvertTo-Json -Compress
             Send-Response -Response $resp -StatusCode 200 -Body $body -RequestId $requestId
             Write-Log -ClientIP $clientIP -Request $requestLine -Status 'METRICS' -ExitCode '-' -RequestId $requestId
@@ -4063,15 +4260,18 @@ $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefau
 # Plain variable names only — no scope qualifiers in SessionStateVariableEntry names.
 # The requestHandler maps them to $script: scope explicitly after startup.
 foreach ($entry in @(
-    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('semaphore',        $semaphore,                  $null),
-    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('startTime',        $startTime,                  $null),
-    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('requestsTotal',    $script:requestsTotal,       $null),
-    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('logMutex',         $script:logMutex,            $null),
-    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('auditMutex',       $script:auditMutex,          $null),
-    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('rateLimitTable',   $script:rateLimitTable,      $null),
-    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('rateLimitedTotal', $script:rateLimitedTotal,    $null),
-    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('metadataCache',    $script:metadataCache,       $null),
-    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('routeCache',       $script:routeCache,          $null)
+    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('semaphore',         $semaphore,                  $null),
+    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('startTime',         $startTime,                  $null),
+    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('requestsTotal',     $script:requestsTotal,       $null),
+    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('logMutex',          $script:logMutex,            $null),
+    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('auditMutex',        $script:auditMutex,          $null),
+    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('rateLimitTable',    $script:rateLimitTable,      $null),
+    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('rateLimitedTotal',  $script:rateLimitedTotal,    $null),
+    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('metadataCache',     $script:metadataCache,       $null),
+    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('routeCache',        $script:routeCache,          $null),
+    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('logDropsTotal',     $script:logDropsTotal,       $null),
+    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('auditLogDropsTotal',$script:auditLogDropsTotal,  $null),
+    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('slowLogDropsTotal', $script:slowLogDropsTotal,   $null)
 )) { $iss.Variables.Add($entry) }
 
 # RunspacePool max = MaxConcurrent * 2.
@@ -4096,26 +4296,34 @@ $bgJobInstances = [System.Collections.Generic.List[object]]::new()
 
 if ($cfg.BackgroundJobs -and $cfg.BackgroundJobs.Count -gt 0) {
     $bgScriptBlock = {
-        param([string] $Path, [int] $Interval, [string] $LogFile, [string] $PwshExeLocal)
+        param([string] $Path, [int] $Interval, [string] $LogFile, [string] $PwshExeLocal, [string] $MutexKey, [int] $MutexWaitMs)
 
         # Defensive: an empty $LogFile would silently swallow every write. Bail out so
         # the failure surfaces immediately. This also marks $LogFile as referenced at
         # the outer-block scope — PSScriptAnalyzer does not follow nested scriptblock
-        # closures and would otherwise flag the parameter as unused.
+        # closures and would otherwise flag the parameter as unused. Same trick for
+        # $MutexWaitMs (consumed by the nested $writeLog closure below).
         if ([string]::IsNullOrWhiteSpace($LogFile)) { return }
+        if ($MutexWaitMs -le 0) { $MutexWaitMs = 500 }
 
         # Named Mutex serialises all writes to JobsLogFile across the per-job runspaces.
-        # 'Global\' makes it visible to every process / runspace on the box. Acquired with
-        # a short WaitOne so a stuck holder cannot deadlock the job forever.
-        $jobsMutex = [System.Threading.Mutex]::new($false, 'Global\PoshWebserverJobsLog')
+        # 'Global\' makes it visible to every process / runspace on the box. Keyed on
+        # the JobsLogFile path hash (passed in as $MutexKey) so multi-instance posh
+        # deployments writing to different jobs.log files do not contend.
+        # Acquired with a short WaitOne so a stuck holder cannot deadlock the job forever.
+        $jobsMutex = [System.Threading.Mutex]::new($false, "Global\PoshWebserverJobsLog-$MutexKey")
 
         # Helper closure so each log call goes through the same mutex protocol.
+        # Drops the line on timeout — without holding the mutex, parallel writes
+        # would interleave bytes (cf. the request-log path).
         $writeLog = {
             param([string] $LogText)
             $acquired = $false
             try {
-                $acquired = $jobsMutex.WaitOne(500)
-                Add-Content -LiteralPath $LogFile -Value $LogText -Encoding UTF8
+                $acquired = $jobsMutex.WaitOne($MutexWaitMs)
+                if ($acquired) {
+                    Add-Content -LiteralPath $LogFile -Value $LogText -Encoding UTF8
+                }
             } catch { } finally {
                 try { if ($acquired) { $jobsMutex.ReleaseMutex() } } catch { }
             }
@@ -4168,6 +4376,13 @@ if ($cfg.BackgroundJobs -and $cfg.BackgroundJobs.Count -gt 0) {
         }
     }
 
+    # Stable 16-hex-char key per JobsLogFile path — used to namespace the
+    # jobs-log mutex so two posh instances writing to different jobs.log
+    # files don't share the same kernel object.
+    $jobsMutexKey = [System.BitConverter]::ToString(
+        [System.Security.Cryptography.SHA1]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$cfg.JobsLogFile).ToLowerInvariant()))
+    ).Replace('-', '').Substring(0, 16)
+
     foreach ($jobDef in $cfg.BackgroundJobs) {
         if (-not $jobDef.Path -or -not $jobDef.IntervalSec -or $jobDef.IntervalSec -le 0) {
             Write-StartupLog "WARN: skipping malformed BackgroundJob entry: $($jobDef | ConvertTo-Json -Compress)"
@@ -4182,7 +4397,7 @@ if ($cfg.BackgroundJobs -and $cfg.BackgroundJobs.Count -gt 0) {
             $rs.Open()
             $ps = [System.Management.Automation.PowerShell]::Create()
             $ps.Runspace = $rs
-            $null = $ps.AddScript($bgScriptBlock).AddArgument($jobDef.Path).AddArgument([int]$jobDef.IntervalSec).AddArgument($cfg.JobsLogFile).AddArgument($cfg.PwshExe)
+            $null = $ps.AddScript($bgScriptBlock).AddArgument($jobDef.Path).AddArgument([int]$jobDef.IntervalSec).AddArgument($cfg.JobsLogFile).AddArgument($cfg.PwshExe).AddArgument($jobsMutexKey).AddArgument([int]$cfg.LogMutexTimeoutMs)
             $handle = $ps.BeginInvoke()
             $null   = $bgJobInstances.Add([PSCustomObject]@{ Ps = $ps; Rs = $rs; Handle = $handle; Path = $jobDef.Path; Interval = $jobDef.IntervalSec })
             Write-StartupLog ("BackgroundJob started: {0} every {1}s" -f $jobDef.Path, $jobDef.IntervalSec)
