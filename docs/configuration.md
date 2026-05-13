@@ -46,6 +46,14 @@ $cfg = @{
     StaticCacheHeaders       = $true
     BlockedMimeTypes         = @()
     # MimeTypeMap left at defaults — ~50 entries covering text/web/image/audio/video/font/archive types
+    SessionEnabled           = $false
+    SessionCookieName        = 'POSH-Session-Id'
+    CorsAllowedOrigins       = @()
+    CorsAllowedMethods       = 'GET, POST, OPTIONS'
+    CorsAllowedHeaders       = 'X-Api-Key, Content-Type, Authorization'
+    CorsAllowCredentials     = $false
+    CorsMaxAgeSec            = 600
+    AcceptedContentTypes     = @('application/json', 'application/x-www-form-urlencoded')
 }
 ```
 
@@ -88,6 +96,14 @@ $cfg = @{
     DefaultDocuments         = @('index.html', 'index.htm', 'home.html')
     StaticCacheHeaders       = $true
     BlockedMimeTypes         = @('video/', 'audio/')
+    SessionEnabled           = $true
+    SessionCookieName        = 'POSH-Session-Id'
+    CorsAllowedOrigins       = @('https://app.example.com', 'https://admin.example.com')
+    CorsAllowedMethods       = 'GET, POST, OPTIONS'
+    CorsAllowedHeaders       = 'X-Api-Key, Content-Type, Authorization'
+    CorsAllowCredentials     = $true
+    CorsMaxAgeSec            = 600
+    AcceptedContentTypes     = @('application/json')   # narrow gate: JSON only, reject form-encoded
 }
 ```
 
@@ -159,6 +175,14 @@ These are passed on the command line when starting the server. `Register-Schedul
 | `StaticCacheHeaders` | `bool` | `$true` | Emit `ETag` and `Last-Modified` on static responses and honor `If-None-Match` / `If-Modified-Since` with HTTP 304. ETag format: `"<length>-<utcTicksHex>"`. Set to `$false` to disable caching headers entirely (every request gets a fresh 200). |
 | `BlockedMimeTypes` | `string[]` | `@()` | MIME-type blacklist for static responses — matched via `StartsWith` so `'video/'` blocks every video subtype. Matching entries trigger HTTP 403. Legacy PoSH Server "content filter" parity. |
 | `MimeTypeMap` | `hashtable` | ~50 entries | Map of file extension (lowercase, with leading dot — `'.png'`) to Content-Type string. Defaults cover the common web/image/audio/video/font/archive types. Unknown extensions fall back to `application/octet-stream`. Override entries by editing the hashtable directly in `Start-WebServer.ps1`. |
+| `SessionEnabled` | `bool` | `$false` | Auto-set an `HttpOnly` session cookie (`SessionCookieName`) when the request did not carry one. The value is a fresh GUID (32 hex chars, no dashes); `Secure` is added on HTTPS connections; `SameSite=Lax`. The server itself remains stateless — the cookie value is only forwarded to webroot scripts via the `POSH_SESSION_ID` env var so scripts can implement their own session logic. |
+| `SessionCookieName` | `string` | `'POSH-Session-Id'` | Name of the session cookie. Only consulted when `SessionEnabled = $true`. |
+| `CorsAllowedOrigins` | `string[]` | `@()` | List of allowed `Origin` values for CORS. Use `@('*')` for any origin (incompatible with `CorsAllowCredentials = $true` per CORS spec — when both are set, the actual origin is echoed back instead of `*`). Empty array = CORS disabled (default). |
+| `CorsAllowedMethods` | `string` | `'GET, POST, OPTIONS'` | Value of the `Access-Control-Allow-Methods` header sent on OPTIONS preflight responses. |
+| `CorsAllowedHeaders` | `string` | `'X-Api-Key, Content-Type, Authorization'` | Value of the `Access-Control-Allow-Headers` header sent on OPTIONS preflight responses. |
+| `CorsAllowCredentials` | `bool` | `$false` | Set `Access-Control-Allow-Credentials: true` when the request origin matches the allowlist. Browsers send cookies / `Authorization` only when this is enabled. Incompatible with `@('*')` per CORS spec. |
+| `CorsMaxAgeSec` | `integer` | `600` | Value of `Access-Control-Max-Age` on OPTIONS preflight responses — how long the browser may cache the preflight result. `0` omits the header entirely. |
+| `AcceptedContentTypes` | `string[]` | `@('application/json', 'application/x-www-form-urlencoded')` | Allowed POST `Content-Type` prefixes. Matched via `StartsWith`. Requests with a non-listed Content-Type receive HTTP 415. Narrow this list (e.g. to `@('application/json')`) to reject form-encoded bodies entirely. |
 
 ### Register-ScheduledTask.ps1 — Scheduled Task Options
 

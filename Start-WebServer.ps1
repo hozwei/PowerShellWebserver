@@ -208,6 +208,14 @@ $cfg = @{
         '.wasm' = 'application/wasm'
         '.map'  = 'application/json; charset=utf-8'
     }
+    SessionEnabled           = $false # auto-set a 'POSH-Session-Id' HttpOnly cookie when missing; cookie value is passed to webroot scripts via the POSH_COOKIES env var
+    SessionCookieName        = 'POSH-Session-Id'
+    CorsAllowedOrigins       = @()    # CORS: list of allowed Origin values, or @('*') for any origin; empty = CORS disabled (default)
+    CorsAllowedMethods       = 'GET, POST, OPTIONS'
+    CorsAllowedHeaders       = 'X-Api-Key, Content-Type, Authorization'
+    CorsAllowCredentials     = $false # set Access-Control-Allow-Credentials: true when an Origin is allowed (incompatible with '*' wildcard per CORS spec)
+    CorsMaxAgeSec            = 600    # value of the Access-Control-Max-Age header on preflight responses (how long the browser may cache the preflight result)
+    AcceptedContentTypes     = @('application/json', 'application/x-www-form-urlencoded') # POST body content types that pass the Get-BodyParams gate
 }
 
 # StaticRoot fallback — empty string means: reuse WebRoot. Resolved here rather than at
@@ -770,31 +778,43 @@ function Get-QueryParams {
 function Get-BodyParams {
     # Reads and validates the POST body.
     # Returns PSCustomObject { Error [int]; RawJson [string] }.
-    #   Error = 0   → valid; RawJson contains the raw UTF-8 body string.
-    #   Error = 415 → wrong Content-Type (must be application/json).
+    #   Error = 0   → valid; RawJson contains a UTF-8 JSON string ready to write to disk.
+    #   Error = 415 → Content-Type not in AcceptedContentTypes ('application/json' or 'application/x-www-form-urlencoded').
     #   Error = 413 → body exceeds MaxRequestBodyBytes.
-    #   Error = 400 → body is not valid JSON.
+    #   Error = 400 → body is not valid JSON (JSON path) or could not be parsed (form path).
     #
-    # No flat-structure validation — nested objects and arrays are fully supported.
-    # The raw JSON is written to a file by Save-PostJson; the script receives the
-    # file path via -JsonFilePath and reads/parses the JSON itself.
+    # JSON path: raw body forwarded verbatim — nested objects and arrays preserved.
+    # Form path: x-www-form-urlencoded body parsed into a flat object (or nested via 'key[]' arrays)
+    #            and re-serialised as JSON, so scripts get the same -JsonFilePath contract regardless
+    #            of how the client encoded the request.
     param([System.Net.HttpListenerRequest] $Request)
 
-    # Check Content-Type — must be application/json.
-    # StartsWith allows variants like "application/json; charset=utf-8".
     $ct = $Request.ContentType
-    if (-not $ct -or -not $ct.StartsWith('application/json', [System.StringComparison]::OrdinalIgnoreCase)) {
+    if (-not $ct) {
+        return [PSCustomObject]@{ Error = 415; RawJson = $null }
+    }
+
+    $isJson = $ct.StartsWith('application/json',                  [System.StringComparison]::OrdinalIgnoreCase)
+    $isForm = $ct.StartsWith('application/x-www-form-urlencoded', [System.StringComparison]::OrdinalIgnoreCase)
+
+    # Honor $cfg.AcceptedContentTypes — operators can narrow the gate (e.g. JSON-only) without
+    # touching this function. Empty list = accept whatever this function knows how to parse.
+    if ($script:cfg.AcceptedContentTypes -and $script:cfg.AcceptedContentTypes.Count -gt 0) {
+        $matched = $false
+        foreach ($prefix in $script:cfg.AcceptedContentTypes) {
+            if ($ct.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) { $matched = $true; break }
+        }
+        if (-not $matched) { return [PSCustomObject]@{ Error = 415; RawJson = $null } }
+    } elseif (-not ($isJson -or $isForm)) {
         return [PSCustomObject]@{ Error = 415; RawJson = $null }
     }
 
     # Check body size before reading — ContentLength64 is -1 when no Content-Length header is set.
-    # Only reject when size is known AND too large — unknown size is checked after reading.
     if ($Request.ContentLength64 -gt $script:cfg.MaxRequestBodyBytes) {
         return [PSCustomObject]@{ Error = 413; RawJson = $null }
     }
 
     # Read body — leaveOpen=$true keeps InputStream alive (owned by HttpListenerRequest).
-    # The StreamReader wrapper itself is disposed explicitly after reading.
     $reader = [System.IO.StreamReader]::new($Request.InputStream, [System.Text.Encoding]::UTF8, $true, -1, $true)
     try {
         $rawBody = $reader.ReadToEnd()
@@ -802,25 +822,71 @@ function Get-BodyParams {
         $reader.Dispose()
     }
 
-    # Check size again in case Content-Length was missing.
     if ($rawBody.Length -gt $script:cfg.MaxRequestBodyBytes) {
         return [PSCustomObject]@{ Error = 413; RawJson = $null }
     }
 
-    # Empty body — treat as empty JSON object so the script receives an empty file.
     if ([string]::IsNullOrWhiteSpace($rawBody)) {
         return [PSCustomObject]@{ Error = 0; RawJson = '{}' }
     }
 
-    # Validate JSON syntax — reject syntactically invalid payloads early.
-    # Nested objects and arrays are intentionally allowed.
+    if ($isJson) {
+        try {
+            $null = $rawBody | ConvertFrom-Json -ErrorAction Stop
+        } catch {
+            return [PSCustomObject]@{ Error = 400; RawJson = $null }
+        }
+        return [PSCustomObject]@{ Error = 0; RawJson = $rawBody }
+    }
+
+    # Form-URL-encoded path.
+    # 'key=value&key2=value2' → flat object { key: 'value', key2: 'value2' }
+    # 'tags[]=a&tags[]=b'     → { tags: ['a', 'b'] }
+    # Multiple plain occurrences of the same key (without '[]') collapse into an array as well.
     try {
-        $null = $rawBody | ConvertFrom-Json -ErrorAction Stop
+        $obj = [ordered]@{}
+        foreach ($pair in $rawBody.Split('&', [System.StringSplitOptions]::RemoveEmptyEntries)) {
+            $eqIx = $pair.IndexOf('=')
+            if ($eqIx -lt 0) {
+                $rawKey = $pair
+                $rawVal = ''
+            } else {
+                $rawKey = $pair.Substring(0, $eqIx)
+                $rawVal = $pair.Substring($eqIx + 1)
+            }
+            # WebUtility handles '+' as space and standard percent-encoding.
+            $key = [System.Net.WebUtility]::UrlDecode($rawKey)
+            $val = [System.Net.WebUtility]::UrlDecode($rawVal)
+            if ([string]::IsNullOrEmpty($key)) { continue }
+
+            $isArrayKey = $false
+            if ($key.EndsWith('[]')) {
+                $isArrayKey = $true
+                $key = $key.Substring(0, $key.Length - 2)
+            }
+            if ($obj.Contains($key)) {
+                $existing = $obj[$key]
+                if ($existing -is [System.Collections.IList]) {
+                    $null = $existing.Add($val)
+                } else {
+                    $list = [System.Collections.Generic.List[string]]::new()
+                    $null = $list.Add([string]$existing)
+                    $null = $list.Add($val)
+                    $obj[$key] = $list
+                }
+            } elseif ($isArrayKey) {
+                $list = [System.Collections.Generic.List[string]]::new()
+                $null = $list.Add($val)
+                $obj[$key] = $list
+            } else {
+                $obj[$key] = $val
+            }
+        }
+        $json = $obj | ConvertTo-Json -Compress -Depth 5
+        return [PSCustomObject]@{ Error = 0; RawJson = $json }
     } catch {
         return [PSCustomObject]@{ Error = 400; RawJson = $null }
     }
-
-    return [PSCustomObject]@{ Error = 0; RawJson = $rawBody }
 }
 
 # ---------------------------------------------------------------------------
@@ -844,6 +910,75 @@ function Save-PostJson {
     $filePath = Join-Path $script:cfg.PostJsonDir $fileName
     [System.IO.File]::WriteAllText($filePath, $RawJson, [System.Text.Encoding]::UTF8)
     return $filePath
+}
+
+# ---------------------------------------------------------------------------
+# CORS helpers
+# Add-CorsHeaders inspects the incoming Origin and, if it matches CorsAllowedOrigins
+# (or '*' is in the list), writes Access-Control-Allow-Origin and the Vary header.
+# Returns the matched origin string (or '*' for wildcard mode) so the OPTIONS preflight
+# handler can attach the full ACL header set; returns $null when the request is not
+# eligible for CORS treatment (origin missing or not allowlisted).
+#
+# 'null'-origin handling: a literal "Origin: null" header is allowed only when '*' is
+# in the allowlist — same behavior as most production servers.
+# ---------------------------------------------------------------------------
+function Add-CorsHeaders {
+    param(
+        [System.Net.HttpListenerRequest]  $Request,
+        [System.Net.HttpListenerResponse] $Response
+    )
+    if (-not $script:cfg.CorsAllowedOrigins -or $script:cfg.CorsAllowedOrigins.Count -eq 0) { return $null }
+
+    $origin = $Request.Headers['Origin']
+    if ([string]::IsNullOrEmpty($origin)) { return $null }
+
+    $matchedOrigin = $null
+    if ($script:cfg.CorsAllowedOrigins -contains '*') {
+        # Wildcard: echo back the actual origin when credentials are allowed (spec forbids '*' + credentials);
+        # echo '*' otherwise so caches don't fragment by origin.
+        if ($script:cfg.CorsAllowCredentials) { $matchedOrigin = $origin } else { $matchedOrigin = '*' }
+    } elseif ($script:cfg.CorsAllowedOrigins -contains $origin) {
+        $matchedOrigin = $origin
+    }
+    if ($null -eq $matchedOrigin) { return $null }
+
+    $Response.AddHeader('Access-Control-Allow-Origin', $matchedOrigin)
+    $Response.AddHeader('Vary',                        'Origin')
+    if ($script:cfg.CorsAllowCredentials -and $matchedOrigin -ne '*') {
+        $Response.AddHeader('Access-Control-Allow-Credentials', 'true')
+    }
+    return $matchedOrigin
+}
+
+# ---------------------------------------------------------------------------
+# Send-CorsPreflight
+# Handles an OPTIONS preflight: writes the CORS response headers (methods,
+# headers, max-age) and returns HTTP 204. Skipped (returns $false) when the
+# request is not CORS-eligible — caller is responsible for the fallback path.
+# ---------------------------------------------------------------------------
+function Send-CorsPreflight {
+    param(
+        [System.Net.HttpListenerRequest]  $Request,
+        [System.Net.HttpListenerResponse] $Response,
+        [string]                          $RequestId
+    )
+    $origin = Add-CorsHeaders -Request $Request -Response $Response
+    if ($null -eq $origin) { return $false }
+
+    # Echo the requested ACL-Request-Method/-Headers when the operator left the
+    # global defaults at allow-all; otherwise stick to the configured static list.
+    $Response.AddHeader('Access-Control-Allow-Methods', $script:cfg.CorsAllowedMethods)
+    $Response.AddHeader('Access-Control-Allow-Headers', $script:cfg.CorsAllowedHeaders)
+    if ($script:cfg.CorsMaxAgeSec -gt 0) {
+        $Response.AddHeader('Access-Control-Max-Age',  [string]$script:cfg.CorsMaxAgeSec)
+    }
+    if ($RequestId) { $Response.AddHeader('X-Request-Id', $RequestId) }
+
+    $Response.StatusCode      = 204
+    $Response.ContentLength64 = 0
+    try { $Response.OutputStream.Close() } catch { }
+    return $true
 }
 
 # ---------------------------------------------------------------------------
@@ -1053,7 +1188,8 @@ function Invoke-Script {
         [string]    $ScriptPath,
         [hashtable] $Params,
         [int]       $TimeoutSec,
-        [string]    $JsonFilePath = ''  # when set: passed as -JsonFilePath to the script (POST requests)
+        [string]    $JsonFilePath = '',  # when set: passed as -JsonFilePath to the script (POST requests)
+        [hashtable] $EnvVars      = $null # extra environment variables (POSH_COOKIES, POSH_HEADERS_JSON, …) — child process inherits them
     )
 
     # pwsh.exe as a separate process — the only reliable method to:
@@ -1071,6 +1207,15 @@ function Invoke-Script {
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError  = $true
     $psi.CreateNoWindow         = $true
+
+    # Inject per-request environment variables for the child pwsh.exe. Touching
+    # psi.Environment forces .NET to materialise the parent env block, so we only
+    # do it when the caller asked for extras — keeps the hot path zero-cost.
+    if ($null -ne $EnvVars -and $EnvVars.Count -gt 0) {
+        foreach ($k in $EnvVars.Keys) {
+            $psi.Environment[$k] = [string]$EnvVars[$k]
+        }
+    }
 
     foreach ($arg in @('-NonInteractive', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $ScriptPath)) {
         $null = $psi.ArgumentList.Add($arg)
@@ -1263,6 +1408,8 @@ $shared = @{
     FnRateLimit      = ${function:Test-RateLimit}
     FnGetMime        = ${function:Get-MimeType}
     FnSendStatic     = ${function:Send-StaticFile}
+    FnAddCors        = ${function:Add-CorsHeaders}
+    FnCorsPreflight  = ${function:Send-CorsPreflight}
 }
 
 # ---------------------------------------------------------------------------
@@ -1291,6 +1438,8 @@ $requestHandler = {
     ${function:Test-RateLimit}   = $shared.FnRateLimit
     ${function:Get-MimeType}     = $shared.FnGetMime
     ${function:Send-StaticFile}  = $shared.FnSendStatic
+    ${function:Add-CorsHeaders}  = $shared.FnAddCors
+    ${function:Send-CorsPreflight} = $shared.FnCorsPreflight
     $script:cfg              = $shared.Cfg
 
     # Live .NET objects were injected via InitialSessionState.Variables — plain names.
@@ -1320,6 +1469,27 @@ $requestHandler = {
         $requestId = [Guid]::NewGuid().ToString('N').Substring(0, 8)
 
         # --------------------------------------------------------------
+        # CORS preflight — OPTIONS is the only method besides GET/POST that the server
+        # answers, and only when the request actually carries an Origin allowlisted in
+        # CorsAllowedOrigins. Preflight short-circuits before auth and rate-limiting
+        # so browsers can negotiate without an API key.
+        # --------------------------------------------------------------
+        if ($req.HttpMethod -eq 'OPTIONS') {
+            $corsAllowed = $script:cfg.CorsAllowedOrigins -and $script:cfg.CorsAllowedOrigins.Count -gt 0
+            if ($corsAllowed) {
+                if (Send-CorsPreflight -Request $req -Response $resp -RequestId $requestId) {
+                    Write-Log -ClientIP $clientIP -Request $requestLine -Status 'CORS PREFLIGHT' -ExitCode '-' -RequestId $requestId
+                    return
+                }
+            }
+            $body = New-JsonResponse -ExitCode 405 -Output '' -Err 'Method not allowed.'
+            $resp.AddHeader('Allow', 'GET, POST')
+            Send-Response -Response $resp -StatusCode 405 -Body $body -RequestId $requestId
+            Write-Log -ClientIP $clientIP -Request $requestLine -Status 'METHOD NOT ALLOWED' -ExitCode '-' -RequestId $requestId
+            return
+        }
+
+        # --------------------------------------------------------------
         # Only GET and POST are allowed — all other methods are rejected.
         # --------------------------------------------------------------
         if ($req.HttpMethod -ne 'GET' -and $req.HttpMethod -ne 'POST') {
@@ -1328,6 +1498,37 @@ $requestHandler = {
             Send-Response -Response $resp -StatusCode 405 -Body $body -RequestId $requestId
             Write-Log -ClientIP $clientIP -Request $requestLine -Status 'METHOD NOT ALLOWED' -ExitCode '-' -RequestId $requestId
             return
+        }
+
+        # --------------------------------------------------------------
+        # CORS headers for non-preflight requests — added once here so every
+        # subsequent Send-Response carries them (including auth failures).
+        # --------------------------------------------------------------
+        $null = Add-CorsHeaders -Request $req -Response $resp
+
+        # --------------------------------------------------------------
+        # Cookie / Session — opt-in via SessionEnabled. When the client did not
+        # send a SessionCookieName cookie, a new GUID-based ID is minted and
+        # echoed back via Set-Cookie. The cookie value (or the entire Cookie
+        # header) is forwarded to webroot scripts via the POSH_SESSION_ID /
+        # POSH_COOKIES env vars so scripts can implement their own session
+        # logic — the server itself remains stateless.
+        # --------------------------------------------------------------
+        $rawCookieHeader = $req.Headers['Cookie']
+        $sessionId       = $null
+        if ($script:cfg.SessionEnabled) {
+            $existingSid = $null
+            try {
+                $sessionCookie = $req.Cookies[$script:cfg.SessionCookieName]
+                if ($null -ne $sessionCookie) { $existingSid = $sessionCookie.Value }
+            } catch { }
+            if ([string]::IsNullOrEmpty($existingSid)) {
+                $sessionId = [Guid]::NewGuid().ToString('N')
+                $secureAttr = if ($req.IsSecureConnection) { '; Secure' } else { '' }
+                $resp.AddHeader('Set-Cookie', ('{0}={1}; Path=/; HttpOnly; SameSite=Lax{2}' -f $script:cfg.SessionCookieName, $sessionId, $secureAttr))
+            } else {
+                $sessionId = $existingSid
+            }
         }
 
         # --------------------------------------------------------------
@@ -1566,11 +1767,23 @@ $requestHandler = {
 
             # Write body to file — script receives path via -JsonFilePath.
             $jsonFilePath = Save-PostJson -RawJson $bodyResult.RawJson -RequestId $requestId
-            $result = Invoke-Script -ScriptPath $resolvedPath -Params @{} -TimeoutSec $script:cfg.ScriptTimeoutSec -JsonFilePath $jsonFilePath
+
+            # Build per-request env vars for the child pwsh.exe. Only populated when something
+            # actually changes from the parent environment — keeps the hot path zero-cost.
+            $scriptEnvVars = @{}
+            if (-not [string]::IsNullOrEmpty($rawCookieHeader)) { $scriptEnvVars['POSH_COOKIES']    = $rawCookieHeader }
+            if (-not [string]::IsNullOrEmpty($sessionId))       { $scriptEnvVars['POSH_SESSION_ID'] = $sessionId }
+
+            $result = Invoke-Script -ScriptPath $resolvedPath -Params @{} -TimeoutSec $script:cfg.ScriptTimeoutSec -JsonFilePath $jsonFilePath -EnvVars $scriptEnvVars
         } else {
             # GET: pass query string key/value pairs as named arguments.
-            $scriptParams = Get-QueryParams -QueryString $req.QueryString
-            $result = Invoke-Script -ScriptPath $resolvedPath -Params $scriptParams -TimeoutSec $script:cfg.ScriptTimeoutSec
+            $scriptParams  = Get-QueryParams -QueryString $req.QueryString
+
+            $scriptEnvVars = @{}
+            if (-not [string]::IsNullOrEmpty($rawCookieHeader)) { $scriptEnvVars['POSH_COOKIES']    = $rawCookieHeader }
+            if (-not [string]::IsNullOrEmpty($sessionId))       { $scriptEnvVars['POSH_SESSION_ID'] = $sessionId }
+
+            $result = Invoke-Script -ScriptPath $resolvedPath -Params $scriptParams -TimeoutSec $script:cfg.ScriptTimeoutSec -EnvVars $scriptEnvVars
         }
 
         # Script request completed — increment counter atomically (thread-safe).
