@@ -121,6 +121,12 @@ function Test-PoshAuth {
             return $false
         }
     }
+    # Reset on successful auth: AuthFails is a lifetime counter and the editor
+    # self-terminates at MaxAuthFails. Without a reset, an operator's stray
+    # bookmark-without-cookie click — over weeks of editor lifetime — accumulates
+    # toward the lockout. Genuine brute-force attempts arrive in seconds, not
+    # weeks, so resetting on success preserves the lockout's actual purpose.
+    $s.AuthFails = 0
     return $true
 }
 

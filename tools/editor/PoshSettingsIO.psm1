@@ -1080,6 +1080,15 @@ function Save-PoshFieldChanges {
             'config.psd1'    { $s.ConfigPsd1 }
             default          { throw "Unsupported file in schema: $file" }
         }
+        # Capture the pre-edit content so we can roll back on partial failure.
+        # Backup-PoshFile creates the on-disk .bak but doesn't return content;
+        # an in-memory snapshot guarantees the rollback even if .bak rotation
+        # is misconfigured.
+        $preEdit = $null
+        if (Test-Path -LiteralPath $abs -PathType Leaf) {
+            try { $preEdit = [System.IO.File]::ReadAllText($abs) } catch { $preEdit = $null }
+        }
+        $bk = $null
         if ($PSCmdlet.ShouldProcess($abs, "Backup before edit")) {
             $bk = Backup-PoshFile -FilePath $abs
             if ($bk) { $null = $backups.Add($bk) }
@@ -1094,9 +1103,14 @@ function Save-PoshFieldChanges {
                     Set-PoshConfigKey -Key $field.Name -Value $typed -Type $field.Type
                 }
             } catch {
-                # Wrap with the file + key so the editor's toast tells the
-                # operator exactly where the save broke instead of just
-                # "Save failed: <inner exception>".
+                # Atomic rollback: an N-key batch must be all-or-nothing. Without
+                # this, a 3rd-of-5 failure leaves keys 1-2 written and 4-5 untouched —
+                # operator sees a generic toast and a half-applied config. Restore
+                # the pre-batch snapshot so the file is exactly as it was before
+                # this save started.
+                if ($null -ne $preEdit) {
+                    try { [System.IO.File]::WriteAllText($abs, $preEdit) } catch { }
+                }
                 throw ("{0}: writing '{1}' failed -> {2}" -f $file, $field.Name, $_.Exception.Message)
             }
         }

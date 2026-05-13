@@ -4684,22 +4684,38 @@ $requestHandler = {
         # Captured placeholder values flow into $scriptParams below.
         # --------------------------------------------------------------
         $routePlaceholders = $null
+        $routeReassigned   = $false
         if ($null -ne $routedFromPath) {
             # Pre-resolved from the no-script-extension path above; bypass the
             # exact-match Test-Path step (path came from file enumeration).
             $resolvedPath = $routedFromPath.ScriptPath
             $routePlaceholders = $routedFromPath.Placeholders
+            $routeReassigned = $true
         } elseif (-not (Test-Path -LiteralPath $resolvedPath -PathType Leaf)) {
             $routed = Resolve-RoutedScript -UrlPath $urlPath
             if ($null -ne $routed) {
                 $resolvedPath = $routed.ScriptPath
                 $routePlaceholders = $routed.Placeholders
+                $routeReassigned = $true
             } else {
                 $body = New-JsonResponse -ExitCode 404 -Output '' -Err "Script not found: $urlPath"
                 Send-Response -Response $resp -StatusCode 404 -Body $body -RequestId $requestId
                 Write-Log -ClientIP $clientIP -Request $requestLine -Status 'NOT FOUND' -ExitCode '-' -RequestId $requestId
                 return
             }
+        }
+        # If the route table reassigned $resolvedPath, the earlier reparse-point
+        # check (line ~4672) ran against the LITERAL URL→path mapping, not the
+        # routed path. Re-check now so a symlink at e.g. webroot/users/[id].ps1
+        # cannot be executed via /users/123 (which Resolve-RoutedScript would
+        # match). Containment is implicit: Resolve-RoutedScript only returns
+        # paths from a webroot file enumeration, but the reparse attribute is
+        # the part we actually care about.
+        if ($routeReassigned -and (Test-PathContainsReparsePoint -FullPath $resolvedPath -RootFull $webrootFull)) {
+            $body = New-JsonResponse -ExitCode 403 -Output '' -Err 'Access denied.'
+            Send-Response -Response $resp -StatusCode 403 -Body $body -RequestId $requestId
+            Write-Log -ClientIP $clientIP -Request $requestLine -Status 'FORBIDDEN' -ExitCode '-' -RequestId $requestId
+            return
         }
 
         # --------------------------------------------------------------
