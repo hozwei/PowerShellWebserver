@@ -42,8 +42,11 @@
                 --warn-bd:    #9e6a03;
                 --warn-fg:    #d29922;
                 --field-disabled-bg: #1a1f26;
+                /* Tells the browser to draw native form-control chrome
+                   in dark mode — without this, the date/select dropdowns,
+                   number-input spinners and scrollbars stay light. */
+                color-scheme: dark;
             }
-            color-scheme: dark;
         }
         * { box-sizing: border-box; }
         body {
@@ -109,6 +112,7 @@
             border-radius: 6px;
             font: inherit;
             background: var(--panel);
+            color: var(--text);
         }
         .field input:focus, .field select:focus, .field textarea:focus {
             outline: 2px solid var(--accent-dim);
@@ -238,7 +242,7 @@
         .setup-card h3 { margin: 0 0 8px; font-size: 16px; }
         .setup-card p  { margin: 0 0 12px; color: var(--muted); }
         .setup-card .row { display: flex; gap: 8px; align-items: center; }
-        .setup-card .row input { flex: 1; padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px; font: inherit; }
+        .setup-card .row input { flex: 1; padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px; font: inherit; background: var(--panel); color: var(--text); }
 
         .badge {
             display: inline-block;
@@ -299,6 +303,8 @@
             border-radius: 6px;
             font: inherit;
             margin-top: 4px;
+            background: var(--panel);
+            color: var(--text);
         }
 
         /* Keymap fields span the full content width — the right column of
