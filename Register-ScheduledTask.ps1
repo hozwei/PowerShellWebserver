@@ -111,6 +111,45 @@ function Get-CleanThumbprint {
 }
 
 # ---------------------------------------------------------------------------
+# Helper: update one top-level key in config.psd1 via the PowerShell AST.
+# Preserves all surrounding comments and whitespace — the only thing that
+# changes is the value of <Key>. Mirrors the editor's IO logic but stays
+# inline so the installer does not depend on the editor module.
+# ---------------------------------------------------------------------------
+function Update-PoshConfigKey {
+    param(
+        [Parameter(Mandatory)] [string] $ConfigFile,
+        [Parameter(Mandatory)] [string] $Key,
+        [Parameter(Mandatory)] $Value,
+        [Parameter(Mandatory)] [ValidateSet('int','bool','string')] [string] $Type
+    )
+    if (-not (Test-Path -LiteralPath $ConfigFile -PathType Leaf)) {
+        throw "config.psd1 not found at $ConfigFile"
+    }
+    $literal = switch ($Type) {
+        'int'    { [string][int]$Value }
+        'bool'   { if ($Value) { '$true' } else { '$false' } }
+        'string' { "'" + ([string]$Value -replace "'", "''") + "'" }
+    }
+    $errs = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($ConfigFile, [ref]$null, [ref]$errs)
+    if ($errs -and $errs.Count -gt 0) {
+        throw "config.psd1 at $ConfigFile has parse errors — fix manually first."
+    }
+    $hashes = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.HashtableAst] }, $true)
+    if ($hashes.Count -eq 0) { throw "config.psd1 contains no hashtable literal" }
+    $pair = $hashes[0].KeyValuePairs | Where-Object {
+        $_.Item1 -is [System.Management.Automation.Language.StringConstantExpressionAst] -and
+        $_.Item1.Value -eq $Key
+    } | Select-Object -First 1
+    if (-not $pair) { throw "Key '$Key' not found at top level of config.psd1" }
+    $extent  = $pair.Item2.Extent
+    $content = [System.IO.File]::ReadAllText($ConfigFile)
+    $newContent = $content.Substring(0, $extent.StartOffset) + $literal + $content.Substring($extent.EndOffset)
+    [System.IO.File]::WriteAllText($ConfigFile, $newContent, [System.Text.UTF8Encoding]::new($false))
+}
+
+# ---------------------------------------------------------------------------
 # Header
 # ---------------------------------------------------------------------------
 Write-Output ''
@@ -510,23 +549,14 @@ if (-not (Test-Path -LiteralPath $pwshExe -PathType Leaf)) {
 }
 
 # ---------------------------------------------------------------------------
-# Build task action arguments
-# Start-WebServer.ps1 receives all relevant parameters directly.
-# -HttpsEnabled as a switch: just specify it, no ':$true' needed.
-# -HttpPort 0 signals: HTTP disabled.
+# Build task action arguments.
+# Port + HTTPS settings are NOT passed on the command line — they live in
+# config.psd1 and the server reads them from there. Keeping them out of
+# the task action means a later "edit config.psd1, restart task" workflow
+# does the right thing without re-running Register-ScheduledTask.ps1.
 # ---------------------------------------------------------------------------
 $scriptArgs = '-NonInteractive -NoProfile -ExecutionPolicy Bypass'
 $scriptArgs += " -File `"$SCRIPT_PATH`""
-$scriptArgs += " -HttpPort $httpPort"
-
-if ($httpsEnabled) {
-    $scriptArgs += ' -HttpsEnabled'
-    $scriptArgs += " -HttpsPort $httpsPort"
-    if ($httpDisabled) {
-        # HttpPort 0 = HTTP disabled — guard in Start-WebServer.ps1: if ($HttpPort -gt 0)
-        $scriptArgs = $scriptArgs -replace "-HttpPort $httpPort", '-HttpPort 0'
-    }
-}
 
 # ---------------------------------------------------------------------------
 # Task components
@@ -570,22 +600,21 @@ try {
     Write-Output ''
 
     # ------------------------------------------------------------------
-    # config.psd1 is mandatory at server start — generate one from the
-    # inline $cfg defaults if the deployment directory does not already
-    # have a personalised file. tools\Initialize-Config.ps1 is the only
-    # supported way to seed it; it asks Start-WebServer.ps1 for its
-    # current defaults via -DumpConfig and writes a grouped, human-
-    # readable psd1.
+    # config.psd1 is the runtime source of truth for ports + HTTPS.
+    # Generate it from inline defaults if missing, then write the values
+    # the operator just typed into the file so a later restart of the
+    # task picks them up — without us having to bake them into the task
+    # action and shadow the file.
     # ------------------------------------------------------------------
     $configFile       = Join-Path $baseDir 'config.psd1'
     $initConfigScript = Join-Path $baseDir 'tools\Initialize-Config.ps1'
+    $configReady      = $false
     if (Test-Path -LiteralPath $configFile -PathType Leaf) {
-        Write-Output "config.psd1  : exists ($configFile) — keeping as-is."
-        Write-Output ''
+        $configReady = $true
+        Write-Output "config.psd1  : exists ($configFile) — updating with new port settings."
     } elseif (-not (Test-Path -LiteralPath $initConfigScript -PathType Leaf)) {
         Write-Output "WARNING: tools\Initialize-Config.ps1 not found at $initConfigScript."
         Write-Output '         Server will hard-fail at startup until you create config.psd1 manually.'
-        Write-Output ''
     } else {
         Write-Output 'Generating config.psd1 from inline defaults...'
         & $initConfigScript -ServerScript $SCRIPT_PATH -OutputFile $configFile
@@ -593,9 +622,27 @@ try {
             Write-Output ''
             Write-Output "WARNING: Initialize-Config.ps1 exited with code $LASTEXITCODE."
             Write-Output '         Server will hard-fail at startup until config.psd1 is fixed or regenerated.'
+        } else {
+            $configReady = $true
         }
-        Write-Output ''
     }
+    if ($configReady) {
+        # HttpPort 0 in config.psd1 means "HTTP disabled" — same convention as the CLI.
+        $effectiveHttpPort = if ($httpsEnabled -and $httpDisabled) { 0 } else { $httpPort }
+        try {
+            Update-PoshConfigKey -ConfigFile $configFile -Key 'HttpPort'     -Value $effectiveHttpPort -Type int
+            Update-PoshConfigKey -ConfigFile $configFile -Key 'HttpsPort'    -Value $httpsPort         -Type int
+            Update-PoshConfigKey -ConfigFile $configFile -Key 'HttpsEnabled' -Value ([bool]$httpsEnabled) -Type bool
+            Write-Output "  HttpPort     -> $effectiveHttpPort"
+            Write-Output "  HttpsPort    -> $httpsPort"
+            Write-Output "  HttpsEnabled -> $([bool]$httpsEnabled)"
+        } catch {
+            Write-Output ''
+            Write-Output "WARNING: could not update config.psd1: $_"
+            Write-Output '         Edit the file by hand or re-run tools\Edit-PoshSettings.ps1.'
+        }
+    }
+    Write-Output ''
 
     # Network configuration summary
     Write-Output 'Network configuration:'

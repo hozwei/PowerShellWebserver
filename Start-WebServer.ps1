@@ -58,7 +58,12 @@ param(
     # JSON to stdout, then exit 0. Used by tools\Initialize-Config.ps1 to seed a
     # fresh config.psd1 without running the listener. Skips POSH_API_KEY and
     # external-config checks because the dump only consumes inline defaults.
-    [switch] $DumpConfig
+    [switch] $DumpConfig,
+    # Internal: dump the EFFECTIVE $cfg AFTER merging config.psd1 and re-
+    # applying any explicit CLI overrides. Useful for debugging and for
+    # automated tests of the merge precedence. Still requires config.psd1
+    # because the merge depends on it; skips POSH_API_KEY only.
+    [switch] $DumpEffectiveConfig
 )
 
 # ---------------------------------------------------------------------------
@@ -99,7 +104,7 @@ $ErrorActionPreference = 'Continue'
 # No key = no start — unprotected operation is not permitted.
 # ---------------------------------------------------------------------------
 $apiKey = $env:POSH_API_KEY
-if ([string]::IsNullOrEmpty($apiKey) -and -not $DumpConfig) {
+if ([string]::IsNullOrEmpty($apiKey) -and -not $DumpConfig -and -not $DumpEffectiveConfig) {
     $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | STARTUP | ERROR: Environment variable POSH_API_KEY is not set. Server will not start."
     try {
         if (-not (Test-Path $baseDir)) { $null = New-Item -ItemType Directory -Path $baseDir -Force }
@@ -359,6 +364,22 @@ if ($null -ne $external) {
 }
 
 # ---------------------------------------------------------------------------
+# CLI-explicit parameters win over config.psd1. Param defaults (80, 443,
+# switch:off) DO NOT override file values — only values the caller put on
+# the command line. $PSBoundParameters distinguishes "default" from
+# "explicitly passed" without us tracking it ourselves.
+#
+# Without this re-apply step, `Start-WebServer.ps1 -HttpPort 8080` would
+# silently fall back to whatever HttpPort is in config.psd1 because the
+# foreach($external.Keys) above runs last. We discovered this the hard
+# way: the Scheduled Task action carries -HttpPort 8080 but config.psd1
+# still says 80 → server bound to 80.
+# ---------------------------------------------------------------------------
+if ($PSBoundParameters.ContainsKey('HttpPort'))     { $cfg.HttpPort     = $HttpPort }
+if ($PSBoundParameters.ContainsKey('HttpsPort'))    { $cfg.HttpsPort    = $HttpsPort }
+if ($PSBoundParameters.ContainsKey('HttpsEnabled')) { $cfg.HttpsEnabled = $HttpsEnabled.IsPresent }
+
+# ---------------------------------------------------------------------------
 # API-Keys BC fallback — if the operator did not populate ApiKeys via the
 # external config, lift the legacy single $cfg.ApiKey into ApiKeys under the
 # 'default' label so the auth path can use one uniform lookup.
@@ -372,6 +393,13 @@ if (-not $cfg.ApiKeys -or $cfg.ApiKeys.Count -eq 0) {
 # Apply derived-field fallbacks AFTER the external psd1 has merged so file
 # overrides on WebRoot / LogDir flow into ErrorPagesRoot / JobsLogFile / etc.
 Set-CfgDerivedDefaults -Cfg $cfg
+
+# -DumpEffectiveConfig stops here, after config.psd1 + CLI overrides + the
+# second derived-defaults pass. The output is what the listener WOULD use.
+if ($DumpEffectiveConfig) {
+    $cfg | ConvertTo-Json -Depth 20 -Compress
+    exit 0
+}
 
 # Runtime measurement from server start — used for health check uptime.
 $startTime = [System.Diagnostics.Stopwatch]::StartNew()
