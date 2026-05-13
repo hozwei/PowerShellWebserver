@@ -504,36 +504,36 @@ function Test-PoshFieldValue {
             $s = if ($null -eq $Value) { '' } else { [string]$Value }
             if ($Field.ContainsKey('Validator') -and $Field.Validator) {
                 if ($s -notmatch $Field.Validator) {
-                    return "Wert entspricht nicht dem erwarteten Format ($($Field.Validator))"
+                    return "Value does not match the expected format ($($Field.Validator))"
                 }
             }
             return $null
         }
         'enum' {
             $s = [string]$Value
-            if (-not $Field.ContainsKey('Choices')) { return "Schema-Fehler: 'Choices' fehlt für $($Field.Name)" }
+            if (-not $Field.ContainsKey('Choices')) { return "Schema error: 'Choices' missing for $($Field.Name)" }
             # -in is case-insensitive for strings in PowerShell. Match the
             # server's tolerance for casing while still rejecting truly
             # unknown values.
-            if ($s -notin $Field.Choices) { return "Wert muss einer von '$($Field.Choices -join ", ")' sein" }
+            if ($s -notin $Field.Choices) { return "Value must be one of '$($Field.Choices -join ", ")'" }
             return $null
         }
         'int' {
             # Reject $null and bools explicitly so the coercer can hand us
             # a sentinel for "user gave us nonsense" without us treating
             # nonsense-coerced-to-0 as a valid value.
-            if ($null -eq $Value)   { return 'Ganzzahl erwartet' }
-            if ($Value -is [bool])  { return 'Ganzzahl erwartet (kein Bool)' }
+            if ($null -eq $Value)   { return 'Integer expected' }
+            if ($Value -is [bool])  { return 'Integer expected (not a Bool)' }
             $n = 0L
-            if (-not [long]::TryParse([string]$Value, [ref] $n)) { return 'Ganzzahl erwartet' }
-            if ($Field.ContainsKey('Min') -and $n -lt [long]$Field.Min) { return "Mindestens $($Field.Min)" }
-            if ($Field.ContainsKey('Max') -and $n -gt [long]$Field.Max) { return "Höchstens $($Field.Max)" }
+            if (-not [long]::TryParse([string]$Value, [ref] $n)) { return 'Integer expected' }
+            if ($Field.ContainsKey('Min') -and $n -lt [long]$Field.Min) { return "At least $($Field.Min)" }
+            if ($Field.ContainsKey('Max') -and $n -gt [long]$Field.Max) { return "At most $($Field.Max)" }
             return $null
         }
         'bool' {
-            if ($null -eq $Value)   { return 'Bool erwartet ($true / $false)' }
+            if ($null -eq $Value)   { return 'Bool expected ($true / $false)' }
             if ($Value -is [bool])  { return $null }
-            return 'Bool erwartet ($true / $false)'
+            return 'Bool expected ($true / $false)'
         }
         'string-array' {
             if ($null -eq $Value) { return $null }
@@ -543,11 +543,11 @@ function Test-PoshFieldValue {
                 # No per-item validator yet — the existing server tolerates
                 # exact IPs, CIDR, and regex (~^pattern). Accept anything
                 # non-empty and trim happens at serialize time.
-                if ($s.Length -gt 200) { return "Eintrag '$s' ist zu lang (max 200 Zeichen)" }
+                if ($s.Length -gt 200) { return "Entry '$s' is too long (max 200 characters)" }
             }
             return $null
         }
-        default { return "Unbekannter Field-Typ: $($Field.Type)" }
+        default { return "Unknown field type: $($Field.Type)" }
     }
 }
 
@@ -567,7 +567,7 @@ function ConvertTo-PoshTypedValue {
         'enum'         { if ($null -eq $RawValue) { return '' } else { return [string]$RawValue } }
         'int' {
             # Return $null on bad input — the caller's Test-PoshFieldValue
-            # surfaces it as "Ganzzahl erwartet". Previously this silently
+            # surfaces it as "Integer expected". Previously this silently
             # mapped 'abc' to 0L, which then passed any Min=0 validator.
             if ($null -eq $RawValue) { return $null }
             if ($RawValue -is [bool]) { return $null }
@@ -647,11 +647,11 @@ function Compare-PoshScalar {
 
 function ConvertTo-PoshDisplayString {
     param($Value, [string] $Type)
-    if ($null -eq $Value) { return '(nicht gesetzt)' }
+    if ($null -eq $Value) { return '(not set)' }
     if ($Type -eq 'bool') { if ($Value) { return '$true' } else { return '$false' } }
     if ($Type -eq 'string-array') {
         $arr = @($Value | ForEach-Object { [string]$_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-        if ($arr.Count -eq 0) { return '(leer)' }
+        if ($arr.Count -eq 0) { return '(empty)' }
         return ($arr -join ', ')
     }
     return [string]$Value

@@ -23,11 +23,11 @@
 @{
     Groups = @(
         @{ Id = 'globalvars'; Title = 'globalvars.ps1' }
-        @{ Id = 'server';     Title = 'Server-Ports und TLS' }
-        @{ Id = 'auth';       Title = 'Authentifizierung und Limits' }
+        @{ Id = 'server';     Title = 'Server ports and TLS' }
+        @{ Id = 'auth';       Title = 'Authentication and limits' }
         @{ Id = 'logging';    Title = 'Logging' }
-        @{ Id = 'features';   Title = 'Komfort-Features' }
-        @{ Id = 'setup';      Title = 'Setup-Helfer' }
+        @{ Id = 'features';   Title = 'Quality-of-life features' }
+        @{ Id = 'setup';      Title = 'Setup helpers' }
     )
 
     # ---------------------------------------------------------------
@@ -44,7 +44,7 @@
             Group     = 'globalvars'
             Type      = 'string'
             Label     = '$DomainController'
-            Help      = "FQDN des Active-Directory-Servers."
+            Help      = "FQDN of the Active Directory server."
             Validator = '^[A-Za-z0-9]([A-Za-z0-9\-\.]{0,253}[A-Za-z0-9])?$|^$'
         }
         @{
@@ -53,7 +53,7 @@
             Group     = 'globalvars'
             Type      = 'string'
             Label     = '$DomainDnsSuffix'
-            Help      = "DNS-Domäne des AD (z.B. 'example.local')."
+            Help      = "DNS domain of the AD forest (e.g. 'example.local')."
             Validator = '^[A-Za-z0-9]([A-Za-z0-9\-\.]{0,253}[A-Za-z0-9])?$|^$'
         }
         @{
@@ -62,7 +62,7 @@
             Group     = 'globalvars'
             Type      = 'string'
             Label     = '$SmtpRelay'
-            Help      = "FQDN des SMTP-Relays für ausgehende Mails."
+            Help      = "FQDN of the SMTP relay for outbound mail."
             Validator = '^[A-Za-z0-9]([A-Za-z0-9\-\.]{0,253}[A-Za-z0-9])?$|^$'
         }
         @{
@@ -71,7 +71,7 @@
             Group     = 'globalvars'
             Type      = 'string'
             Label     = '$AdminMail'
-            Help      = "Mail-Adresse für Notifications und Fehler-Mails."
+            Help      = "Mail address for notifications and error mails."
             Validator = '^([^@\s]+@[^@\s]+\.[^@\s]+)?$'
         }
         @{
@@ -80,7 +80,7 @@
             Group     = 'globalvars'
             Type      = 'string'
             Label     = '$PoshServerFqdn'
-            Help      = "Externer Hostname dieses posh-Servers (für Cert-Subject und Self-Links)."
+            Help      = "External hostname of this posh server (used for cert subject and self-links)."
             Validator = '^[A-Za-z0-9]([A-Za-z0-9\-\.]{0,253}[A-Za-z0-9])?$|^$'
         }
         @{
@@ -89,7 +89,7 @@
             Group     = 'globalvars'
             Type      = 'string'
             Label     = '$LdapUsers'
-            Help      = "Distinguished Name der Benutzer-OU (z.B. 'OU=Users,DC=example,DC=local')."
+            Help      = "Distinguished Name of the users OU (e.g. 'OU=Users,DC=example,DC=local')."
             Validator = '^((OU|CN|DC)=[^,]+(,(OU|CN|DC)=[^,]+)*)?$'
         }
         @{
@@ -98,7 +98,7 @@
             Group     = 'globalvars'
             Type      = 'string'
             Label     = '$LdapUsersDisabled'
-            Help      = "DN der Disabled-Users-OU."
+            Help      = "DN of the disabled-users OU."
             Validator = '^((OU|CN|DC)=[^,]+(,(OU|CN|DC)=[^,]+)*)?$'
         }
         @{
@@ -107,7 +107,7 @@
             Group     = 'globalvars'
             Type      = 'string'
             Label     = '$LdapServers'
-            Help      = "DN der Server-OU."
+            Help      = "DN of the servers OU."
             Validator = '^((OU|CN|DC)=[^,]+(,(OU|CN|DC)=[^,]+)*)?$'
         }
         @{
@@ -116,7 +116,7 @@
             Group     = 'globalvars'
             Type      = 'string'
             Label     = '$LdapClients'
-            Help      = "DN der Client-OU."
+            Help      = "DN of the clients OU."
             Validator = '^((OU|CN|DC)=[^,]+(,(OU|CN|DC)=[^,]+)*)?$'
         }
         @{
@@ -125,7 +125,7 @@
             Group     = 'globalvars'
             Type      = 'string'
             Label     = '$LdapGroups'
-            Help      = "DN der Gruppen-OU."
+            Help      = "DN of the groups OU."
             Validator = '^((OU|CN|DC)=[^,]+(,(OU|CN|DC)=[^,]+)*)?$'
         }
         @{
@@ -134,7 +134,7 @@
             Group     = 'globalvars'
             Type      = 'string'
             Label     = '$DefaultTargetHost'
-            Help      = "Hostname, der als Default für `$TargetHost in Webroot-Skripten dient."
+            Help      = "Hostname used as the default for `$TargetHost in webroot scripts."
             Validator = '^[A-Za-z0-9]([A-Za-z0-9\-\.]{0,253}[A-Za-z0-9])?$|^$'
         }
         @{
@@ -143,19 +143,19 @@
             Group     = 'globalvars'
             Type      = 'int'
             Label     = '$PasswordRetentionDays'
-            Help      = "Tage, nach denen ein Passwort als abgelaufen gilt."
+            Help      = "Days after which a password is considered expired."
             Min       = 0
             Max       = 3650
         }
 
-        # -- Server-Ports und TLS (config.psd1) -----------------------------
+        # -- Server ports and TLS (config.psd1) -----------------------------
         @{
             Name      = 'HttpPort'
             File      = 'config.psd1'
             Group     = 'server'
             Type      = 'int'
             Label     = 'HttpPort'
-            Help      = "TCP-Port für HTTP. 0 = HTTP deaktiviert (nur sinnvoll mit HttpsEnabled)."
+            Help      = "TCP port for HTTP. 0 = HTTP disabled (only useful together with HttpsEnabled)."
             Min       = 0
             Max       = 65535
         }
@@ -165,7 +165,7 @@
             Group     = 'server'
             Type      = 'int'
             Label     = 'HttpsPort'
-            Help      = "TCP-Port für HTTPS. Wirkt nur mit HttpsEnabled = `$true."
+            Help      = "TCP port for HTTPS. Only takes effect with HttpsEnabled = `$true."
             Min       = 1
             Max       = 65535
         }
@@ -175,7 +175,7 @@
             Group     = 'server'
             Type      = 'bool'
             Label     = 'HttpsEnabled'
-            Help      = "Voraussetzung: netsh-sslcert-Binding via Register-ScheduledTask.ps1."
+            Help      = "Requires a netsh sslcert binding via Register-ScheduledTask.ps1."
         }
         @{
             Name      = 'MaxRequestBodyBytes'
@@ -183,19 +183,19 @@
             Group     = 'server'
             Type      = 'int'
             Label     = 'MaxRequestBodyBytes'
-            Help      = "Maximale Größe von POST-Bodys in Bytes (20 MB = 20971520). Größer → HTTP 413."
+            Help      = "Maximum POST body size in bytes (20 MB = 20971520). Larger -> HTTP 413."
             Min       = 1024
             Max       = 1073741824
         }
 
-        # -- Authentifizierung und Limits (config.psd1) ---------------------
+        # -- Authentication and limits (config.psd1) ------------------------
         @{
             Name      = 'AuthMode'
             File      = 'config.psd1'
             Group     = 'auth'
             Type      = 'enum'
             Label     = 'AuthMode'
-            Help      = "ApiKey: nur X-Api-Key. Basic: nur HTTP-Basic. Both: beides erlaubt."
+            Help      = "ApiKey: X-Api-Key only. Basic: HTTP Basic only. Both: either accepted."
             Choices   = @('ApiKey', 'Basic', 'Both')
         }
         @{
@@ -204,7 +204,7 @@
             Group     = 'auth'
             Type      = 'int'
             Label     = 'MaxConcurrent'
-            Help      = "Mehr gleichzeitige Requests → HTTP 503."
+            Help      = "More concurrent requests -> HTTP 503."
             Min       = 1
             Max       = 1000
         }
@@ -214,7 +214,7 @@
             Group     = 'auth'
             Type      = 'int'
             Label     = 'ScriptTimeoutSec'
-            Help      = "Wenn ein Skript länger läuft → HTTP 504."
+            Help      = "If a script runs longer than this -> HTTP 504."
             Min       = 1
             Max       = 86400
         }
@@ -224,7 +224,7 @@
             Group     = 'auth'
             Type      = 'int'
             Label     = 'RateLimitRequests'
-            Help      = "Max. Anzahl Requests pro IP pro Fenster (0 = Rate-Limit deaktiviert)."
+            Help      = "Max requests per IP per window (0 = rate limit disabled)."
             Min       = 0
             Max       = 1000000
         }
@@ -234,7 +234,7 @@
             Group     = 'auth'
             Type      = 'int'
             Label     = 'RateLimitWindowSec'
-            Help      = "Dauer des Rate-Limit-Fensters in Sekunden."
+            Help      = "Length of the rate-limit window in seconds."
             Min       = 1
             Max       = 86400
         }
@@ -244,7 +244,7 @@
             Group     = 'auth'
             Type      = 'int'
             Label     = 'RateLimitPenaltySec'
-            Help      = "Sperrzeit nach erstem 429 (0 = nur normales Fensterverhalten)."
+            Help      = "Lockout duration after the first 429 (0 = window-only behaviour)."
             Min       = 0
             Max       = 86400
         }
@@ -254,7 +254,7 @@
             Group     = 'auth'
             Type      = 'enum'
             Label     = 'RateLimitMode'
-            Help      = "reject: sofort HTTP 429. queue: bis RateLimitQueueTimeoutSec warten."
+            Help      = "reject: immediate HTTP 429. queue: wait up to RateLimitQueueTimeoutSec."
             Choices   = @('reject', 'queue')
         }
         @{
@@ -263,7 +263,7 @@
             Group     = 'auth'
             Type      = 'bool'
             Label     = 'RateLimitPerIdentity'
-            Help      = "Gut bei NAT/Proxy. Anonyme Requests bleiben pro IP gelimitet."
+            Help      = "Useful behind NAT/proxy. Anonymous requests still get rate-limited per IP."
         }
         @{
             Name      = 'AllowedIPs'
@@ -271,7 +271,7 @@
             Group     = 'auth'
             Type      = 'string-array'
             Label     = 'AllowedIPs'
-            Help      = "Eine Zeile pro Eintrag. Leer = alle erlaubt. Beispiele: '192.168.1.10', '10.0.0.0/8', '~^192\.168\.'."
+            Help      = "One entry per line. Empty = all allowed. Examples: '192.168.1.10', '10.0.0.0/8', '~^192\.168\.'."
         }
         @{
             Name      = 'BlockedIPs'
@@ -279,7 +279,7 @@
             Group     = 'auth'
             Type      = 'string-array'
             Label     = 'BlockedIPs'
-            Help      = "Eine Zeile pro Eintrag. Wird vor AllowedIPs ausgewertet."
+            Help      = "One entry per line. Evaluated before AllowedIPs."
         }
 
         # -- Logging (config.psd1) ------------------------------------------
@@ -289,7 +289,7 @@
             Group     = 'logging'
             Type      = 'int'
             Label     = 'LogRetentionDays'
-            Help      = "Logs älter als N Tage werden beim Start gelöscht (0 = aus)."
+            Help      = "Logs older than N days are deleted at startup (0 = off)."
             Min       = 0
             Max       = 3650
         }
@@ -299,7 +299,7 @@
             Group     = 'logging'
             Type      = 'enum'
             Label     = 'LogSchedule'
-            Help      = "Daily: ein File pro Tag. Hourly: ein File pro Stunde."
+            Help      = "Daily: one file per day. Hourly: one file per hour."
             Choices   = @('Daily', 'Hourly')
         }
         @{
@@ -308,7 +308,7 @@
             Group     = 'logging'
             Type      = 'enum'
             Label     = 'LogFormat'
-            Help      = "Native: pipe-delimited. IIS-W3C: W3C Extended (für logparser)."
+            Help      = "Native: pipe-delimited. IIS-W3C: W3C Extended (for logparser)."
             Choices   = @('Native', 'IIS-W3C')
         }
         @{
@@ -317,7 +317,7 @@
             Group     = 'logging'
             Type      = 'bool'
             Label     = 'AuditLogEnabled'
-            Help      = "Schreibt AUTH_FAIL, IP_BLOCKED, RATE_LIMITED als NDJSON in audit.log."
+            Help      = "Writes AUTH_FAIL, IP_BLOCKED, RATE_LIMITED as NDJSON to audit.log."
         }
         @{
             Name      = 'SlowRequestThresholdMs'
@@ -325,7 +325,7 @@
             Group     = 'logging'
             Type      = 'int'
             Label     = 'SlowRequestThresholdMs'
-            Help      = "Requests >= N ms bekommen einen Eintrag in slow.log (0 = aus)."
+            Help      = "Requests >= N ms get an entry in slow.log (0 = off)."
             Min       = 0
             Max       = 86400000
         }
@@ -335,17 +335,17 @@
             Group     = 'logging'
             Type      = 'bool'
             Label     = 'LogIntegrityHash'
-            Help      = "Schreibt <logfile>.md5 neben jedes abgeschlossene Logfile (Audit-Trail)."
+            Help      = "Writes <logfile>.md5 next to every completed log file (audit trail)."
         }
 
-        # -- Komfort-Features (config.psd1) ---------------------------------
+        # -- Quality-of-life features (config.psd1) -------------------------
         @{
             Name      = 'GzipEnabled'
             File      = 'config.psd1'
             Group     = 'features'
             Type      = 'bool'
             Label     = 'GzipEnabled'
-            Help      = "Komprimiert Text-Antworten (HTML/JSON/CSS/JS) wenn der Client gzip akzeptiert."
+            Help      = "Compresses text responses (HTML/JSON/CSS/JS) when the client accepts gzip."
         }
         @{
             Name      = 'BrotliEnabled'
@@ -353,7 +353,7 @@
             Group     = 'features'
             Type      = 'bool'
             Label     = 'BrotliEnabled'
-            Help      = "Bevorzugt Brotli vor GZIP wenn beides angeboten wird (~15-25 % kleiner)."
+            Help      = "Prefers Brotli over GZIP when both are offered (~15-25 % smaller)."
         }
         @{
             Name      = 'StaticServingEnabled'
@@ -361,7 +361,7 @@
             Group     = 'features'
             Type      = 'bool'
             Label     = 'StaticServingEnabled'
-            Help      = "Liefert non-.ps1-Dateien aus dem WebRoot aus."
+            Help      = "Serves non-.ps1 files out of the webroot."
         }
         @{
             Name      = 'IndexShowMetadata'
@@ -369,7 +369,7 @@
             Group     = 'features'
             Type      = 'bool'
             Label     = 'IndexShowMetadata'
-            Help      = "GET / liefert Synopsis + Parameter aus jedem Skript (statt nur Pfad)."
+            Help      = "GET / returns synopsis + parameters for every script (instead of just the path)."
         }
         @{
             Name      = 'PromMetricsEnabled'
@@ -377,7 +377,7 @@
             Group     = 'features'
             Type      = 'bool'
             Label     = 'PromMetricsEnabled'
-            Help      = "Aktiviert GET /metrics-prom im Prometheus-Text-Format."
+            Help      = "Enables GET /metrics-prom in Prometheus text format."
         }
         @{
             Name      = 'OpenApiEnabled'
@@ -385,7 +385,7 @@
             Group     = 'features'
             Type      = 'bool'
             Label     = 'OpenApiEnabled'
-            Help      = "Aktiviert GET /openapi.json mit auto-generierter OpenAPI-3.1-Spec."
+            Help      = "Enables GET /openapi.json with an auto-generated OpenAPI 3.1 spec."
         }
         @{
             Name      = 'PathPlaceholders'
@@ -393,7 +393,7 @@
             Group     = 'features'
             Type      = 'bool'
             Label     = 'PathPlaceholders'
-            Help      = "Aktiviert '[id].ps1' als Platzhalter für /users/123 etc."
+            Help      = "Enables '[id].ps1' as a placeholder for /users/123 etc."
         }
     )
 }

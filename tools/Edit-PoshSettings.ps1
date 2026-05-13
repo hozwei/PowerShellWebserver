@@ -253,7 +253,7 @@ function Build-EffectiveSchema {
             # label IS the variable name.
             $field.Label = '$' + $def.Name
             $field.Group = 'globalvars'
-            $field.Help  = 'Selbst in globalvars.ps1 angelegt (keine Schema-Validierung).'
+            $field.Help  = 'Manually added in globalvars.ps1 (no schema validation).'
         }
         $null = $fields.Add($field)
     }
@@ -332,7 +332,7 @@ function Invoke-RouteDiff {
     foreach ($field in $eff.Fields) {
         if ($proposed.ContainsKey($field.Name)) {
             if ($field.ContainsKey('IsLiteral') -and -not $field.IsLiteral) {
-                $errors[$field.Name] = 'Wert ist berechnet (z.B. Join-Path); im Editor nicht änderbar.'
+                $errors[$field.Name] = 'Value is computed (e.g. Join-Path); not editable in the editor.'
                 continue
             }
             $typed = ConvertTo-PoshTypedValue -Field $field -RawValue $proposed[$field.Name]
@@ -372,7 +372,7 @@ function Invoke-RouteSave {
     foreach ($field in $eff.Fields) {
         if ($proposed.ContainsKey($field.Name)) {
             if ($field.ContainsKey('IsLiteral') -and -not $field.IsLiteral) {
-                $errors[$field.Name] = 'Wert ist berechnet; im Editor nicht änderbar.'
+                $errors[$field.Name] = 'Value is computed; not editable in the editor.'
                 continue
             }
             $typed = ConvertTo-PoshTypedValue -Field $field -RawValue $proposed[$field.Name]
@@ -412,7 +412,7 @@ function Invoke-RouteGlobalvarAdd {
     $name = [string]$Body['name']
     $type = [string]$Body['type']
     if ($name -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') {
-        Send-PoshErrorResponse -Response $Response -StatusCode 400 -Message 'Name darf nur Buchstaben, Ziffern und _ enthalten und nicht mit einer Ziffer beginnen.'
+        Send-PoshErrorResponse -Response $Response -StatusCode 400 -Message 'Name may only contain letters, digits and _, and cannot start with a digit.'
         return
     }
     if ($type -notin @('string','int','string-array','bool')) {

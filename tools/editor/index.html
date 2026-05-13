@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="de">
+<html lang="en">
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>posh Einstellungen</title>
+    <title>posh settings</title>
     <script>const POSH_TOKEN = '__POSH_TOKEN__';</script>
     <style>
         :root {
@@ -264,44 +264,44 @@
 <body>
     <header>
         <div>
-            <h1>posh Einstellungen</h1>
-            <div class="meta" id="meta-line">lade …</div>
+            <h1>posh settings</h1>
+            <div class="meta" id="meta-line">loading …</div>
         </div>
         <div style="display:flex; gap:8px;">
-            <button class="btn" id="addvar-btn" title="Neue Variable in globalvars.ps1 anlegen">+ Variable</button>
-            <button class="btn btn-danger" id="quit-btn" title="Editor beenden">Beenden</button>
+            <button class="btn" id="addvar-btn" title="Create a new variable in globalvars.ps1">+ Variable</button>
+            <button class="btn btn-danger" id="quit-btn" title="Quit editor">Quit</button>
         </div>
     </header>
 
     <div class="layout">
         <nav class="tabs" id="tabs"></nav>
         <main id="main">
-            <p>Lade Schema und aktuelle Werte …</p>
+            <p>Loading schema and current values …</p>
         </main>
     </div>
 
     <div class="savebar">
-        <span class="status" id="dirty-status">Keine Änderungen.</span>
-        <button class="btn btn-primary" id="save-btn" disabled>Speichern</button>
+        <span class="status" id="dirty-status">No changes.</span>
+        <button class="btn btn-primary" id="save-btn" disabled>Save</button>
     </div>
 
     <div class="modal-bg" id="diff-modal">
         <div class="modal">
-            <h3>Änderungen prüfen</h3>
+            <h3>Review changes</h3>
             <div class="body" id="diff-body"></div>
             <div class="actions">
-                <button class="btn" id="diff-cancel">Abbrechen</button>
-                <button class="btn btn-primary" id="diff-confirm">Übernehmen und speichern</button>
+                <button class="btn" id="diff-cancel">Cancel</button>
+                <button class="btn btn-primary" id="diff-confirm">Apply and save</button>
             </div>
         </div>
     </div>
 
     <div class="modal-bg" id="prompt-modal">
         <div class="modal">
-            <h3 id="prompt-title">Eingabe</h3>
+            <h3 id="prompt-title">Input</h3>
             <div class="body" id="prompt-body"></div>
             <div class="actions">
-                <button class="btn" id="prompt-cancel">Abbrechen</button>
+                <button class="btn" id="prompt-cancel">Cancel</button>
                 <button class="btn btn-primary" id="prompt-confirm">OK</button>
             </div>
         </div>
@@ -309,16 +309,16 @@
 
     <div class="modal-bg" id="addvar-modal">
         <div class="modal">
-            <h3>Neue Variable in globalvars.ps1 anlegen</h3>
+            <h3>Create a new variable in globalvars.ps1</h3>
             <div class="body">
                 <p style="margin-top:0; color:var(--muted); font-size:13px;">
-                    Wird am Ende der globalvars.ps1-Service-Variablen eingefügt (vor den Filesystem-Pfaden). Beim nächsten Reload erscheint sie im Tab <strong>globalvars.ps1</strong>.
+                    Inserted at the end of the service-variable block in globalvars.ps1 (before the filesystem paths). It will appear in the <strong>globalvars.ps1</strong> tab on the next reload.
                 </p>
                 <form class="add-form" id="addvar-form">
-                    <label>Variablenname (ohne <code>$</code>) — A-Z, 0-9, _; nicht mit Ziffer beginnen
+                    <label>Variable name (without <code>$</code>) — A-Z, 0-9, _; cannot start with a digit
                         <input type="text" id="addvar-name" autocomplete="off">
                     </label>
-                    <label>Typ
+                    <label>Type
                         <select id="addvar-type">
                             <option value="string">string</option>
                             <option value="int">int</option>
@@ -326,17 +326,17 @@
                             <option value="string-array">string-array</option>
                         </select>
                     </label>
-                    <label>Wert
+                    <label>Value
                         <textarea id="addvar-value" rows="1" autocomplete="off" style="resize:vertical; font-family:ui-monospace, Consolas, monospace;"></textarea>
                     </label>
                     <p id="addvar-hint" style="color:var(--muted); font-size:12px; margin-top:8px;">
-                        Hinweise: <em>string-array</em> = eine Zeile pro Eintrag, <em>bool</em> = <code>true</code> oder <code>false</code>.
+                        Hints: <em>string-array</em> = one entry per line, <em>bool</em> = <code>true</code> or <code>false</code>.
                     </p>
                 </form>
             </div>
             <div class="actions">
-                <button class="btn" id="addvar-cancel">Abbrechen</button>
-                <button class="btn btn-primary" id="addvar-confirm">Anlegen</button>
+                <button class="btn" id="addvar-cancel">Cancel</button>
+                <button class="btn btn-primary" id="addvar-confirm">Create</button>
             </div>
         </div>
     </div>
@@ -349,7 +349,7 @@
     const $$ = (sel, ctx = document) => Array.from(ctx.querySelectorAll(sel));
     const TOKEN = (POSH_TOKEN && POSH_TOKEN.indexOf('__') !== 0) ? POSH_TOKEN : null;
     if (!TOKEN) {
-        document.body.innerHTML = '<p style="padding:24px;color:#cf222e">Editor-Token fehlt. Bitte Editor erneut starten.</p>';
+        document.body.innerHTML = '<p style="padding:24px;color:#cf222e">Editor token missing. Please restart the editor.</p>';
         return;
     }
 
@@ -397,7 +397,7 @@
         }
         const r = await fetch(path, opts);
         let data;
-        try { data = await r.json(); } catch (e) { data = { ok: false, error: 'Antwort ist kein JSON' }; }
+        try { data = await r.json(); } catch (e) { data = { ok: false, error: 'Response is not JSON' }; }
         if (!r.ok) {
             const msg = data && data.error ? data.error : ('HTTP ' + r.status);
             const err = new Error(msg);
@@ -428,7 +428,7 @@
     const updateSaveButton = () => {
         const n = dirtyFieldsCount();
         $('#save-btn').disabled = (n === 0);
-        $('#dirty-status').textContent = n === 0 ? 'Keine Änderungen.' : (n + (n === 1 ? ' Änderung' : ' Änderungen') + ' bereit zum Speichern.');
+        $('#dirty-status').textContent = n === 0 ? 'No changes.' : (n + (n === 1 ? ' change' : ' changes') + ' ready to save.');
         for (const field of state.schema.Fields) {
             const row = document.querySelector('.field[data-name="' + field.Name + '"]');
             if (!row) continue;
@@ -444,17 +444,17 @@
                     // PowerShell -match is case-insensitive by default — match that
                     // here so the client doesn't flag valid input as bad just
                     // because the operator wrote 'dc=foo' instead of 'DC=foo'.
-                    if (!new RegExp(field.Validator, 'i').test(s)) return 'Format passt nicht.';
+                    if (!new RegExp(field.Validator, 'i').test(s)) return 'Format does not match.';
                 } catch (e) { /* invalid regex on server side — let server adjudicate */ }
             }
             return null;
         }
         if (field.Type === 'int') {
-            if (raw === '' || raw === null || raw === undefined) return 'Ganzzahl erwartet.';
+            if (raw === '' || raw === null || raw === undefined) return 'Integer expected.';
             const n = Number(raw);
-            if (!Number.isInteger(n)) return 'Ganzzahl erwartet.';
-            if (field.Min !== undefined && n < field.Min) return 'Mindestens ' + field.Min + '.';
-            if (field.Max !== undefined && n > field.Max) return 'Höchstens ' + field.Max + '.';
+            if (!Number.isInteger(n)) return 'Integer expected.';
+            if (field.Min !== undefined && n < field.Min) return 'At least ' + field.Min + '.';
+            if (field.Max !== undefined && n > field.Max) return 'At most ' + field.Max + '.';
             return null;
         }
         return null;
@@ -462,11 +462,11 @@
 
     const formatCurrent = (field) => {
         const v = state.current[field.Name];
-        if (v === undefined || v === null) return '(nicht gesetzt)';
+        if (v === undefined || v === null) return '(not set)';
         if (field.Type === 'bool') return v ? '$true' : '$false';
         if (field.Type === 'string-array') {
             const arr = Array.isArray(v) ? v : [v];
-            return arr.length === 0 ? '(leer)' : arr.join(', ');
+            return arr.length === 0 ? '(empty)' : arr.join(', ');
         }
         return String(v);
     };
@@ -481,11 +481,11 @@
         label.textContent = field.Label;
         const dot = document.createElement('span');
         dot.className = 'dirty-marker';
-        dot.title = 'Wert geändert';
+        dot.title = 'Value changed';
         label.appendChild(dot);
         const help = document.createElement('div');
         help.className = 'help';
-        help.textContent = (field.Help || '') + ' · Datei: ' + field.File;
+        help.textContent = (field.Help || '') + ' · File: ' + field.File;
         const vmsg = document.createElement('div');
         vmsg.className = 'validator-msg';
         vmsg.style.display = 'none';
@@ -524,7 +524,7 @@
         } else if (field.Type === 'string-array') {
             input = document.createElement('textarea');
             input.value = initialStr;
-            input.placeholder = 'Eine Zeile pro Eintrag';
+            input.placeholder = 'One entry per line';
         } else {
             input = document.createElement('input');
             input.type = 'text';
@@ -555,21 +555,21 @@
         right.appendChild(input);
         const def = document.createElement('div');
         def.className = 'help';
-        def.innerHTML = 'aktuell in der Datei: <code>' + formatCurrent(field).replace(/</g, '&lt;') + '</code>';
+        def.innerHTML = 'current value in file: <code>' + formatCurrent(field).replace(/</g, '&lt;') + '</code>';
         right.appendChild(def);
 
         if (field.IsLiteral === false) {
             input.disabled = true;
             const hint = document.createElement('div');
             hint.className = 'computed-hint';
-            hint.textContent = 'Berechneter Wert (z.B. Join-Path oder $env:...) — nur direkt in globalvars.ps1 editierbar.';
+            hint.textContent = 'Computed value (e.g. Join-Path or $env:...) — only editable directly in globalvars.ps1.';
             right.appendChild(hint);
         } else if (field.File === 'globalvars.ps1') {
             const rm = document.createElement('button');
             rm.className = 'remove-btn';
             rm.type = 'button';
-            rm.textContent = '✕ aus globalvars.ps1 entfernen';
-            rm.title = 'Variable komplett aus globalvars.ps1 löschen';
+            rm.textContent = '✕ remove from globalvars.ps1';
+            rm.title = 'Delete variable from globalvars.ps1';
             rm.addEventListener('click', () => removeGlobalvar(field.Name));
             right.appendChild(rm);
         }
@@ -594,7 +594,7 @@
 
         const desc = document.createElement('p');
         desc.className = 'group-desc';
-        desc.textContent = 'Werte werden nicht sofort gespeichert. Klick auf "Speichern" zeigt zuerst eine Diff-Vorschau und legt vor dem Schreiben ein Backup an.';
+        desc.textContent = 'Values are not saved immediately. Clicking "Save" first shows a diff preview and creates a backup before writing.';
         main.appendChild(desc);
 
         const fields = state.schema.Fields.filter(f => f.Group === groupId);
@@ -605,34 +605,34 @@
     const renderSetup = (main) => {
         const desc = document.createElement('p');
         desc.className = 'group-desc';
-        desc.textContent = 'Spezialfunktionen für die Erst-Einrichtung. Jeweils mit Rückfrage und sicheren Defaults.';
+        desc.textContent = 'Special functions for initial setup. Each prompts for confirmation and ships with safe defaults.';
         main.appendChild(desc);
 
         const aes = state.snapshot.aesKey;
         const aesCard = document.createElement('div');
         aesCard.className = 'setup-card';
         const aesBadge = aes.Initialised
-            ? '<span class="badge badge-ok">initialisiert</span>'
-            : '<span class="badge badge-warn">Placeholder</span>';
+            ? '<span class="badge badge-ok">initialised</span>'
+            : '<span class="badge badge-warn">placeholder</span>';
         aesCard.innerHTML =
-            '<h3>AES-Schlüssel für verschlüsselte Secrets ' + aesBadge + '</h3>' +
-            '<p>Schreibt 32 zufällige Bytes in den <code>$key</code>-Block von <code>globalvars.ps1</code>. ' +
-            'Achtung: Wenn bereits Secrets verschlüsselt sind, müssen sie nach dem Neu-Generieren mit dem neuen Schlüssel neu abgelegt werden.</p>' +
+            '<h3>AES key for encrypted secrets ' + aesBadge + '</h3>' +
+            '<p>Writes 32 random bytes into the <code>$key</code> block of <code>globalvars.ps1</code>. ' +
+            'Warning: any existing secrets must be re-encrypted with the new key after regeneration.</p>' +
             '<div class="row">' +
-            '<button class="btn btn-primary" id="aes-gen">Schlüssel ' + (aes.Initialised ? 'neu generieren' : 'generieren') + '</button>' +
-            (aes.Initialised ? '<label><input type="checkbox" id="aes-force"> Bestehenden Schlüssel überschreiben</label>' : '') +
+            '<button class="btn btn-primary" id="aes-gen">' + (aes.Initialised ? 'Regenerate key' : 'Generate key') + '</button>' +
+            (aes.Initialised ? '<label><input type="checkbox" id="aes-force"> Overwrite existing key</label>' : '') +
             '</div>';
         main.appendChild(aesCard);
         $('#aes-gen').addEventListener('click', async () => {
             const force = aes.Initialised ? Boolean(document.getElementById('aes-force')?.checked) : false;
-            if (aes.Initialised && !force) { toast('Bitte erst "Bestehenden Schlüssel überschreiben" anhaken.', 'err'); return; }
+            if (aes.Initialised && !force) { toast('Please tick "Overwrite existing key" first.', 'err'); return; }
             const sure = confirm(aes.Initialised
-                ? 'Bestehender AES-Schlüssel wird ersetzt. Alle bisherigen Secrets sind danach NICHT mehr lesbar. Wirklich fortfahren?'
-                : 'AES-Schlüssel mit 32 Zufallsbytes erzeugen?');
+                ? 'The existing AES key will be replaced. Previously encrypted secrets will NOT be readable afterwards. Really continue?'
+                : 'Generate an AES key with 32 random bytes?');
             if (!sure) return;
             try {
                 const r = await api('POST', '/api/initkey', { force });
-                toast('Schlüssel gespeichert. Backup: ' + (r.backup || '(keines)'));
+                toast('Key saved. Backup: ' + (r.backup || '(none)'));
                 await loadAll();
                 // Re-render the whole 'setup' group: renderSetup APPENDS to
                 // main, it doesn't clear first. Calling it directly stacked
@@ -643,30 +643,30 @@
             } catch (e) { toast(formatApiError(e), 'err'); }
         });
 
-        // Secret-Storage
+        // Secret storage
         const secCard = document.createElement('div');
         secCard.className = 'setup-card';
         secCard.innerHTML =
-            '<h3>Verschlüsseltes Secret ablegen</h3>' +
-            '<p>Speichert ein Passwort verschlüsselt in <code>encrypted_pw\\encryptedString_&lt;Label&gt;.txt</code>. ' +
-            'Voraussetzung: AES-Schlüssel ist initialisiert.</p>' +
-            '<div class="row"><input type="text" id="sec-label" placeholder="Label (z.B. ad_adsread)" pattern="^[A-Za-z0-9_-]+$"></div>' +
-            '<div class="row" style="margin-top:8px"><input type="password" id="sec-pw" placeholder="Passwort"></div>' +
-            '<div class="row" style="margin-top:8px"><label><input type="checkbox" id="sec-force"> bestehendes Label überschreiben</label>' +
-            '<button class="btn btn-primary" id="sec-save" style="margin-left:auto">Ablegen</button></div>' +
+            '<h3>Store encrypted secret</h3>' +
+            '<p>Saves a password encrypted to <code>encrypted_pw\\encryptedString_&lt;label&gt;.txt</code>. ' +
+            'Requires the AES key to be initialised.</p>' +
+            '<div class="row"><input type="text" id="sec-label" placeholder="Label (e.g. ad_adsread)" pattern="^[A-Za-z0-9_-]+$"></div>' +
+            '<div class="row" style="margin-top:8px"><input type="password" id="sec-pw" placeholder="Password"></div>' +
+            '<div class="row" style="margin-top:8px"><label><input type="checkbox" id="sec-force"> overwrite existing label</label>' +
+            '<button class="btn btn-primary" id="sec-save" style="margin-left:auto">Store</button></div>' +
             (state.snapshot.secrets && state.snapshot.secrets.length > 0
-                ? '<p style="margin-top:12px"><strong>Vorhandene Labels:</strong> ' + state.snapshot.secrets.map(s => '<code>' + s + '</code>').join(', ') + '</p>'
-                : '<p style="margin-top:12px;color:var(--muted)">Noch keine Secrets abgelegt.</p>');
+                ? '<p style="margin-top:12px"><strong>Existing labels:</strong> ' + state.snapshot.secrets.map(s => '<code>' + s + '</code>').join(', ') + '</p>'
+                : '<p style="margin-top:12px;color:var(--muted)">No secrets stored yet.</p>');
         main.appendChild(secCard);
         $('#sec-save').addEventListener('click', async () => {
             const label = $('#sec-label').value.trim();
             const pw    = $('#sec-pw').value;
             const force = $('#sec-force').checked;
-            if (!/^[A-Za-z0-9_-]+$/.test(label)) { toast('Label darf nur A-Z, 0-9, _ und - enthalten.', 'err'); return; }
-            if (!pw) { toast('Passwort darf nicht leer sein.', 'err'); return; }
+            if (!/^[A-Za-z0-9_-]+$/.test(label)) { toast('Label may only contain A-Z, 0-9, _ and -.', 'err'); return; }
+            if (!pw) { toast('Password must not be empty.', 'err'); return; }
             try {
                 const r = await api('POST', '/api/secret', { label, password: pw, force });
-                toast('Secret abgelegt: ' + r.file);
+                toast('Secret stored: ' + r.file);
                 $('#sec-label').value = '';
                 $('#sec-pw').value = '';
                 $('#sec-force').checked = false;
@@ -680,26 +680,26 @@
         const envCard = document.createElement('div');
         envCard.className = 'setup-card';
         const envBadge = env.SetMachine
-            ? '<span class="badge badge-ok">gesetzt (' + env.LengthChars + ' Zeichen)</span>'
-            : '<span class="badge badge-err">nicht gesetzt</span>';
+            ? '<span class="badge badge-ok">set (' + env.LengthChars + ' chars)</span>'
+            : '<span class="badge badge-err">not set</span>';
         const adminWarn = state.snapshot.isAdmin
             ? ''
-            : '<div class="warn-banner">Editor wurde nicht als Administrator gestartet — POSH_API_KEY kann nicht im System-Scope gesetzt werden.</div>';
+            : '<div class="warn-banner">Editor was not launched as Administrator — POSH_API_KEY cannot be set at machine scope.</div>';
         envCard.innerHTML =
-            '<h3>POSH_API_KEY (System-Umgebungsvariable) ' + envBadge + '</h3>' +
+            '<h3>POSH_API_KEY (machine environment variable) ' + envBadge + '</h3>' +
             adminWarn +
-            '<p>Wird beim Server-Start als HTTP-API-Key verlangt. Wird im Machine-Scope gespeichert (für den Scheduled Task lesbar).</p>' +
-            '<div class="row"><input type="text" id="env-val" placeholder="neuer API-Key" autocomplete="off">' +
-            '<button class="btn btn-primary" id="env-save"' + (state.snapshot.isAdmin ? '' : ' disabled') + '>Setzen</button></div>';
+            '<p>Required by the server at startup as the HTTP API key. Stored at machine scope (readable by the scheduled task).</p>' +
+            '<div class="row"><input type="text" id="env-val" placeholder="new API key" autocomplete="off">' +
+            '<button class="btn btn-primary" id="env-save"' + (state.snapshot.isAdmin ? '' : ' disabled') + '>Set</button></div>';
         main.appendChild(envCard);
         if (state.snapshot.isAdmin) {
             $('#env-save').addEventListener('click', async () => {
                 const v = $('#env-val').value.trim();
-                if (!v) { toast('API-Key darf nicht leer sein.', 'err'); return; }
-                if (!confirm('POSH_API_KEY im System-Scope überschreiben?')) return;
+                if (!v) { toast('API key must not be empty.', 'err'); return; }
+                if (!confirm('Overwrite POSH_API_KEY at machine scope?')) return;
                 try {
                     await api('POST', '/api/setenv', { value: v });
-                    toast('POSH_API_KEY gesetzt. Scheduled Task neu starten, damit der neue Wert greift.');
+                    toast('POSH_API_KEY set. Restart the scheduled task for the new value to take effect.');
                     $('#env-val').value = '';
                     await loadAll();
                     renderGroup('setup');
@@ -742,8 +742,8 @@
         state.current  = buildFlatCurrent();
         state.proposed = {};
         const meta = $('#meta-line');
-        const adminBadge = state.snapshot.isAdmin ? '<span class="badge badge-ok">Admin</span>' : '<span class="badge">Standard-User</span>';
-        meta.innerHTML = state.schema.Fields.length + ' Felder · ' + state.schema.Groups.length + ' Gruppen · ' + adminBadge;
+        const adminBadge = state.snapshot.isAdmin ? '<span class="badge badge-ok">Admin</span>' : '<span class="badge">Standard user</span>';
+        meta.innerHTML = state.schema.Fields.length + ' fields · ' + state.schema.Groups.length + ' groups · ' + adminBadge;
     };
 
     const openDiffModal = async () => {
@@ -763,7 +763,7 @@
         const body = $('#diff-body');
         body.innerHTML = '';
         if (!res.changes || res.changes.length === 0) {
-            body.innerHTML = '<p>Keine effektiven Änderungen erkannt.</p>';
+            body.innerHTML = '<p>No effective changes detected.</p>';
         } else {
             for (const c of res.changes) {
                 const row = document.createElement('div');
@@ -790,17 +790,17 @@
             return;
         }
         const bk = (res.backups || []).join(', ');
-        toast('Gespeichert. Backups: ' + (bk || '(keine — keine Datei zu sichern)'));
+        toast('Saved. Backups: ' + (bk || '(none — no file to back up)'));
         $('#diff-modal').classList.remove('shown');
         await loadAll();
         renderGroup(state.active);
     };
 
     const removeGlobalvar = async (name) => {
-        if (!confirm("Variable $" + name + " aus globalvars.ps1 wirklich entfernen?\n\nEin Backup wird vorher angelegt.")) return;
+        if (!confirm("Really remove variable $" + name + " from globalvars.ps1?\n\nA backup will be created first.")) return;
         try {
             await api('POST', '/api/globalvar/remove', { name });
-            toast('$' + name + ' entfernt.');
+            toast('$' + name + ' removed.');
         } catch (e) {
             toast(formatApiError(e), 'err');
             return;
@@ -822,13 +822,13 @@
         const v    = $('#addvar-value');
         if (type === 'string-array') {
             v.rows = 4;
-            v.placeholder = 'Eine Zeile pro Eintrag';
+            v.placeholder = 'One entry per line';
         } else if (type === 'bool') {
             v.rows = 1;
-            v.placeholder = 'true oder false';
+            v.placeholder = 'true or false';
         } else if (type === 'int') {
             v.rows = 1;
-            v.placeholder = 'Ganzzahl (z.B. 8080)';
+            v.placeholder = 'Integer (e.g. 8080)';
         } else {
             v.rows = 1;
             v.placeholder = '';
@@ -853,7 +853,7 @@
         const type = $('#addvar-type').value;
         const rawV = $('#addvar-value').value;
         if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
-            toast('Variablenname ungültig.', 'err');
+            toast('Variable name is invalid.', 'err');
             return;
         }
         let value;
@@ -861,7 +861,7 @@
             value = (rawV.trim().toLowerCase() === 'true' || rawV.trim() === '1');
         } else if (type === 'int') {
             const n = Number(rawV);
-            if (!Number.isInteger(n)) { toast('Wert muss eine Ganzzahl sein.', 'err'); return; }
+            if (!Number.isInteger(n)) { toast('Value must be an integer.', 'err'); return; }
             value = n;
         } else if (type === 'string-array') {
             value = rawV.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
@@ -870,7 +870,7 @@
         }
         try {
             await api('POST', '/api/globalvar/add', { name, type, value });
-            toast('$' + name + ' angelegt.');
+            toast('$' + name + ' created.');
         } catch (e) {
             toast(formatApiError(e), 'err');
             return;
@@ -896,14 +896,14 @@
         $('#addvar-confirm').addEventListener('click', confirmAddVar);
         $('#addvar-type').addEventListener('change', syncAddVarValueShape);
         $('#quit-btn').addEventListener('click', async () => {
-            if (!confirm('Editor beenden?')) return;
+            if (!confirm('Quit editor?')) return;
             try { await api('POST', '/api/quit', {}); } catch (e) { /* server is shutting down, that is fine */ }
-            document.body.innerHTML = '<p style="padding:24px">Editor wurde beendet. Du kannst das Browser-Fenster schließen.</p>';
+            document.body.innerHTML = '<p style="padding:24px">Editor has stopped. You can close this browser window.</p>';
         });
         try {
             await loadAll();
         } catch (e) {
-            $('#main').innerHTML = '<p style="color:var(--danger)">Konnte Schema nicht laden: ' + e.message + '</p>';
+            $('#main').innerHTML = '<p style="color:var(--danger)">Could not load schema: ' + e.message + '</p>';
             return;
         }
         renderTabs();
