@@ -69,7 +69,7 @@ $cfg = @{
     MaxRequestBodyBytes      = 20MB
     RateLimitRequests        = 100
     RateLimitWindowSec       = 600
-    RateLimitPenaltySec      = 1800
+    RateLimitPenaltySec      = 300
     RateLimitMode            = 'reject'
     RateLimitQueueTimeoutSec = 10
     RateLimitExemptPaths     = @('/health', '/metrics')
@@ -238,12 +238,15 @@ These are passed on the command line when starting the server. `Register-Schedul
 | `MaxRequestBodyBytes` | `integer` | `20971520` (20 MB) | Maximum allowed size of a POST request body in bytes. Requests exceeding this limit receive HTTP 413 immediately. Use PowerShell byte literals for readability: `5MB`, `10MB`. |
 | `RateLimitRequests` | `integer` | `100` | Maximum number of requests allowed per client IP per window (`RateLimitWindowSec`). Requests exceeding this limit receive HTTP 429 with a `Retry-After` header. Set to `0` to disable rate limiting entirely. |
 | `RateLimitWindowSec` | `integer` | `600` (10 min) | Duration in seconds of the Fixed Window used for rate limiting. The request counter resets when the window expires. |
-| `RateLimitPenaltySec` | `integer` | `1800` (30 min) | Duration in seconds for which a client IP is fully blocked after the first HTTP 429. The `Retry-After` header reflects the remaining penalty time. Set to `0` to fall back to window-end behaviour (no flat penalty). |
+| `RateLimitPenaltySec` | `integer` | `300` (5 min) | Duration in seconds for which a client IP is fully blocked after the first HTTP 429. The `Retry-After` header reflects the remaining penalty time. Set to `0` to fall back to window-end behaviour (no flat penalty). |
 | `RateLimitMode` | `string` | `'reject'` | Behaviour when a client exceeds the rate limit. `'reject'`: return HTTP 429 immediately. `'queue'`: wait up to `RateLimitQueueTimeoutSec` seconds for the window to reset before returning HTTP 429. |
 | `RateLimitPerIdentity` | `bool` | `$false` | When `$true`, requests carrying a valid `X-Api-Key` are rate-limited per API-key label instead of per client IP. Useful when several clients sit behind the same NAT or proxy. Anonymous / auth-exempt requests still use the client IP. Wrong/missing keys also fall back to per-IP, so brute-force attempts on the API key continue to hit the IP quota. |
 | `RateLimitQueueTimeoutSec` | `integer` | `10` | Maximum seconds a request waits in queue mode before receiving HTTP 429. Only evaluated when `RateLimitMode = 'queue'`. |
-| `RateLimitExemptPaths` | `string[]` | `@('/health', '/metrics')` | URL paths excluded from rate limiting. Must be an array even if only one path is exempt. Comparison is case-insensitive. |
-| `MinRequestIntervalSec` | `integer` | `1` | Minimum number of seconds that must elapse between two dispatched requests, globally across all clients. Requests arriving before this interval elapses receive HTTP 429 with a `Retry-After` header. Enforced in the main thread before any runspace is started — the RunspacePool is never touched for throttled requests. `GET /health` and `GET /metrics` are always exempt regardless of this setting. Set to `0` to disable. |
+| `RateLimitExemptPaths` | `string[]` | `@('/health', '/metrics', '/metrics-prom', '/openapi.json')` | URL paths excluded from rate limiting. Must be an array even if only one path is exempt. Comparison is case-insensitive. |
+| `MinRequestIntervalSec` | `integer` | `1` | Minimum number of seconds that must elapse between two dispatched requests, globally across all clients. Requests arriving before this interval elapses receive HTTP 429 with a `Retry-After` header. Enforced in the main thread before any runspace is started — the RunspacePool is never touched for throttled requests. Paths in `GlobalThrottleExemptPaths` are exempt. Set to `0` to disable. |
+| `GlobalThrottleExemptPaths` | `string[]` | `@('/health', '/metrics', '/metrics-prom', '/openapi.json')` | URL paths exempt from the `MinRequestIntervalSec` throttle. Defaults to the monitoring/discovery routes so Prometheus + Swagger UI are never throttled. Comparison is case-insensitive. |
+| `IpFilterExemptPaths` | `string[]` | `@('/health')` | URL paths exempt from `AllowedIPs` / `BlockedIPs` enforcement. Default keeps `/health` reachable from external monitoring even when IP filtering is enabled. Comparison is case-insensitive. |
+| `AuthExemptPaths` | `string[]` | `@('/health', '/metrics', '/metrics-prom', '/openapi.json')` | URL paths that bypass authentication entirely. Identity is logged as `'anonymous'`. Add `/version`, `/robots.txt`, or similar public endpoints here without code edits. Comparison is case-insensitive. |
 | `AllowedIPs` | `string[]` | `@()` | IP address allowlist. Empty = all IPs allowed (default). Non-empty = only matching client IPs pass. Each entry may be an exact IP (`'192.168.1.10'`), a CIDR range (`'10.0.0.0/8'`), or a regex when prefixed with `~` (`'~^192\.168\.'`). IPv4 and IPv6 both supported. `GET /health` is always exempt. |
 | `BlockedIPs` | `string[]` | `@()` | IP address blocklist. Same matching syntax as `AllowedIPs` (exact / CIDR / `~regex`). Listed IPs are always rejected with HTTP 403, regardless of `AllowedIPs`. Checked first. `GET /health` is always exempt. |
 | `Prefixes` | `string[]` | `@()` | Explicit `HttpListener` URL prefixes. When non-empty, overrides the default `+`-wildcard binding constructed from `HttpPort` / `HttpsPort`. Each prefix MUST end with `/` (`HttpListener` requirement). Allows hostname-bound listeners and mixed-port scenarios. Empty = legacy behavior. |

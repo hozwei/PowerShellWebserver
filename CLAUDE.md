@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repo is
 
-A single-file Windows HTTP/HTTPS server (`Start-WebServer.ps1`, ~1265 lines) built on `System.Net.HttpListener` + `RunspacePool`. Every `.ps1` file under `webroot\` is automatically reachable as an HTTP endpoint — the server spawns a separate `pwsh.exe` subprocess per request, captures stdout/stderr/exit-code, and returns a uniform JSON envelope `{ exitCode, output, error }`.
+A single-file Windows HTTP/HTTPS server (`Start-WebServer.ps1`, ~5000 lines) built on `System.Net.HttpListener` + `RunspacePool`. Every `.ps1` file under `webroot\` is automatically reachable as an HTTP endpoint — the server spawns a separate `pwsh.exe` subprocess per request, captures stdout/stderr/exit-code, and returns a uniform JSON envelope `{ exitCode, output, error }`.
 
 There is **no build system, no test framework, and no external dependencies** beyond the .NET BCL and PowerShell 7.
 
