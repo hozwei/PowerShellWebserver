@@ -149,7 +149,70 @@ $cfg = @{
     LogIntegrityHash         = $false # write <logfile>.md5 next to every completed log file at startup (legacy PoSH Server parity); current day's file is left alone
     LogSchedule              = 'Daily' # 'Daily' = YYYY-MM-DD.log | 'Hourly' = YYYY-MM-DDTHH.log
     LogFormat                = 'Native' # 'Native' = current pipe-delimited format | 'IIS-W3C' = W3C Extended Log File Format with #Fields header
+    StaticServingEnabled     = $false # serve non-.ps1 files (HTML, CSS, JS, images, …) from StaticRoot — opt-in for backward compatibility
+    StaticRoot               = ''     # static file root; empty string = use WebRoot (so static files live alongside .ps1 endpoints by default)
+    DefaultDocuments         = @('index.html', 'index.htm')  # served when StaticServing handles a directory request (e.g. GET /docs/); PR-9 (DirectoryBrowsing) takes over when none of these exist
+    StaticCacheHeaders       = $true  # emit ETag + Last-Modified on static responses and honor If-None-Match / If-Modified-Since with HTTP 304
+    BlockedMimeTypes         = @()    # MIME-type blacklist for static responses — matched via StartsWith; entries trigger HTTP 403 (legacy PoSH content filter)
+    MimeTypeMap              = @{
+        # Extension keys are lowercased, with leading dot. Comparison is case-insensitive.
+        # Text-ish types include charset=utf-8 so browsers render UTF-8 correctly without sniffing.
+        '.html' = 'text/html; charset=utf-8'
+        '.htm'  = 'text/html; charset=utf-8'
+        '.xhtml'= 'application/xhtml+xml; charset=utf-8'
+        '.css'  = 'text/css; charset=utf-8'
+        '.js'   = 'text/javascript; charset=utf-8'
+        '.mjs'  = 'text/javascript; charset=utf-8'
+        '.json' = 'application/json; charset=utf-8'
+        '.xml'  = 'application/xml; charset=utf-8'
+        '.txt'  = 'text/plain; charset=utf-8'
+        '.md'   = 'text/markdown; charset=utf-8'
+        '.csv'  = 'text/csv; charset=utf-8'
+        '.rss'  = 'application/rss+xml'
+        '.atom' = 'application/atom+xml'
+        '.svg'  = 'image/svg+xml'
+        '.svgz' = 'image/svg+xml'
+        '.png'  = 'image/png'
+        '.jpg'  = 'image/jpeg'
+        '.jpeg' = 'image/jpeg'
+        '.gif'  = 'image/gif'
+        '.ico'  = 'image/x-icon'
+        '.webp' = 'image/webp'
+        '.bmp'  = 'image/bmp'
+        '.tiff' = 'image/tiff'
+        '.tif'  = 'image/tiff'
+        '.pdf'  = 'application/pdf'
+        '.zip'  = 'application/zip'
+        '.rar'  = 'application/vnd.rar'
+        '.7z'   = 'application/x-7z-compressed'
+        '.gz'   = 'application/gzip'
+        '.tar'  = 'application/x-tar'
+        '.mp3'  = 'audio/mpeg'
+        '.ogg'  = 'audio/ogg'
+        '.oga'  = 'audio/ogg'
+        '.wav'  = 'audio/wav'
+        '.mp4'  = 'video/mp4'
+        '.m4v'  = 'video/mp4'
+        '.ogv'  = 'video/ogg'
+        '.webm' = 'video/webm'
+        '.mpeg' = 'video/mpeg'
+        '.mpg'  = 'video/mpeg'
+        '.flv'  = 'video/x-flv'
+        '.swf'  = 'application/x-shockwave-flash'
+        '.wmv'  = 'video/x-ms-wmv'
+        '.woff' = 'font/woff'
+        '.woff2'= 'font/woff2'
+        '.eot'  = 'application/vnd.ms-fontobject'
+        '.otf'  = 'font/otf'
+        '.ttf'  = 'font/ttf'
+        '.wasm' = 'application/wasm'
+        '.map'  = 'application/json; charset=utf-8'
+    }
 }
+
+# StaticRoot fallback — empty string means: reuse WebRoot. Resolved here rather than at
+# request time so the static handler can compare full paths without per-request work.
+if ([string]::IsNullOrEmpty($cfg.StaticRoot)) { $cfg.StaticRoot = $cfg.WebRoot }
 
 # Runtime measurement from server start — used for health check uptime.
 $startTime = [System.Diagnostics.Stopwatch]::StartNew()
@@ -783,6 +846,208 @@ function Save-PostJson {
     return $filePath
 }
 
+# ---------------------------------------------------------------------------
+# Get-MimeType
+# Returns the configured MIME-type for a file extension, or 'application/octet-stream'
+# when no entry matches. Comparison is case-insensitive — keys in $cfg.MimeTypeMap
+# are always lowercase with a leading dot ('.png', '.json').
+# ---------------------------------------------------------------------------
+function Get-MimeType {
+    param([string] $Extension)
+    if ([string]::IsNullOrEmpty($Extension)) { return 'application/octet-stream' }
+    $key = $Extension.ToLowerInvariant()
+    if (-not $key.StartsWith('.')) { $key = '.' + $key }
+    if ($script:cfg.MimeTypeMap.ContainsKey($key)) { return $script:cfg.MimeTypeMap[$key] }
+    return 'application/octet-stream'
+}
+
+# ---------------------------------------------------------------------------
+# Send-StaticFile
+# Serves a file from disk with full RFC-7232 conditional-request support
+# (If-None-Match / If-Modified-Since) and RFC-7233 byte-range support.
+#
+# Returns PSCustomObject { StatusCode [int]; Reason [string]; Length [long] }.
+# Reason is used only for log output — Send-StaticFile writes headers and body
+# itself and never throws on a closed client connection.
+#
+# Caller responsibilities:
+#   - resolve $FilePath under StaticRoot with path-traversal protection
+#   - log the result (via Write-Log) — Send-StaticFile does not log
+#   - skip this path for .ps1 endpoints — those go through Invoke-Script
+# ---------------------------------------------------------------------------
+function Send-StaticFile {
+    param(
+        [System.Net.HttpListenerRequest]  $Request,
+        [System.Net.HttpListenerResponse] $Response,
+        [string]                          $FilePath,
+        [string]                          $RequestId
+    )
+
+    $fi = [System.IO.FileInfo]::new($FilePath)
+    if (-not $fi.Exists) {
+        return [PSCustomObject]@{ StatusCode = 404; Reason = 'NOT FOUND'; Length = 0 }
+    }
+
+    $mime = Get-MimeType -Extension $fi.Extension
+
+    # MIME blacklist — legacy PoSH content filter parity. Matching uses StartsWith
+    # so 'video/' blocks all video subtypes without listing each.
+    foreach ($blocked in $script:cfg.BlockedMimeTypes) {
+        if ($mime.StartsWith($blocked, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return [PSCustomObject]@{ StatusCode = 403; Reason = 'MIME BLOCKED'; Length = 0 }
+        }
+    }
+
+    # Cache validators — ETag is "<length>-<utcTicks>" so it changes on either
+    # content size OR last-write-time change. Quotes are part of the literal
+    # ETag value per RFC 7232.
+    $lastModifiedUtc = $fi.LastWriteTimeUtc
+    $etag            = '"{0}-{1:X}"' -f $fi.Length, $lastModifiedUtc.Ticks
+
+    if ($script:cfg.StaticCacheHeaders) {
+        $ifNoneMatch = $Request.Headers['If-None-Match']
+        if ($ifNoneMatch -and $ifNoneMatch -eq $etag) {
+            $Response.StatusCode = 304
+            $Response.AddHeader('ETag',          $etag)
+            $Response.AddHeader('Last-Modified', $lastModifiedUtc.ToString('R'))
+            if ($RequestId) { $Response.AddHeader('X-Request-Id', $RequestId) }
+            try { $Response.OutputStream.Close() } catch { }
+            return [PSCustomObject]@{ StatusCode = 304; Reason = 'NOT MODIFIED'; Length = 0 }
+        }
+        $ifModifiedSince = $Request.Headers['If-Modified-Since']
+        if ($ifModifiedSince) {
+            try {
+                $imsDate = [datetime]::Parse($ifModifiedSince).ToUniversalTime()
+                # Trim sub-second precision — HTTP-date format does not carry milliseconds.
+                $lastModTrimmed = [datetime]::new($lastModifiedUtc.Year, $lastModifiedUtc.Month, $lastModifiedUtc.Day, $lastModifiedUtc.Hour, $lastModifiedUtc.Minute, $lastModifiedUtc.Second, [System.DateTimeKind]::Utc)
+                if ($lastModTrimmed.Ticks -le $imsDate.Ticks) {
+                    $Response.StatusCode = 304
+                    $Response.AddHeader('ETag',          $etag)
+                    $Response.AddHeader('Last-Modified', $lastModifiedUtc.ToString('R'))
+                    if ($RequestId) { $Response.AddHeader('X-Request-Id', $RequestId) }
+                    try { $Response.OutputStream.Close() } catch { }
+                    return [PSCustomObject]@{ StatusCode = 304; Reason = 'NOT MODIFIED'; Length = 0 }
+                }
+            } catch { }
+        }
+    }
+
+    # Range request — single-range only (multipart/byteranges intentionally not implemented).
+    $rangeStart = 0L
+    $rangeEnd   = $fi.Length - 1L
+    $isRange    = $false
+    $rawRange   = $Request.Headers['Range']
+    if ($rawRange -and $rawRange.StartsWith('bytes=', [System.StringComparison]::OrdinalIgnoreCase)) {
+        $spec = $rawRange.Substring(6).Trim()
+        # Multi-range like 'bytes=0-100,200-300' — fall back to full content instead of
+        # complicating the response with multipart/byteranges. Conformant per RFC 7233.
+        if (-not $spec.Contains(',')) {
+            $parts = $spec.Split('-', 2)
+            if ($parts.Length -eq 2) {
+                try {
+                    if ($parts[0] -ne '') { $rangeStart = [long]$parts[0] }
+                    if ($parts[1] -ne '') { $rangeEnd   = [long]$parts[1] }
+                    elseif ($parts[0] -eq '') {
+                        # Suffix range 'bytes=-N' — last N bytes.
+                        $suffix = [long]$parts[1]
+                        $rangeStart = [long][math]::Max(0L, $fi.Length - $suffix)
+                        $rangeEnd   = $fi.Length - 1L
+                    }
+                    if ($rangeStart -lt 0 -or $rangeEnd -ge $fi.Length -or $rangeStart -gt $rangeEnd) {
+                        $Response.StatusCode = 416
+                        $Response.AddHeader('Content-Range', ('bytes */{0}' -f $fi.Length))
+                        if ($RequestId) { $Response.AddHeader('X-Request-Id', $RequestId) }
+                        try { $Response.OutputStream.Close() } catch { }
+                        return [PSCustomObject]@{ StatusCode = 416; Reason = 'RANGE INVALID'; Length = 0 }
+                    }
+                    $isRange = $true
+                } catch { $isRange = $false }
+            }
+        }
+    }
+
+    $contentLength = $rangeEnd - $rangeStart + 1L
+
+    # GZIP compression for static text content — only when no Range was requested.
+    # Range + Content-Encoding is a thorny combination (clients differ on whether ranges
+    # apply to compressed or original bytes); skipping compression for ranges sidesteps
+    # the issue and matches the behavior of most production servers.
+    $compressBody = $null
+    $useGzip      = $false
+    if (-not $isRange -and $script:cfg.GzipEnabled -and $contentLength -ge $script:cfg.GzipMinBytes) {
+        $accept = $Request.Headers['Accept-Encoding']
+        if ($accept -and $accept.IndexOf('gzip', [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            foreach ($prefix in $script:cfg.GzipMimeTypes) {
+                if ($mime.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    # Load + compress in-memory. Acceptable for text content where bodies are
+                    # typically small (HTML/CSS/JS); GzipMinBytes still gates against tiny payloads.
+                    $useGzip      = $true
+                    $allBytes     = [System.IO.File]::ReadAllBytes($FilePath)
+                    $ms           = [System.IO.MemoryStream]::new()
+                    $gz           = [System.IO.Compression.GZipStream]::new($ms, [System.IO.Compression.CompressionLevel]::Optimal, $true)
+                    try {
+                        $gz.Write($allBytes, 0, $allBytes.Length)
+                    } finally {
+                        $gz.Dispose()
+                    }
+                    $compressBody = $ms.ToArray()
+                    $ms.Dispose()
+                    break
+                }
+            }
+        }
+    }
+
+    # Common headers
+    $Response.StatusCode    = if ($isRange) { 206 } else { 200 }
+    $Response.ContentType   = $mime
+    $Response.AddHeader('Accept-Ranges', 'bytes')
+    if ($RequestId) { $Response.AddHeader('X-Request-Id', $RequestId) }
+    if ($script:cfg.StaticCacheHeaders) {
+        $Response.AddHeader('ETag',          $etag)
+        $Response.AddHeader('Last-Modified', $lastModifiedUtc.ToString('R'))
+    }
+    if ($isRange) {
+        $Response.AddHeader('Content-Range', ('bytes {0}-{1}/{2}' -f $rangeStart, $rangeEnd, $fi.Length))
+    }
+    if ($useGzip -and $null -ne $compressBody) {
+        $Response.AddHeader('Content-Encoding', 'gzip')
+        $Response.AddHeader('Vary',             'Accept-Encoding')
+        $Response.ContentLength64 = $compressBody.Length
+    } else {
+        $Response.ContentLength64 = $contentLength
+    }
+
+    # Body stream — gzip path uses the in-memory buffer; otherwise stream from disk
+    # with a 64 KB buffer to avoid loading large media files entirely into memory.
+    if ($useGzip -and $null -ne $compressBody) {
+        try { $Response.OutputStream.Write($compressBody, 0, $compressBody.Length) } catch { }
+    } else {
+        $fs = $null
+        try {
+            $fs = [System.IO.File]::Open($FilePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+            if ($rangeStart -gt 0) { $null = $fs.Seek($rangeStart, [System.IO.SeekOrigin]::Begin) }
+            $buffer    = [byte[]]::new(65536)
+            $remaining = $contentLength
+            while ($remaining -gt 0L) {
+                $toRead = [int][math]::Min([long]$buffer.Length, $remaining)
+                $read   = $fs.Read($buffer, 0, $toRead)
+                if ($read -le 0) { break }
+                $Response.OutputStream.Write($buffer, 0, $read)
+                $remaining -= $read
+            }
+        } catch {
+            # Client disconnected mid-stream — common for media seeking; never fatal.
+        } finally {
+            if ($null -ne $fs) { try { $fs.Dispose() } catch { } }
+        }
+    }
+    try { $Response.OutputStream.Close() } catch { }
+
+    $reason = if ($isRange) { 'OK PARTIAL' } else { 'OK STATIC' }
+    return [PSCustomObject]@{ StatusCode = $Response.StatusCode; Reason = $reason; Length = $contentLength }
+}
+
 function Invoke-Script {
     param(
         [string]    $ScriptPath,
@@ -996,6 +1261,8 @@ $shared = @{
     FnInvScript      = ${function:Invoke-Script}
     FnGetIndex       = ${function:Get-ScriptIndex}
     FnRateLimit      = ${function:Test-RateLimit}
+    FnGetMime        = ${function:Get-MimeType}
+    FnSendStatic     = ${function:Send-StaticFile}
 }
 
 # ---------------------------------------------------------------------------
@@ -1022,6 +1289,8 @@ $requestHandler = {
     ${function:Invoke-Script}    = $shared.FnInvScript
     ${function:Get-ScriptIndex}  = $shared.FnGetIndex
     ${function:Test-RateLimit}   = $shared.FnRateLimit
+    ${function:Get-MimeType}     = $shared.FnGetMime
+    ${function:Send-StaticFile}  = $shared.FnSendStatic
     $script:cfg              = $shared.Cfg
 
     # Live .NET objects were injected via InitialSessionState.Variables — plain names.
@@ -1169,12 +1438,69 @@ $requestHandler = {
         }
 
         # --------------------------------------------------------------
-        # Only .ps1 allowed
+        # Non-.ps1 path → static file branch (opt-in via StaticServingEnabled).
+        # POST requests to non-.ps1 paths are always rejected — static content is
+        # GET-only by design and POST would otherwise silently no-op.
+        # When StaticServingEnabled is off, fall back to the legacy HTTP 400.
         # --------------------------------------------------------------
         if (-not $urlPath.EndsWith('.ps1', [System.StringComparison]::OrdinalIgnoreCase)) {
-            $body = New-JsonResponse -ExitCode 400 -Output '' -Err "Only .ps1 files are allowed. Requested: $urlPath"
-            Send-Response -Response $resp -StatusCode 400 -Body $body -RequestId $requestId
-            Write-Log -ClientIP $clientIP -Request $requestLine -Status 'BAD REQUEST' -ExitCode '-' -RequestId $requestId
+
+            if (-not $script:cfg.StaticServingEnabled) {
+                $body = New-JsonResponse -ExitCode 400 -Output '' -Err "Only .ps1 files are allowed. Requested: $urlPath"
+                Send-Response -Response $resp -StatusCode 400 -Body $body -RequestId $requestId
+                Write-Log -ClientIP $clientIP -Request $requestLine -Status 'BAD REQUEST' -ExitCode '-' -RequestId $requestId
+                return
+            }
+
+            if ($req.HttpMethod -ne 'GET') {
+                $body = New-JsonResponse -ExitCode 405 -Output '' -Err 'Static resources may only be requested with GET.'
+                $resp.AddHeader('Allow', 'GET')
+                Send-Response -Response $resp -StatusCode 405 -Body $body -RequestId $requestId
+                Write-Log -ClientIP $clientIP -Request $requestLine -Status 'METHOD NOT ALLOWED' -ExitCode '-' -RequestId $requestId
+                return
+            }
+
+            # Path-traversal protection — identical pattern to the .ps1 branch below
+            # but rooted at StaticRoot (which defaults to WebRoot).
+            $staticRel  = $urlPath.TrimStart('/').Replace('/', '\')
+            $staticFull = [System.IO.Path]::GetFullPath((Join-Path $script:cfg.StaticRoot $staticRel))
+            $rootFull   = [System.IO.Path]::GetFullPath($script:cfg.StaticRoot)
+            $isInsideRoot = $staticFull -eq $rootFull -or
+                            $staticFull.StartsWith($rootFull + '\', [System.StringComparison]::OrdinalIgnoreCase)
+            if (-not $isInsideRoot) {
+                $body = New-JsonResponse -ExitCode 403 -Output '' -Err 'Access denied.'
+                Send-Response -Response $resp -StatusCode 403 -Body $body -RequestId $requestId
+                Write-Log -ClientIP $clientIP -Request $requestLine -Status 'FORBIDDEN' -ExitCode '-' -RequestId $requestId
+                return
+            }
+
+            # Directory request: try configured default documents (index.html, …) in order.
+            # If none exist, fall through to a 404 — PR-9 (DirectoryBrowsing) will plug a
+            # directory listing in here later when that feature is implemented.
+            $isDir = Test-Path -LiteralPath $staticFull -PathType Container
+            if ($isDir -or $urlPath.EndsWith('/')) {
+                $resolvedDefault = $null
+                foreach ($candidate in $script:cfg.DefaultDocuments) {
+                    $probe = Join-Path $staticFull $candidate
+                    if (Test-Path -LiteralPath $probe -PathType Leaf) { $resolvedDefault = $probe; break }
+                }
+                if ($null -eq $resolvedDefault) {
+                    $body = New-JsonResponse -ExitCode 404 -Output '' -Err "No default document for: $urlPath"
+                    Send-Response -Response $resp -StatusCode 404 -Body $body -RequestId $requestId
+                    Write-Log -ClientIP $clientIP -Request $requestLine -Status 'NOT FOUND' -ExitCode '-' -RequestId $requestId
+                    return
+                }
+                $staticFull = $resolvedDefault
+            } elseif (-not (Test-Path -LiteralPath $staticFull -PathType Leaf)) {
+                $body = New-JsonResponse -ExitCode 404 -Output '' -Err "File not found: $urlPath"
+                Send-Response -Response $resp -StatusCode 404 -Body $body -RequestId $requestId
+                Write-Log -ClientIP $clientIP -Request $requestLine -Status 'NOT FOUND' -ExitCode '-' -RequestId $requestId
+                return
+            }
+
+            $sr = Send-StaticFile -Request $req -Response $resp -FilePath $staticFull -RequestId $requestId
+            $null = [System.Threading.Interlocked]::Increment($requestsTotal)
+            Write-Log -ClientIP $clientIP -Request $requestLine -Status $sr.Reason -ExitCode "$($sr.StatusCode)" -RequestId $requestId
             return
         }
 

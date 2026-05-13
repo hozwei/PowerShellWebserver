@@ -40,6 +40,12 @@ $cfg = @{
     LogIntegrityHash         = $false
     LogSchedule              = 'Daily'
     LogFormat                = 'Native'
+    StaticServingEnabled     = $false
+    StaticRoot               = ''     # empty = use WebRoot
+    DefaultDocuments         = @('index.html', 'index.htm')
+    StaticCacheHeaders       = $true
+    BlockedMimeTypes         = @()
+    # MimeTypeMap left at defaults — ~50 entries covering text/web/image/audio/video/font/archive types
 }
 ```
 
@@ -77,6 +83,11 @@ $cfg = @{
     LogIntegrityHash         = $true
     LogSchedule              = 'Hourly'
     LogFormat                = 'IIS-W3C'
+    StaticServingEnabled     = $true
+    StaticRoot               = 'D:\automation\posh\public'
+    DefaultDocuments         = @('index.html', 'index.htm', 'home.html')
+    StaticCacheHeaders       = $true
+    BlockedMimeTypes         = @('video/', 'audio/')
 }
 ```
 
@@ -142,6 +153,12 @@ These are passed on the command line when starting the server. `Register-Schedul
 | `LogIntegrityHash` | `bool` | `$false` | At startup, write an `.md5` companion file next to every completed log file in `LogDir`. The currently-active log file is intentionally skipped so its hash never goes stale. Output format matches `md5sum` (lowercase hash + two spaces + filename). Provides a basic audit trail for log files at rest. |
 | `LogSchedule` | `string` | `'Daily'` | Log file rotation schedule. `'Daily'` (default): file name is `YYYY-MM-DD.log`. `'Hourly'`: file name is `YYYY-MM-DDTHH.log` (one file per hour). `LogRetentionDays` is interpreted as days in both cases — at hourly granularity, ~24 files per day age out together. |
 | `LogFormat` | `string` | `'Native'` | Log line format. `'Native'` (default): pipe-delimited columns matching the existing format. `'IIS-W3C'`: W3C Extended Log File Format with `#Software`, `#Version`, `#Date`, and `#Fields` header lines emitted on first write to a new file — consumable by `logparser` and similar tools. Fields: `date time c-ip cs-method cs-uri-stem cs-uri-query sc-status cs(User-Agent) x-request-id`. |
+| `StaticServingEnabled` | `bool` | `$false` | Serve non-`.ps1` files (HTML, CSS, JS, images, fonts, …) from `StaticRoot`. Opt-in for backward compatibility — when off, every non-`.ps1` request still returns HTTP 400 as before. Only `GET` is accepted on static resources; `POST` returns HTTP 405. |
+| `StaticRoot` | `string` | `""` (= `WebRoot`) | Filesystem root for static content. Empty string means: reuse `WebRoot`, so static files live alongside `.ps1` endpoints. Path-traversal protection is applied identically to the `.ps1` branch. |
+| `DefaultDocuments` | `string[]` | `@('index.html', 'index.htm')` | When a static request resolves to a directory (or a path ending in `/`), each file name in this list is tried in order under that directory; the first existing one is served. If none exist, the response is HTTP 404 — directory browsing is opt-in (PR-9, not yet implemented). |
+| `StaticCacheHeaders` | `bool` | `$true` | Emit `ETag` and `Last-Modified` on static responses and honor `If-None-Match` / `If-Modified-Since` with HTTP 304. ETag format: `"<length>-<utcTicksHex>"`. Set to `$false` to disable caching headers entirely (every request gets a fresh 200). |
+| `BlockedMimeTypes` | `string[]` | `@()` | MIME-type blacklist for static responses — matched via `StartsWith` so `'video/'` blocks every video subtype. Matching entries trigger HTTP 403. Legacy PoSH Server "content filter" parity. |
+| `MimeTypeMap` | `hashtable` | ~50 entries | Map of file extension (lowercase, with leading dot — `'.png'`) to Content-Type string. Defaults cover the common web/image/audio/video/font/archive types. Unknown extensions fall back to `application/octet-stream`. Override entries by editing the hashtable directly in `Start-WebServer.ps1`. |
 
 ### Register-ScheduledTask.ps1 — Scheduled Task Options
 
