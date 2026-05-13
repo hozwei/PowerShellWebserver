@@ -31,6 +31,11 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Two-level dot-source — this file lives at webroot/users/[id].ps1, so
+# globalvars.ps1 is two directories up.
+. (Join-Path $PSScriptRoot '..\..\globalvars.ps1')
+
 $showDetail = $Detail -eq 'true' -or $Detail -eq '1'
 
 if ([string]::IsNullOrWhiteSpace($id)) {
@@ -38,10 +43,19 @@ if ([string]::IsNullOrWhiteSpace($id)) {
     exit 1
 }
 
-# Toy in-script "DB" — real endpoints would query SQL / a file / an API.
+# Toy in-script "DB". A real endpoint would query AD against $LdapUsers
+# using credentials decrypted from encrypted_pw\ with the $key already
+# in scope (both supplied by globalvars.ps1):
+#
+#   $cipher = (Get-Content "$PoshEncryptedDir\encryptedString_ad_adsread.txt" -Raw).Trim()
+#   $secStr = ConvertTo-SecureString -String $cipher -Key $key
+#   $cred   = [PSCredential]::new('DOMAIN\svc-adsread', $secStr)
+#   Get-ADUser -Identity $id -SearchBase $LdapUsers -Credential $cred
 $record = [ordered]@{
     id        = $id
     name      = "User-$id"
+    domain    = $DomainDnsSuffix
+    ldapBase  = $LdapUsers
     createdAt = (Get-Date).AddDays(-([math]::Abs($id.GetHashCode()) % 365)).ToString('yyyy-MM-dd')
     active    = ($id.GetHashCode() % 2) -eq 0
 }

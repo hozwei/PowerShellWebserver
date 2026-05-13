@@ -37,6 +37,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Central config: post-json log/audit folder + admin mail address come
+# from globalvars so multiple POST endpoints can stay consistent.
+. (Join-Path $PSScriptRoot '..\globalvars.ps1')
+
 if ([string]::IsNullOrWhiteSpace($JsonFilePath)) {
     Write-Error 'JsonFilePath missing. Call this endpoint via HTTP POST.'
     exit 1
@@ -65,6 +69,7 @@ $roles = if ($data.PSObject.Properties['roles']) { @($data.roles) } else { @() }
 
 $echo = [ordered]@{
     receivedAt   = (Get-Date).ToString('o')
+    server       = $PoshServerFqdn
     bodyPath     = $JsonFilePath
     bodyBytes    = (Get-Item -LiteralPath $JsonFilePath).Length
     parsed = [ordered]@{

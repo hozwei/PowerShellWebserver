@@ -28,10 +28,16 @@
 
 $ErrorActionPreference = 'Stop'
 
+# Central config — used here to surface the deployment FQDN alongside
+# the session id, so multi-server cookie tests can verify which posh
+# instance issued the cookie.
+. (Join-Path $PSScriptRoot '..\globalvars.ps1')
+
 $sessionId  = $env:POSH_SESSION_ID
 $rawCookies = $env:POSH_COOKIES
 
 $result = [ordered]@{
+    server           = $PoshServerFqdn
     sessionId        = if ([string]::IsNullOrEmpty($sessionId))  { $null } else { $sessionId }
     sessionEnabled   = -not [string]::IsNullOrEmpty($sessionId)
     rawCookieHeader  = if ([string]::IsNullOrEmpty($rawCookies)) { '' } else { $rawCookies }

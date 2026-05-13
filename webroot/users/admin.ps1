@@ -22,10 +22,15 @@
 
 $ErrorActionPreference = 'Stop'
 
+# Two-level dot-source — this file lives at webroot/users/admin.ps1.
+. (Join-Path $PSScriptRoot '..\..\globalvars.ps1')
+
 [ordered]@{
     id          = 'admin'
     name        = 'Administrator'
     role        = 'admin'
+    domain      = $DomainDnsSuffix
+    adminMail   = $AdminMail
     privileges  = @('read', 'write', 'rotate-keys', 'view-audit')
     note        = 'Static handler — picked by exact-filename priority over the [id] placeholder route.'
     timestamp   = (Get-Date).ToString('o')

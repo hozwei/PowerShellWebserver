@@ -23,11 +23,22 @@
         -Headers @{ 'X-Api-Key' = 'your-key' }
 #>
 param(
-    [string] $ComputerName = $env:COMPUTERNAME,
+    [string] $ComputerName = '',
     [string] $Detail       = 'false'
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Central config: lets the operator change the default target without
+# editing every endpoint individually. globalvars.ps1 is two levels up
+# because this script lives at webroot/subdir/.
+. (Join-Path $PSScriptRoot '..\..\globalvars.ps1')
+
+# Fall back to the centrally-configured default host when the caller did
+# not pass one — keeps the demo working out of the box.
+if ([string]::IsNullOrWhiteSpace($ComputerName)) {
+    $ComputerName = $DefaultTargetHost
+}
 $showDetail = $Detail -eq 'true' -or $Detail -eq '1'
 
 try {

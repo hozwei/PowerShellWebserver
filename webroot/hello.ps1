@@ -32,13 +32,17 @@ param(
     [string] $Loud  = 'false'
 )
 
+# Dot-source the central config (server names, paths, AES key).
+. (Join-Path $PSScriptRoot '..\globalvars.ps1')
+
 # Query-string values arrive as strings — cast Count and convert Loud.
 $repeats = [int]$Count
 if ($repeats -lt 1)  { $repeats = 1 }
 if ($repeats -gt 10) { $repeats = 10 }
 $shout = $Loud -eq 'true' -or $Loud -eq '1'
 
-$greeting = "Hello, $Name!"
+# Server name pulled from globalvars so a deployment rename touches one file.
+$greeting = "Hello, $Name! (from $PoshServerFqdn)"
 if ($shout) { $greeting = $greeting.ToUpper() }
 
 1..$repeats | ForEach-Object { Write-Output $greeting }

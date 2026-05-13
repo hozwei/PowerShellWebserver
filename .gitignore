@@ -7,6 +7,17 @@ logs/*.log
 !logs/.gitkeep
 
 # ---------------------------------------------------------------------------
+# Secrets — keep encrypted credential files out of git
+# ---------------------------------------------------------------------------
+# globalvars.ps1 is THE central config and ships in the repo. After running
+# tools\Initialize-Globalvars.ps1 the $key array contains your per-install
+# random AES key — do NOT commit that personalised version back upstream.
+encrypted_pw/encryptedString_*.txt
+
+# Keep the encrypted_pw/ directory itself so a fresh clone has the layout.
+!encrypted_pw/.gitkeep
+
+# ---------------------------------------------------------------------------
 # Project-specific exclusions
 # ---------------------------------------------------------------------------
 AGENTS.md

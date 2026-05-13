@@ -34,9 +34,13 @@ param(
     [string] $Message = 'demo message'
 )
 
+# Central config — included so the response includes the operator's
+# AdminMail address, useful when a 500 prompts an operator to follow up.
+. (Join-Path $PSScriptRoot '..\globalvars.ps1')
+
 switch ($Mode.ToLowerInvariant()) {
     'ok' {
-        Write-Output "OK: $Message"
+        Write-Output "OK: $Message  (contact: $AdminMail on issue)"
         exit 0
     }
     'warn' {

@@ -32,8 +32,14 @@ param()
 
 $ErrorActionPreference = 'Stop'
 
+# Central config — the FQDN reported here is the deployment-level
+# identifier, distinct from $env:COMPUTERNAME which is the underlying VM.
+. (Join-Path $PSScriptRoot '..\globalvars.ps1')
+
 $items = @(
     @{ Hostname     = $env:COMPUTERNAME }
+    @{ PoshServer   = $PoshServerFqdn }
+    @{ Domain       = $DomainDnsSuffix }
     @{ TimeUtc      = (Get-Date).ToUniversalTime().ToString('o') }
     @{ PSVersion    = $PSVersionTable.PSVersion.ToString() }
     @{ PoshRequests = if ($null -ne $requestsTotal) { [System.Threading.Interlocked]::Read($requestsTotal) } else { 0 } }

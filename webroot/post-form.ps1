@@ -29,6 +29,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Central config: keeps the response shape aligned with post-json.ps1
+# (both endpoints can echo the same $Global:PoshServerFqdn).
+. (Join-Path $PSScriptRoot '..\globalvars.ps1')
+
 if ([string]::IsNullOrWhiteSpace($JsonFilePath) -or
     -not (Test-Path -LiteralPath $JsonFilePath -PathType Leaf)) {
     Write-Error 'JsonFilePath missing or unreadable. POST a form body to call this endpoint.'
@@ -40,6 +44,7 @@ $data = Get-Content -LiteralPath $JsonFilePath -Raw -Encoding UTF8 |
 
 $result = [ordered]@{
     receivedAt = (Get-Date).ToString('o')
+    server     = $PoshServerFqdn
     keys       = @($data.Keys | Sort-Object)
     values     = [ordered]@{}
 }
