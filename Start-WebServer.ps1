@@ -76,6 +76,41 @@ param(
 )
 
 # ---------------------------------------------------------------------------
+# Startup phase
+# ---------------------------------------------------------------------------
+# Order matters — each step builds on the previous and assumes the earlier
+# checks have already failed-loudly when their precondition wasn't met:
+#
+#   1. -BaseDir resolution (now)
+#   2. early startup-log path (immediately below)
+#   3. PowerShell 7 runtime check       (lines 94-115)
+#   4. POSH_API_KEY env-var check       (lines 117-145)
+#   5. Basic-Auth env-var read          (lines 147-160)
+#   6. $cfg literal materialisation     (lines ~175 onwards)
+#   7. -DumpConfig fast-exit            (after $cfg + derived defaults)
+#   8. config.psd1 load + merge         (mandatory, hard-exits)
+#   9. CLI-explicit param re-apply      (overrides config.psd1)
+#  10. Post-merge numeric/path checks
+#  11. API-key BC merge                 (env-key into ApiKeys)
+#  12. Set-CfgDerivedDefaults (2nd run) (after file merge)
+#  13. -DumpEffectiveConfig fast-exit
+#  14. Mutex / counter / cache init
+#  15. Function definitions (Write-Log etc.)
+#  16. Admin check (loopback bypass)
+#  17. HTTPS netsh sslcert validation
+#  18. Auth-mode credential validation
+#  19. PHP-CGI binary validation
+#  20. Prefixes shape + duplicate validation
+#  21. Cross-field consistency block
+#  22. Directory creation + log rotation
+#  23. Listener start + main loop
+#
+# Any change to the order needs to consider: is the precondition for the
+# next step still satisfied? Most fail-loudly checks call exit 1 so a
+# misordered earlier step would simply not run.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
 # Base path — defaults to 'C:\posh' but is overridable via -BaseDir. Defined
 # before all checks so every early-exit path shares the same value. The
 # config-merge step below preserves the resolved value in $cfg via the
@@ -83,18 +118,24 @@ param(
 # ---------------------------------------------------------------------------
 $baseDir = $BaseDir
 
+# Pre-cfg startup-log path. Used by every early-exit path (PS-7 check, API-key
+# check, config-load error) that runs before Write-StartupLog is available.
+# Same target as Write-StartupLog ($baseDir\logs\startup.log) so operators
+# only need to look at one file.
+$script:earlyStartupLog = Join-Path $baseDir 'logs\startup.log'
+
 # ---------------------------------------------------------------------------
 # PowerShell 7 — mandatory check
-# Must run before $cfg and logging setup.
-# $PSVersionTable.PSEdition is 'Core' in PS 7, 'Desktop' in PS 5.x
+# Must run before $cfg and logging setup. Edition='Core' alone is not enough:
+# PowerShell 6 also reports Core but lacks features posh relies on (Brotli
+# stream, ConvertFrom-Json -AsHashtable, etc.). Pin the floor at major 7.
 # ---------------------------------------------------------------------------
-if ($PSVersionTable.PSEdition -ne 'Core') {
-    $logDir  = Join-Path $baseDir 'logs'
-    $logFile = Join-Path $logDir 'startup.log'
-    $line    = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | STARTUP | PowerShell 7 required. Running version: $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition))"
+if ($PSVersionTable.PSEdition -ne 'Core' -or $PSVersionTable.PSVersion.Major -lt 7) {
+    $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | STARTUP | PowerShell 7 required. Running version: $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition))"
     try {
-        if (-not (Test-Path $logDir)) { $null = New-Item -ItemType Directory -Path $logDir -Force }
-        [System.IO.File]::AppendAllText($logFile, $line + [System.Environment]::NewLine, [System.Text.Encoding]::UTF8)
+        $logDir = Split-Path -Parent $script:earlyStartupLog
+        if (-not (Test-Path -LiteralPath $logDir -PathType Container)) { $null = New-Item -ItemType Directory -Path $logDir -Force }
+        [System.IO.File]::AppendAllText($script:earlyStartupLog, $line + [System.Environment]::NewLine, [System.Text.Encoding]::UTF8)
     } catch { }
     Write-Output $line
     exit 1
@@ -114,12 +155,19 @@ $ErrorActionPreference = 'Continue'
 # No key = no start — unprotected operation is not permitted.
 # ---------------------------------------------------------------------------
 $apiKey = $env:POSH_API_KEY
-if ([string]::IsNullOrEmpty($apiKey) -and -not $DumpConfig -and -not $DumpEffectiveConfig) {
-    $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | STARTUP | ERROR: Environment variable POSH_API_KEY is not set. Server will not start."
+if ([string]::IsNullOrWhiteSpace($apiKey) -and -not $DumpConfig -and -not $DumpEffectiveConfig) {
+    $apiKeyReason = if ($null -eq $apiKey) {
+        'not set'
+    } elseif ($apiKey.Length -eq 0) {
+        'set but empty'
+    } else {
+        'set but contains only whitespace'
+    }
+    $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | STARTUP | ERROR: Environment variable POSH_API_KEY is $apiKeyReason. Server will not start."
     try {
-        if (-not (Test-Path $baseDir)) { $null = New-Item -ItemType Directory -Path $baseDir -Force }
-        $startupLog = Join-Path $baseDir 'logs\startup.log'
-        [System.IO.File]::AppendAllText($startupLog, $line + [System.Environment]::NewLine, [System.Text.Encoding]::UTF8)
+        $logDir = Split-Path -Parent $script:earlyStartupLog
+        if (-not (Test-Path -LiteralPath $logDir -PathType Container)) { $null = New-Item -ItemType Directory -Path $logDir -Force }
+        [System.IO.File]::AppendAllText($script:earlyStartupLog, $line + [System.Environment]::NewLine, [System.Text.Encoding]::UTF8)
     } catch { }
     Write-Output $line
     Write-Output ''
@@ -152,6 +200,14 @@ if ($null -eq $basicPass) { $basicPass = '' }
 # $PID for PwshExe — must therefore be defined BEFORE the block runs.
 # Reordering blocks here without minding that contract leaves silently
 # empty $cfg fields (no error is raised — $null just lands in the value).
+#
+# Naming: in the main script scope, $cfg and $script:cfg refer to the same
+# variable — PowerShell aliases them. The dual notation in the codebase is
+# intentional: functions called from RunspacePool runspaces use $script:cfg
+# (the runspace's own script scope, populated by the request handler), so
+# function bodies prefer that form. The main thread's startup body uses the
+# unprefixed $cfg for brevity. Don't `Remove-Variable -Scope Script cfg` —
+# it would clear the alias too.
 # ---------------------------------------------------------------------------
 $cfg = @{
     HttpsEnabled        = $HttpsEnabled.IsPresent                    # HTTPS active?
@@ -363,11 +419,19 @@ if ($DumpConfig) {
 # visible in `git diff`/the editor and not buried in script defaults.
 # ---------------------------------------------------------------------------
 $resolvedConfigFile = if (-not [string]::IsNullOrEmpty($ConfigFile)) { $ConfigFile } else { Join-Path $baseDir 'config.psd1' }
+# Relative paths resolve against the current working directory, which under
+# Scheduled Task is C:\Windows\System32 — not what an operator expects. Pin
+# to an absolute path so error messages and downstream Import-PowerShellDataFile
+# calls reference the file the operator actually meant.
+if (-not [System.IO.Path]::IsPathRooted($resolvedConfigFile)) {
+    $resolvedConfigFile = Join-Path (Get-Location).Path $resolvedConfigFile
+}
 if (-not (Test-Path -LiteralPath $resolvedConfigFile -PathType Leaf)) {
     $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | STARTUP | ERROR: config.psd1 not found at '$resolvedConfigFile'. Run tools\Initialize-PoshConfig.ps1 first."
     try {
-        if (-not (Test-Path $baseDir)) { $null = New-Item -ItemType Directory -Path $baseDir -Force }
-        [System.IO.File]::AppendAllText((Join-Path $baseDir 'logs\startup.log'), $line + [System.Environment]::NewLine, [System.Text.Encoding]::UTF8)
+        $logDir = Split-Path -Parent $script:earlyStartupLog
+        if (-not (Test-Path -LiteralPath $logDir -PathType Container)) { $null = New-Item -ItemType Directory -Path $logDir -Force }
+        [System.IO.File]::AppendAllText($script:earlyStartupLog, $line + [System.Environment]::NewLine, [System.Text.Encoding]::UTF8)
     } catch { }
     Write-Output $line
     Write-Output ''
@@ -408,10 +472,11 @@ try {
     }
     $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | STARTUP | ERROR: External config '$resolvedConfigFile' could not be parsed: $($_.Exception.Message)"
     try {
-        if (-not (Test-Path $baseDir)) { $null = New-Item -ItemType Directory -Path $baseDir -Force }
-        [System.IO.File]::AppendAllText((Join-Path $baseDir 'logs\startup.log'), $line + [System.Environment]::NewLine, [System.Text.Encoding]::UTF8)
+        $logDir = Split-Path -Parent $script:earlyStartupLog
+        if (-not (Test-Path -LiteralPath $logDir -PathType Container)) { $null = New-Item -ItemType Directory -Path $logDir -Force }
+        [System.IO.File]::AppendAllText($script:earlyStartupLog, $line + [System.Environment]::NewLine, [System.Text.Encoding]::UTF8)
         if ($details -ne $_.Exception.Message) {
-            [System.IO.File]::AppendAllText((Join-Path $baseDir 'logs\startup.log'), $details + [System.Environment]::NewLine, [System.Text.Encoding]::UTF8)
+            [System.IO.File]::AppendAllText($script:earlyStartupLog, $details + [System.Environment]::NewLine, [System.Text.Encoding]::UTF8)
         }
     } catch { }
     Write-Output $line
@@ -919,8 +984,15 @@ function Write-StartupLog {
     )
 
     if ($Severity -eq 'INFO') {
-        if     ($Message -match '^\s*ERROR\b') { $Severity = 'ERROR' }
-        elseif ($Message -match '^\s*WARN\b')  { $Severity = 'WARN' }
+        if ($Message -match '^\s*ERROR\b\s*:?\s*(.*)') {
+            $Severity = 'ERROR'
+            # Strip the legacy "ERROR: " prefix so the rendered line is "STARTUP | ERROR | msg",
+            # not the duplicate "STARTUP | ERROR | ERROR: msg" callers would otherwise produce.
+            if ($Matches[1]) { $Message = $Matches[1] }
+        } elseif ($Message -match '^\s*WARN\b\s*:?\s*(.*)') {
+            $Severity = 'WARN'
+            if ($Matches[1]) { $Message = $Matches[1] }
+        }
     }
 
     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
@@ -1107,15 +1179,37 @@ function Remove-StaleRateLimitEntries {
 }
 
 # ---------------------------------------------------------------------------
-# Admin check
+# Admin check (step 16 in the startup-phase ladder near the top of the file).
+# HttpListener needs admin privileges to bind '+' / '*' / non-loopback IPs.
+# Loopback-only prefixes (127.0.0.1 / [::1] / localhost) work without admin —
+# when the operator has narrowed Prefixes to those, skip the check so dev/test
+# workflows don't require an elevated shell.
 # ---------------------------------------------------------------------------
-$principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
-if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Write-StartupLog 'ERROR: Not running as Administrator. Port binding requires admin privileges.'
-    Write-Output ''
-    Write-Output 'ERROR: This script must be run as Administrator.'
-    Write-Output 'Solution: open pwsh.exe as Administrator and run again.'
-    exit 1
+$loopbackOnly = $false
+if ($cfg.Prefixes -is [System.Collections.IList] -and $cfg.Prefixes.Count -gt 0) {
+    $loopbackOnly = $true
+    # The regex matches the three forms HttpListener recognises for loopback:
+    # 'localhost', '127.0.0.1' (IPv4), and '[::1]' (bracketed IPv6 literal).
+    # Anything else — wildcards '+'/'*', external IPs, FQDNs — requires admin.
+    foreach ($p in $cfg.Prefixes) {
+        if ([string]$p -notmatch '^https?://(localhost|127\.0\.0\.1|\[::1\])(:[0-9]+)?/') {
+            $loopbackOnly = $false
+            break
+        }
+    }
+}
+if (-not $loopbackOnly) {
+    $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        Write-StartupLog 'ERROR: Not running as Administrator. Port binding requires admin privileges.'
+        Write-Output ''
+        Write-Output 'ERROR: This script must be run as Administrator.'
+        Write-Output 'Solution: open pwsh.exe as Administrator and run again.'
+        Write-Output '   (or restrict Prefixes to loopback-only to skip this check)'
+        exit 1
+    }
+} else {
+    Write-StartupLog "Admin check skipped: all Prefixes bind to loopback only ($($cfg.Prefixes -join ', '))."
 }
 
 # ---------------------------------------------------------------------------
@@ -1138,34 +1232,89 @@ if (-not [string]::IsNullOrEmpty($script:envKeyMergeNote)) {
 }
 
 if ($cfg.HttpsEnabled) {
+    # Try the IPv4 binding form first, then the IPv6 form. The combined view
+    # has both bindings, but using the per-IP form keeps the diagnostic
+    # message clear about which address the cert is bound to.
     $netshOut = netsh http show sslcert "ipport=0.0.0.0:$($cfg.HttpsPort)" 2>&1
-    if ($LASTEXITCODE -ne 0 -or ($netshOut -join '') -notmatch 'IP:Port') {
+    $bindingOk = ($LASTEXITCODE -eq 0) -and (($netshOut -join '') -match 'IP:Port')
+    if (-not $bindingOk) {
+        $netshOut6 = netsh http show sslcert "ipport=[::]:$($cfg.HttpsPort)" 2>&1
+        if (($LASTEXITCODE -eq 0) -and (($netshOut6 -join '') -match 'IP:Port')) {
+            $bindingOk = $true
+            $netshOut  = $netshOut6
+        }
+    }
+    $netshLine = ($netshOut | Out-String).Trim()
+    if (-not $bindingOk) {
         Write-StartupLog "ERROR: No netsh sslcert binding found for port $($cfg.HttpsPort)."
         Write-StartupLog 'Solution: run Register-ScheduledTask.ps1 again and configure HTTPS.'
+        if (-not [string]::IsNullOrWhiteSpace($netshLine)) {
+            Write-StartupLog "netsh output (for diagnostics): $netshLine"
+        }
         Write-Output ''
         Write-Output "ERROR: HTTPS configured but no certificate binding found for port $($cfg.HttpsPort)."
         Write-Output "Check: netsh http show sslcert ipport=0.0.0.0:$($cfg.HttpsPort)"
         Write-Output 'Solution: run Register-ScheduledTask.ps1 again.'
+        if (-not [string]::IsNullOrWhiteSpace($netshLine)) {
+            Write-Output ''
+            Write-Output '--- netsh output ---'
+            Write-Output $netshLine
+        }
         exit 1
     }
     Write-StartupLog "HTTPS validation OK: netsh sslcert binding found for port $($cfg.HttpsPort)."
 }
 
 # ---------------------------------------------------------------------------
-# Auth-mode validation — when AuthMode requires Basic, both POSH_BASIC_USER
-# and POSH_BASIC_PASS must be set. Mirrors the POSH_API_KEY check above.
+# Auth-mode validation — Basic / Both require POSH_BASIC_USER + POSH_BASIC_PASS.
+# Both additionally requires ApiKeys to have at least one entry (without keys,
+# 'Both' degrades to plain Basic and the mode label misleads operators).
+# ApiKey / Both require ApiKeys non-empty (BC fallback from POSH_API_KEY makes
+# this trivially satisfied when the env var is set).
 # ---------------------------------------------------------------------------
 if ($cfg.AuthMode -ne 'ApiKey') {
-    if ([string]::IsNullOrEmpty($cfg.BasicAuthUser) -or [string]::IsNullOrEmpty($cfg.BasicAuthPass)) {
-        Write-StartupLog ("ERROR: AuthMode = '{0}' requires POSH_BASIC_USER and POSH_BASIC_PASS environment variables." -f $cfg.AuthMode)
+    # IsNullOrWhiteSpace, not IsNullOrEmpty — a whitespace-only env var ' ' would
+    # otherwise pass this gate and then never match an incoming Basic header,
+    # locking everyone out of an "authenticated" server without any error.
+    if ([string]::IsNullOrWhiteSpace($cfg.BasicAuthUser) -or [string]::IsNullOrWhiteSpace($cfg.BasicAuthPass)) {
+        Write-StartupLog ("ERROR: AuthMode = '{0}' requires POSH_BASIC_USER and POSH_BASIC_PASS environment variables (non-empty, non-whitespace)." -f $cfg.AuthMode)
         Write-Output ''
-        Write-Output ("ERROR: AuthMode = '{0}' but Basic-Auth credentials are not set." -f $cfg.AuthMode)
+        Write-Output ("ERROR: AuthMode = '{0}' but Basic-Auth credentials are missing or whitespace-only." -f $cfg.AuthMode)
         Write-Output 'Solution: set both environment variables as Machine-scope and restart the server:'
         Write-Output "  [Environment]::SetEnvironmentVariable('POSH_BASIC_USER', 'username', 'Machine')"
         Write-Output "  [Environment]::SetEnvironmentVariable('POSH_BASIC_PASS', 'password', 'Machine')"
         exit 1
     }
     Write-StartupLog "Auth validation OK: AuthMode = '$($cfg.AuthMode)', Basic credentials present."
+}
+if ($cfg.AuthMode -in @('ApiKey', 'Both')) {
+    if (-not $cfg.ApiKeys -or $cfg.ApiKeys.Count -eq 0) {
+        Write-StartupLog ("ERROR: AuthMode = '{0}' requires at least one ApiKeys entry (or POSH_API_KEY env var). None found." -f $cfg.AuthMode)
+        Write-Output ''
+        Write-Output ("ERROR: AuthMode = '{0}' but ApiKeys is empty and POSH_API_KEY is not set." -f $cfg.AuthMode)
+        Write-Output 'Solution: set POSH_API_KEY or populate ApiKeys = @{ ''label'' = ''key''; ... } in config.psd1.'
+        exit 1
+    }
+}
+
+# ---------------------------------------------------------------------------
+# PwshExe sanity — defaults to the currently running pwsh.exe (auto-derived
+# from $PID), so a normal startup never trips this check. config.psd1 can
+# override the value; warn loudly if the override is no longer valid or
+# accidentally points at Windows PowerShell (which lacks PS-7 features).
+# ---------------------------------------------------------------------------
+if (-not [string]::IsNullOrWhiteSpace($cfg.PwshExe)) {
+    if (-not (Test-Path -LiteralPath $cfg.PwshExe -PathType Leaf)) {
+        Write-StartupLog "ERROR: PwshExe = '$($cfg.PwshExe)' does not exist. Subprocess execution would fail at runtime."
+        Write-Output ''
+        Write-Output "ERROR: PwshExe = '$($cfg.PwshExe)' does not exist."
+        Write-Output 'Solution: remove the override from config.psd1 (the script auto-derives the running pwsh) or fix the path.'
+        exit 1
+    }
+    $pwshLeaf = (Split-Path -Leaf $cfg.PwshExe).ToLowerInvariant()
+    if ($pwshLeaf -ne 'pwsh.exe' -and $pwshLeaf -ne 'pwsh') {
+        Write-StartupLog "WARN: PwshExe = '$($cfg.PwshExe)' does not look like pwsh ('$pwshLeaf'). Subprocess scripts may behave unexpectedly under Windows PowerShell."
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -1255,6 +1404,10 @@ if ($cfg.CustomErrorPages -and -not (Test-Path -LiteralPath $cfg.ErrorPagesRoot 
 # derived-defaults pass (further up the file): WebRoot / LogDir /
 # PostJsonDir rootedness, port-range, post-merge numeric bounds, unknown-
 # key typo detection.
+#
+# Runtime cousins of these checks live in /metrics (posh_log_drops_total,
+# posh_rate_limit_table_size, ...). Use that endpoint to watch for
+# operational issues the startup-time checks can't catch.
 # ---------------------------------------------------------------------------
 
 # Whitelist-style enum validation — invalid values otherwise fall through to
@@ -1475,11 +1628,14 @@ foreach ($listKey in @('GzipMimeTypes', 'AcceptedContentTypes', 'BlockedMimeType
 }
 
 # ---------------------------------------------------------------------------
-# Log startup information
+# Log startup information. Single-line summary so log scrapers can pin a
+# regex on it. Order is stable: BaseDir, WebRoot, LogDir, PS version, listener.
 # ---------------------------------------------------------------------------
 $httpsInfo = if ($cfg.HttpsEnabled) { "  HTTPS=:$($cfg.HttpsPort)" } else { '' }
 $httpInfo  = if ($cfg.HttpPort -gt 0) { "  HTTP=:$($cfg.HttpPort)" } else { '  HTTP=disabled' }
-Write-StartupLog "Web server starting. BaseDir=$baseDir  WebRoot=$($cfg.WebRoot)  LogDir=$($cfg.LogDir)  PS=$($PSVersionTable.PSVersion)$httpInfo$httpsInfo"
+$authInfo  = "  Auth=$($cfg.AuthMode)"
+$execInfo  = "  Exec=$($cfg.ExecutionMode)"
+Write-StartupLog "Web server starting. BaseDir=$baseDir  WebRoot=$($cfg.WebRoot)  LogDir=$($cfg.LogDir)  PS=$($PSVersionTable.PSVersion)$httpInfo$httpsInfo$authInfo$execInfo"
 
 # ---------------------------------------------------------------------------
 # Ensure directories exist. The top-level dirs (WebRoot, LogDir, PostJsonDir)
@@ -1506,6 +1662,33 @@ foreach ($logKey in @('JobsLogFile', 'AuditLogFile', 'SlowLogFile')) {
         } catch {
             Write-StartupLog "WARN: ${logKey} parent directory '$parent' could not be created: $($_.Exception.Message). Writes to '$logFile' will fail silently at runtime."
         }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Pre-flight: warn when the drive backing LogDir / WebRoot is nearly full.
+# Not fatal — operators may have monitoring on the volume already and a fresh
+# install on a small system partition can briefly look low. Threshold: less
+# than 100 MB free is suspicious for a log-writing service.
+# ---------------------------------------------------------------------------
+$drivesChecked = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($pathKey in @('LogDir', 'WebRoot', 'PostJsonDir')) {
+    $path = [string]$cfg[$pathKey]
+    if ([string]::IsNullOrWhiteSpace($path)) { continue }
+    $root = [System.IO.Path]::GetPathRoot($path)
+    if ([string]::IsNullOrEmpty($root)) { continue }
+    if (-not $drivesChecked.Add($root)) { continue }
+    try {
+        $drive = [System.IO.DriveInfo]::new($root)
+        if ($drive.IsReady -and $drive.AvailableFreeSpace -lt 100MB) {
+            $freeMb = [math]::Round($drive.AvailableFreeSpace / 1MB, 2)
+            Write-StartupLog "WARN: drive $root has only $freeMb MB free; log/static writes may fail under load."
+        }
+    } catch {
+        # DriveInfo can throw for non-fixed roots (UNC paths etc.). Best-effort only;
+        # surface the failure quietly to startup.log so it isn't truly silent.
+        $null = $_
+        Write-StartupLog "WARN: disk-space pre-flight failed for '$root': $($_.Exception.Message)"
     }
 }
 
