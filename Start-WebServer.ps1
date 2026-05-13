@@ -2707,46 +2707,67 @@ if ($cfg.BackgroundJobs -and $cfg.BackgroundJobs.Count -gt 0) {
     $bgScriptBlock = {
         param([string] $Path, [int] $Interval, [string] $LogFile, [string] $PwshExeLocal)
 
-        while ($true) {
-            $startTime = Get-Date
-            try {
-                $psi = [System.Diagnostics.ProcessStartInfo]::new()
-                $psi.FileName               = $PwshExeLocal
-                $psi.UseShellExecute        = $false
-                $psi.RedirectStandardOutput = $true
-                $psi.RedirectStandardError  = $true
-                $psi.CreateNoWindow         = $true
-                foreach ($a in @('-NonInteractive', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Path)) {
-                    $null = $psi.ArgumentList.Add($a)
-                }
-                $proc = [System.Diagnostics.Process]::new()
-                $proc.StartInfo = $psi
-                $null = $proc.Start()
-                $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
-                $stderrTask = $proc.StandardError.ReadToEndAsync()
-                $null = $proc.WaitForExit()
-                # stdout is drained but intentionally discarded — reading it is required to
-                # prevent the child from blocking on a full pipe buffer; the actual content
-                # is only of interest in stderr (errors) and the exit code.
-                $null   = $stdoutTask.GetAwaiter().GetResult()
-                $stderr = $stderrTask.GetAwaiter().GetResult()
-                $exitCode = $proc.ExitCode
-                $proc.Dispose()
+        # Named Mutex serialises all writes to JobsLogFile across the per-job runspaces.
+        # 'Global\' makes it visible to every process / runspace on the box. Acquired with
+        # a short WaitOne so a stuck holder cannot deadlock the job forever.
+        $jobsMutex = [System.Threading.Mutex]::new($false, 'Global\PoshWebserverJobsLog')
 
-                $logLine = '{0} | JOB | {1} | EXIT:{2}' -f $startTime.ToString('yyyy-MM-dd HH:mm:ss'), $Path, $exitCode
-                try { Add-Content -LiteralPath $LogFile -Value $logLine -Encoding UTF8 } catch { }
-                if (-not [string]::IsNullOrWhiteSpace($stderr)) {
-                    foreach ($line in $stderr -split "(`r`n|`n)") {
-                        if (-not [string]::IsNullOrWhiteSpace($line)) {
-                            try { Add-Content -LiteralPath $LogFile -Value ('  STDERR: {0}' -f $line.TrimEnd()) -Encoding UTF8 } catch { }
+        # Helper closure so each log call goes through the same mutex protocol.
+        $writeLog = {
+            param([string] $LogText)
+            $acquired = $false
+            try {
+                $acquired = $jobsMutex.WaitOne(500)
+                Add-Content -LiteralPath $LogFile -Value $LogText -Encoding UTF8
+            } catch { } finally {
+                try { if ($acquired) { $jobsMutex.ReleaseMutex() } } catch { }
+            }
+        }
+
+        try {
+            while ($true) {
+                $startTime = Get-Date
+                try {
+                    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+                    $psi.FileName               = $PwshExeLocal
+                    $psi.UseShellExecute        = $false
+                    $psi.RedirectStandardOutput = $true
+                    $psi.RedirectStandardError  = $true
+                    $psi.CreateNoWindow         = $true
+                    foreach ($a in @('-NonInteractive', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Path)) {
+                        $null = $psi.ArgumentList.Add($a)
+                    }
+                    $proc = [System.Diagnostics.Process]::new()
+                    $proc.StartInfo = $psi
+                    $null = $proc.Start()
+                    $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+                    $stderrTask = $proc.StandardError.ReadToEndAsync()
+                    $null = $proc.WaitForExit()
+                    # stdout is drained but intentionally discarded — reading it is required to
+                    # prevent the child from blocking on a full pipe buffer; the actual content
+                    # is only of interest in stderr (errors) and the exit code.
+                    $null   = $stdoutTask.GetAwaiter().GetResult()
+                    $stderr = $stderrTask.GetAwaiter().GetResult()
+                    $exitCode = $proc.ExitCode
+                    $proc.Dispose()
+
+                    $logLine = '{0} | JOB | {1} | EXIT:{2}' -f $startTime.ToString('yyyy-MM-dd HH:mm:ss'), $Path, $exitCode
+                    & $writeLog $logLine
+                    if (-not [string]::IsNullOrWhiteSpace($stderr)) {
+                        foreach ($line in $stderr -split "(`r`n|`n)") {
+                            if (-not [string]::IsNullOrWhiteSpace($line)) {
+                                & $writeLog ('  STDERR: {0}' -f $line.TrimEnd())
+                            }
                         }
                     }
+                } catch {
+                    $errLine = '{0} | JOB ERROR | {1} | {2}' -f $startTime.ToString('yyyy-MM-dd HH:mm:ss'), $Path, $_
+                    & $writeLog $errLine
                 }
-            } catch {
-                $errLine = '{0} | JOB ERROR | {1} | {2}' -f $startTime.ToString('yyyy-MM-dd HH:mm:ss'), $Path, $_
-                try { Add-Content -LiteralPath $LogFile -Value $errLine -Encoding UTF8 } catch { }
+                Start-Sleep -Seconds $Interval
             }
-            Start-Sleep -Seconds $Interval
+        } finally {
+            try { $jobsMutex.Dispose() } catch { }
         }
     }
 
@@ -2859,12 +2880,20 @@ try {
                     $ipStatus.PadRight(13),
                     $ipReqId
                 $ipLogFile = Join-Path $cfg.LogDir ((Get-Date -Format 'yyyy-MM-dd') + '.log')
+                # Acquire the same Mutex Write-Log uses in the RunspacePool runspaces so
+                # IP-filter log lines do not interleave with worker writes. Short timeout
+                # so a stuck holder cannot block the main thread for long; the line is
+                # dropped on contention (still echoed to stdout below).
+                $ipMutexHeld = $false
                 try {
                     if (-not (Test-Path -LiteralPath $cfg.LogDir -PathType Container)) {
                         $null = New-Item -ItemType Directory -Path $cfg.LogDir -Force
                     }
+                    $ipMutexHeld = $script:logMutex.WaitOne(500)
                     [System.IO.File]::AppendAllText($ipLogFile, $ipLogLine + [System.Environment]::NewLine, [System.Text.Encoding]::UTF8)
-                } catch { }
+                } catch { } finally {
+                    try { if ($ipMutexHeld) { $script:logMutex.ReleaseMutex() } } catch { }
+                }
                 Write-Output $ipLogLine
                 continue
             }
