@@ -2786,6 +2786,12 @@ if ($cfg.BackgroundJobs -and $cfg.BackgroundJobs.Count -gt 0) {
     $bgScriptBlock = {
         param([string] $Path, [int] $Interval, [string] $LogFile, [string] $PwshExeLocal)
 
+        # Defensive: an empty $LogFile would silently swallow every write. Bail out so
+        # the failure surfaces immediately. This also marks $LogFile as referenced at
+        # the outer-block scope — PSScriptAnalyzer does not follow nested scriptblock
+        # closures and would otherwise flag the parameter as unused.
+        if ([string]::IsNullOrWhiteSpace($LogFile)) { return }
+
         # Named Mutex serialises all writes to JobsLogFile across the per-job runspaces.
         # 'Global\' makes it visible to every process / runspace on the box. Acquired with
         # a short WaitOne so a stuck holder cannot deadlock the job forever.
