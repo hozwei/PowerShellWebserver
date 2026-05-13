@@ -1,41 +1,58 @@
 #Requires -Version 7.0
 <#
 .SYNOPSIS
-    Demo endpoint for the F9 path-placeholder feature.
+    REST endpoint for a single user, addressed by id (F9 placeholder).
 
 .DESCRIPTION
-    Demonstrates Next.js-style REST routing — the [id] in the filename matches
-    one URL segment and arrives in the script as the -id parameter. Only active
-    when `PathPlaceholders = $true` is set in config.psd1; otherwise the URL
-    /users/<anything> returns 404 (exact-match only).
+    Demonstrates Next.js-style path placeholders. The `[id]` segment in
+    the filename matches one URL path segment and arrives as `-id`.
 
-    Call:
-        GET /users/123                    → -id '123'
-        GET /users/admin                  → -id 'admin'
-        GET /users/123?detail=true        → -id '123' -detail 'true'
+        GET /users/123         → -id '123'
+        GET /users/anna.smith  → -id 'anna.smith'
+
+    Only enabled when `PathPlaceholders = $true` is set in `config.psd1`.
+    With the feature off, the URL `/users/123` returns 404 (exact-match
+    only) and the file is reachable only via the literal URL
+    `/users/[id].ps1`.
+
+    Exact-filename routes win over placeholders: `webroot/users/admin.ps1`
+    will serve `/users/admin` instead of this script — that lets you
+    define specific handlers alongside the parameterised one.
 
 .PARAMETER id
-    Captured value of the [id] placeholder segment in the URL path.
+    User id captured from the URL path. Required.
 
-.PARAMETER detail
-    Optional query-string parameter. When 'true', adds an extra `details` field.
+.PARAMETER Detail
+    When 'true', includes a host info block alongside the basic record.
 #>
 param(
     [string] $id     = '',
-    [string] $detail = 'false'
+    [string] $Detail = 'false'
 )
 
-$result = [ordered]@{
-    user      = $id
-    timestamp = (Get-Date).ToString('o')
+$ErrorActionPreference = 'Stop'
+$showDetail = $Detail -eq 'true' -or $Detail -eq '1'
+
+if ([string]::IsNullOrWhiteSpace($id)) {
+    Write-Error 'User id is required.'
+    exit 1
 }
 
-if ($detail -eq 'true') {
-    $result.details = [ordered]@{
-        hostname = $env:COMPUTERNAME
-        pid      = $PID
+# Toy in-script "DB" — real endpoints would query SQL / a file / an API.
+$record = [ordered]@{
+    id        = $id
+    name      = "User-$id"
+    createdAt = (Get-Date).AddDays(-([math]::Abs($id.GetHashCode()) % 365)).ToString('yyyy-MM-dd')
+    active    = ($id.GetHashCode() % 2) -eq 0
+}
+
+if ($showDetail) {
+    $record.serverInfo = [ordered]@{
+        host       = $env:COMPUTERNAME
+        timestamp  = (Get-Date).ToString('o')
+        pid        = $PID
     }
 }
 
-$result | ConvertTo-Json -Depth 5 -Compress
+$record | ConvertTo-Json -Depth 5
 exit 0

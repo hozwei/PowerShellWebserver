@@ -1,37 +1,49 @@
 #Requires -Version 7.0
 <#
 .SYNOPSIS
-    Example .psxml endpoint — returns raw XML instead of a JSON envelope.
+    Alternate-extension example (psxml) — returns raw XML, no JSON envelope.
 
 .DESCRIPTION
-    PR-5 introduced extension aliases. Scripts ending in .psxml are served
-    with Content-Type 'text/xml' and the response body is the script's
-    raw stdout (no { exitCode, output, error } wrapper).
+    Files with the psxml, posh, or psapi extension bypass the
+    `{ exitCode, output, error }` JSON envelope: the server forwards
+    the script's stdout verbatim with a Content-Type chosen from
+    `ScriptExtensionMap`.
 
-    When $cfg.ExecutionMode = 'InProcess' the server injects a
-    ConvertTo-PoshApiXml helper into the runspace — this script falls
-    back to a manual here-string when the helper is unavailable
-    (Subprocess mode), so the same endpoint works in both modes.
+        psxml  -> text/xml; charset=utf-8
+        posh   -> text/html; charset=utf-8
+        psapi  -> application/xml; charset=utf-8
+
+    When `ExecutionMode = 'InProcess'` the server injects a
+    `ConvertTo-PoshApiXml` helper into the runspace (legacy PoSH Server
+    `New-PoSHAPIXML` shape). Under `Subprocess` (default), the helper
+    isn't visible inside `pwsh.exe`, so this script falls back to a
+    hand-rolled here-string. Same response either way.
 
 .EXAMPLE
-    Invoke-RestMethod -Uri 'http://localhost/api-status.psxml' `
-        -Headers @{ 'X-Api-Key' = 'your-api-key' }
+    $xml = Invoke-WebRequest -Uri 'http://localhost/api-status.psxml' `
+              -Headers @{ 'X-Api-Key' = 'your-key' }
+    [xml] $doc = $xml.Content
+    $doc.Result.Items.Item.Hostname
 #>
+param()
+
+# Empty param() block above anchors the comment-based help so
+# Get-ScriptMetadata (F7) + Build-OpenApiSpec (F10) can extract the synopsis.
 
 $ErrorActionPreference = 'Stop'
 
 $items = @(
-    @{ Hostname  = $env:COMPUTERNAME }
-    @{ TimeUtc   = (Get-Date).ToUniversalTime().ToString('o') }
-    @{ PSVersion = $PSVersionTable.PSVersion.ToString() }
+    @{ Hostname     = $env:COMPUTERNAME }
+    @{ TimeUtc      = (Get-Date).ToUniversalTime().ToString('o') }
+    @{ PSVersion    = $PSVersionTable.PSVersion.ToString() }
+    @{ PoshRequests = if ($null -ne $requestsTotal) { [System.Threading.Interlocked]::Read($requestsTotal) } else { 0 } }
 )
 
-# Prefer the injected helper (InProcess mode) for compact and consistent output;
-# fall back to a hand-rolled here-string under Subprocess mode where the helper
-# is not available in the child pwsh.exe session.
 if (Get-Command ConvertTo-PoshApiXml -ErrorAction SilentlyContinue) {
+    # InProcess mode — server-injected helper produces compact, schema-stable XML.
     ConvertTo-PoshApiXml -Code 1 -Message 'OK' -Items $items
 } else {
+    # Subprocess mode — hand-rolled equivalent.
     $itemXml = $items | ForEach-Object {
         $inner = ($_.GetEnumerator() | ForEach-Object { "    <$($_.Key)>$($_.Value)</$($_.Key)>" }) -join "`n"
         "  <Item>`n$inner`n  </Item>"
