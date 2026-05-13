@@ -221,6 +221,7 @@ $cfg = @{
     ScriptTimeoutSec         = 300    # 5 minutes — scripts running longer are terminated (HTTP 504)
     MaxConcurrent            = 10     # maximum parallel requests — excess requests receive HTTP 503
     RunspacePoolOverprovision = 2     # multiplier for RunspacePool max size relative to MaxConcurrent. Slots beyond the semaphore limit absorb the gap between semaphore.Release() and the cleanup loop's Dispose(); too low = main thread hangs on BeginInvoke under burst. Recommended 2-4.
+    RunspacePoolMinSize       = 1     # minimum RunspacePool size. Pre-warmed runspaces avoid the ~150ms cold-start latency for the first N requests after startup. Raise (e.g. = MaxConcurrent) when first-request latency matters more than memory footprint at idle.
     LogRetentionDays         = 180    # date-stemmed request logs (YYYY-MM-DD.log / YYYY-MM-DDTHH.log) older than N days are deleted at startup; single-file logs (audit/slow/jobs/startup) are exempt — they have separate size-based rotation. 0 = disabled.
     PostJsonDir              = Join-Path $baseDir 'postjson' # directory where POST body JSON files are stored
     PostJsonRetentionDays    = 30     # POST JSON files older than N days are deleted at startup (0 = disabled)
@@ -577,6 +578,7 @@ $numericBounds = @(
     @{ Key = 'RateLimitTableSizeWarnThreshold'; Min = 0; Max = 100000000 }  # 0 = disabled
     @{ Key = 'RateLimitQueuePollMs';      Min = 10;  Max = 60000 }   # 10 ms .. 60 s
     @{ Key = 'RateLimitPenaltySec';       Min = 0;   Max = 86400 }   # 0 = no penalty (instant unblock), 24 h upper
+    @{ Key = 'RunspacePoolMinSize';       Min = 1;   Max = 10000 }   # 1 = lazy start (cold-start latency on first req), higher = pre-warmed
 )
 foreach ($b in $numericBounds) {
     $v = $cfg[$b.Key]
@@ -668,6 +670,13 @@ $script:rateLimitedTotal = [ref] 0L
 # disposal errors would leak RunspacePool slots; this counter surfaces them
 # in /metrics so operators can spot starvation before dispatch is blocked.
 $script:runspaceDisposeFailures = [ref] 0L
+
+# High-water mark of in-flight requests. Sampled on every dispatch — the
+# main loop updates it via Interlocked::CompareExchange so two parallel
+# main-thread iterations (impossible today, but cheap defense) wouldn't
+# clobber each other. Useful for capacity planning: a sustained peak at
+# or near MaxConcurrent means the next traffic spike will see 503s.
+$script:inFlightPeak = [ref] 0L
 
 # Rate-limit state — ConcurrentDictionary for lock-free access from RunspacePool Runspaces.
 # Key: 'ip:<address>' or 'id:<api-key-label>' depending on RateLimitPerIdentity (F4).
@@ -1868,6 +1877,15 @@ Write-Output ''
 # Semaphore: limits active requests to MaxConcurrent — protects against bursts.
 # ---------------------------------------------------------------------------
 $semaphore = [System.Threading.SemaphoreSlim]::new($cfg.MaxConcurrent, $cfg.MaxConcurrent)
+
+# Stopwatch.IsHighResolution is system-wide — on every modern Windows host
+# it is $true (QueryPerformanceCounter-backed). A $false here means timing
+# resolution falls back to DateTime.Ticks (~16ms), which makes
+# MinRequestIntervalSec and the slow-log threshold blunt. Warn so the
+# operator knows that "1s throttle" might fire 16ms early or late.
+if (-not [System.Diagnostics.Stopwatch]::IsHighResolution) {
+    Write-StartupLog ("WARN: Stopwatch is not high-resolution on this host. Throttle / slow-log timing accuracy is ~16ms instead of microseconds.")
+}
 
 # ---------------------------------------------------------------------------
 # Helper functions for request processing
@@ -3455,6 +3473,7 @@ function Format-PromMetrics {
     $auditDrops  = [System.Threading.Interlocked]::Read($script:auditLogDropsTotal)
     $slowDrops   = [System.Threading.Interlocked]::Read($script:slowLogDropsTotal)
     $rsFails     = [System.Threading.Interlocked]::Read($script:runspaceDisposeFailures)
+    $peak        = [System.Threading.Interlocked]::Read($script:inFlightPeak)
 
     $sb = [System.Text.StringBuilder]::new(1024)
     $null = $sb.AppendLine('# HELP posh_uptime_seconds Server uptime since process start.')
@@ -3487,6 +3506,9 @@ function Format-PromMetrics {
     $null = $sb.AppendLine('# HELP posh_runspace_dispose_failures_total EndInvoke/Dispose calls that threw during runspace cleanup.')
     $null = $sb.AppendLine('# TYPE posh_runspace_dispose_failures_total counter')
     $null = $sb.AppendLine("posh_runspace_dispose_failures_total $rsFails")
+    $null = $sb.AppendLine('# HELP posh_in_flight_peak High-water mark of concurrently in-flight requests since process start.')
+    $null = $sb.AppendLine('# TYPE posh_in_flight_peak gauge')
+    $null = $sb.AppendLine("posh_in_flight_peak $peak")
     return $sb.ToString()
 }
 
@@ -3873,6 +3895,7 @@ $requestHandler = {
     $script:auditLogDropsTotal      = $auditLogDropsTotal
     $script:slowLogDropsTotal       = $slowLogDropsTotal
     $script:runspaceDisposeFailures = $runspaceDisposeFailures
+    $script:inFlightPeak            = $inFlightPeak
     # $semaphore, $startTime, $requestsTotal are used directly (no $script: needed)
 
     try {
@@ -4182,6 +4205,7 @@ $requestHandler = {
             $auditDrops  = [System.Threading.Interlocked]::Read($script:auditLogDropsTotal)
             $slowDrops   = [System.Threading.Interlocked]::Read($script:slowLogDropsTotal)
             $rsFails     = [System.Threading.Interlocked]::Read($script:runspaceDisposeFailures)
+            $peak        = [System.Threading.Interlocked]::Read($script:inFlightPeak)
             $body        = [ordered]@{
                 uptime                       = $uptimeStr
                 requestsTotal                = $total
@@ -4190,6 +4214,7 @@ $requestHandler = {
                 auditLogDropsTotal           = $auditDrops
                 slowLogDropsTotal            = $slowDrops
                 runspaceDisposeFailuresTotal = $rsFails
+                inFlightPeak                 = $peak
             } | ConvertTo-Json -Compress
             Send-Response -Response $resp -StatusCode 200 -Body $body -RequestId $requestId
             Write-Log -ClientIP $clientIP -Request $requestLine -Status 'METRICS' -ExitCode '-' -RequestId $requestId
@@ -4611,7 +4636,8 @@ foreach ($entry in @(
     [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('logDropsTotal',             $script:logDropsTotal,            $null),
     [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('auditLogDropsTotal',        $script:auditLogDropsTotal,       $null),
     [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('slowLogDropsTotal',         $script:slowLogDropsTotal,        $null),
-    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('runspaceDisposeFailures',   $script:runspaceDisposeFailures,  $null)
+    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('runspaceDisposeFailures',   $script:runspaceDisposeFailures,  $null),
+    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('inFlightPeak',              $script:inFlightPeak,             $null)
 )) { $iss.Variables.Add($entry) }
 
 # RunspacePool max = MaxConcurrent * RunspacePoolOverprovision (default 2).
@@ -4626,7 +4652,9 @@ foreach ($entry in @(
 # can lower it to cap process memory.
 $poolMultiplier = if ($cfg.RunspacePoolOverprovision -gt 0) { [int]$cfg.RunspacePoolOverprovision } else { 2 }
 $poolMax        = $cfg.MaxConcurrent * $poolMultiplier
-$runspacePool   = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $poolMax, $iss, $Host)
+$poolMin        = if ($cfg.RunspacePoolMinSize -gt 0) { [int]$cfg.RunspacePoolMinSize } else { 1 }
+if ($poolMin -gt $poolMax) { $poolMin = $poolMax }  # safety: min cannot exceed max
+$runspacePool   = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool($poolMin, $poolMax, $iss, $Host)
 $runspacePool.Open()
 # RunspacePoolState.Opened is the only state where BeginInvoke succeeds.
 # .Open() above is synchronous but defensive — if a future PowerShell version
@@ -4637,7 +4665,7 @@ if ($runspacePool.RunspacePoolStateInfo.State -ne [System.Management.Automation.
     Write-Output ("ERROR: RunspacePool is in state '{0}' after Open(). Cannot dispatch requests." -f $runspacePool.RunspacePoolStateInfo.State)
     exit 1
 }
-Write-StartupLog ("RunspacePool open: min=1 max={0} (MaxConcurrent={1} x Overprovision={2})." -f $poolMax, $cfg.MaxConcurrent, $poolMultiplier)
+Write-StartupLog ("RunspacePool open: min={0} max={1} (MaxConcurrent={2} x Overprovision={3})." -f $poolMin, $poolMax, $cfg.MaxConcurrent, $poolMultiplier)
 
 # ---------------------------------------------------------------------------
 # Background jobs — each `$cfg.BackgroundJobs` entry runs in its own dedicated
@@ -4966,6 +4994,17 @@ try {
             try { $resp503.OutputStream.Close()                                  } catch { }
             Write-Log -ClientIP $reqClientIP -Request "$($context.Request.HttpMethod) $reqUrlPath" -Status 'OVERLOAD' -ExitCode '-' -RequestId $overloadReqId
             continue
+        }
+
+        # Update in-flight high-water mark — the semaphore was just acquired,
+        # so the current in-flight count is (MaxConcurrent - remaining slots).
+        # CompareExchange loop in case the peak grew between read and write.
+        $inFlightNow = [long]($cfg.MaxConcurrent - $semaphore.CurrentCount)
+        while ($true) {
+            $currentPeak = [System.Threading.Interlocked]::Read($script:inFlightPeak)
+            if ($inFlightNow -le $currentPeak) { break }
+            $previousPeak = [System.Threading.Interlocked]::CompareExchange($script:inFlightPeak, $inFlightNow, $currentPeak)
+            if ($previousPeak -eq $currentPeak) { break }
         }
 
         # Dispatch request to RunspacePool — non-blocking.
