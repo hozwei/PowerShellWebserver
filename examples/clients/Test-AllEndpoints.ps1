@@ -31,17 +31,29 @@ function Assert-Case {
         [Parameter(Mandatory)][string] $Label,
         [Parameter(Mandatory)][scriptblock] $Test
     )
+    # Per-case stopwatch makes slow endpoints stand out in the output
+    # without requiring a separate run. >500ms is gently flagged in yellow
+    # so the eye catches outliers without colouring every line.
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
     try {
         $ok = & $Test
+        $sw.Stop()
+        $ms     = [int]$sw.ElapsedMilliseconds
+        $msTag  = if ($ms -ge 500) { '!{0,5}ms' -f $ms } else { ' {0,5}ms' -f $ms }
+        $msColor = if ($ms -ge 500) { 'Yellow' } else { 'DarkGray' }
         if ($ok) {
-            Write-Host ('[OK ] {0}' -f $Label) -ForegroundColor Green
+            Write-Host ('[OK ] ' + $msTag + ' ') -ForegroundColor Green -NoNewline
+            Write-Host $Label -ForegroundColor $msColor
             $script:pass++
         } else {
-            Write-Host ('[FAIL] {0}' -f $Label) -ForegroundColor Red
+            Write-Host ('[FAIL] ' + $msTag + ' ') -ForegroundColor Red -NoNewline
+            Write-Host $Label -ForegroundColor $msColor
             $script:fail++
         }
     } catch {
-        Write-Host ('[FAIL] {0}: {1}' -f $Label, $_.Exception.Message) -ForegroundColor Red
+        $sw.Stop()
+        $ms = [int]$sw.ElapsedMilliseconds
+        Write-Host ('[FAIL] {0,6}ms {1}: {2}' -f $ms, $Label, $_.Exception.Message) -ForegroundColor Red
         $script:fail++
     }
 }
