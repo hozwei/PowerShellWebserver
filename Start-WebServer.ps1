@@ -2751,7 +2751,15 @@ function Invoke-ScriptInProcess {
         $done   = $handle.AsyncWaitHandle.WaitOne($TimeoutSec * 1000)
 
         if (-not $done) {
+            # Stop() requests cancellation but doesn't guarantee immediate
+            # termination -- scripts in P/Invoke or tight CPU loops may ignore
+            # the request. Disposing the runspace itself forcibly releases
+            # resources; the runspace's underlying thread is torn down by the
+            # CLR shortly after Dispose. The outer try/finally still runs the
+            # rs.Dispose() below for the normal-completion path.
             try { $ps.Stop() } catch { }
+            try { if ($null -ne $ps) { $ps.Dispose(); $ps = $null } } catch { }
+            try { if ($null -ne $rs) { $rs.Dispose(); $rs = $null } } catch { }
             return [PSCustomObject]@{
                 ExitCode = -1
                 Output   = ''
@@ -3137,13 +3145,26 @@ function Invoke-Script {
     $finished = $proc.WaitForExit($TimeoutSec * 1000)
 
     if (-not $finished) {
-        # Timeout — kill the process.
+        # Timeout — kill the process. After Kill() the streams close on the
+        # OS side; we grab whatever has been written so far so the caller
+        # (and the slow-log entry) can see the script's last words before
+        # it was terminated. Without this, debugging a stuck script means
+        # adding a `Set-Content` line and waiting for the next reproduction.
         try { $proc.Kill() } catch { }
+        try { $null = $proc.WaitForExit(2000) } catch { }
+        $partialOut = ''
+        $partialErr = ''
+        try { if ($stdoutTask.IsCompleted) { $partialOut = $stdoutTask.GetAwaiter().GetResult() } } catch { }
+        try { if ($stderrTask.IsCompleted) { $partialErr = $stderrTask.GetAwaiter().GetResult() } } catch { }
         $proc.Dispose()
+        $errText = "Timeout: script was terminated after $TimeoutSec seconds."
+        if (-not [string]::IsNullOrWhiteSpace($partialErr)) {
+            $errText = "$errText`n--- partial stderr ---`n$($partialErr.TrimEnd())"
+        }
         return [PSCustomObject]@{
             ExitCode = -1
-            Output   = ''
-            Error    = "Timeout: script was terminated after $TimeoutSec seconds."
+            Output   = $partialOut.TrimEnd()
+            Error    = $errText
             TimedOut = $true
         }
     }
