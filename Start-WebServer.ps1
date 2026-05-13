@@ -505,9 +505,26 @@ if ($null -ne $external) {
     $knownCfgKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($k in $cfg.Keys) { $null = $knownCfgKeys.Add([string]$k) }
 
+    # Env-sourced credential keys — these come from POSH_API_KEY / POSH_BASIC_USER
+    # / POSH_BASIC_PASS at startup, NOT from config.psd1. Initialize-PoshConfig used
+    # to emit them as '' (a side effect of -DumpConfig secret redaction); merging an
+    # empty value would wipe the env-sourced default and break authentication on
+    # fresh installs. Skip empty overrides for exactly these three keys; non-empty
+    # overrides still win so operators can put a key directly in config.psd1 if they
+    # really want to.
+    $envSourcedKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $null = $envSourcedKeys.Add('ApiKey')
+    $null = $envSourcedKeys.Add('BasicAuthUser')
+    $null = $envSourcedKeys.Add('BasicAuthPass')
+
     $unknownKeys = [System.Collections.Generic.List[string]]::new()
+    $skippedEmpty = [System.Collections.Generic.List[string]]::new()
     foreach ($k in $external.Keys) {
         if (-not $knownCfgKeys.Contains([string]$k)) { $unknownKeys.Add([string]$k) }
+        if ($envSourcedKeys.Contains([string]$k) -and [string]::IsNullOrEmpty([string]$external[$k])) {
+            $skippedEmpty.Add([string]$k)
+            continue
+        }
         $cfg[$k] = $external[$k]
     }
     # Stash the success line for Write-StartupLog further down (Write-StartupLog
@@ -515,6 +532,9 @@ if ($null -ne $external) {
     $script:externalConfigStartupNote = "External config loaded: $resolvedConfigFile ($($external.Count) key(s) overridden)"
     if ($unknownKeys.Count -gt 0) {
         $script:externalConfigUnknownKeysNote = "WARN: config.psd1 contains $($unknownKeys.Count) key(s) not present in the inline schema (likely typos): $($unknownKeys -join ', ')"
+    }
+    if ($skippedEmpty.Count -gt 0) {
+        $script:externalConfigSkippedNote = "Note: config.psd1 had empty values for env-sourced key(s) [$($skippedEmpty -join ', ')]; preserved env-var defaults instead of wiping them."
     }
 }
 
@@ -1269,6 +1289,9 @@ if (-not [string]::IsNullOrEmpty($script:externalConfigStartupNote)) {
 }
 if (-not [string]::IsNullOrEmpty($script:externalConfigUnknownKeysNote)) {
     Write-StartupLog $script:externalConfigUnknownKeysNote
+}
+if (-not [string]::IsNullOrEmpty($script:externalConfigSkippedNote)) {
+    Write-StartupLog $script:externalConfigSkippedNote
 }
 if (-not [string]::IsNullOrEmpty($script:envKeyMergeNote)) {
     Write-StartupLog $script:envKeyMergeNote

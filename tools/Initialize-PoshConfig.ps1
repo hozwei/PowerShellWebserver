@@ -97,6 +97,14 @@ if ($null -eq $defaults -or $defaults.Count -eq 0) {
     exit 1
 }
 
+# Drop env-sourced credential keys entirely. -DumpConfig redacts their values
+# to '' for safety, but emitting them as '' here would override the env vars
+# (POSH_API_KEY / POSH_BASIC_USER / POSH_BASIC_PASS) at server startup and
+# break authentication. These keys belong in environment variables only.
+foreach ($envOnlyKey in @('ApiKey', 'BasicAuthUser', 'BasicAuthPass')) {
+    if ($defaults.ContainsKey($envOnlyKey)) { $null = $defaults.Remove($envOnlyKey) }
+}
+
 # ---------------------------------------------------------------------------
 # Group ordering: each entry collects related keys under a section header
 # so the generated file reads like a curated config rather than an
