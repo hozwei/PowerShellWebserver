@@ -139,7 +139,7 @@ $cfg = @{
     MaxRequestBodyBytes      = 20MB   # maximum POST body size in bytes — larger requests: HTTP 413
     RateLimitRequests        = 100    # maximum requests per IP per window — excess requests: HTTP 429 (0 = disabled)
     RateLimitWindowSec       = 600    # fixed window size in seconds (10 minutes)
-    RateLimitPenaltySec      = 1800   # penalty duration after first 429 in seconds (30 minutes)
+    RateLimitPenaltySec      = 300    # penalty duration after first 429 in seconds (5 minutes)
     RateLimitMode            = 'reject' # 'reject' = immediate HTTP 429 | 'queue' = wait up to RateLimitQueueTimeoutSec
     RateLimitQueueTimeoutSec = 10     # 'queue' mode only: seconds to wait before returning HTTP 429
     RateLimitExemptPaths     = @('/health', '/metrics') # paths excluded from rate limiting — always an array
