@@ -1601,7 +1601,19 @@ function Invoke-PhpCgi {
 
     $proc = [System.Diagnostics.Process]::new()
     $proc.StartInfo = $psi
-    $null = $proc.Start()
+    try {
+        $null = $proc.Start()
+    } catch {
+        # php-cgi.exe may have been removed/locked since the startup validation, or the
+        # OS may simply refuse the spawn. Return a structured 502 so the request handler
+        # can log it cleanly instead of catching a raw exception and emitting a generic 500.
+        try { $proc.Dispose() } catch { }
+        return [PSCustomObject]@{
+            StatusCode = 502; ContentType = 'text/plain; charset=utf-8'; Headers = @{}
+            Body = [System.Text.Encoding]::UTF8.GetBytes("PHP-CGI process failed to start: $_")
+            TimedOut = $false; Error = "PHP-CGI process failed to start: $_"
+        }
+    }
 
     # Pipe the request body to php-cgi's stdin — must be raw bytes (not the parsed body).
     try {
