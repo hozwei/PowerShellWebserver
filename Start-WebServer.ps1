@@ -51,9 +51,14 @@ param(
     [int]    $HttpPort  = 80,
     [ValidateRange(1, 65535)]
     [int]    $HttpsPort = 443,
-    # Optional path to a .psd1 file whose hashtable entries override the inline $cfg
-    # defaults. When empty, '<baseDir>\config.psd1' is auto-discovered if present.
-    [string] $ConfigFile = ''
+    # Path to the runtime config.psd1. Empty = '<baseDir>\config.psd1'. The file
+    # is mandatory at startup — generate it once via tools\Initialize-Config.ps1.
+    [string] $ConfigFile = '',
+    # Internal: dump the inline $cfg defaults (after derived-field fallbacks) as
+    # JSON to stdout, then exit 0. Used by tools\Initialize-Config.ps1 to seed a
+    # fresh config.psd1 without running the listener. Skips POSH_API_KEY and
+    # external-config checks because the dump only consumes inline defaults.
+    [switch] $DumpConfig
 )
 
 # ---------------------------------------------------------------------------
@@ -94,7 +99,7 @@ $ErrorActionPreference = 'Continue'
 # No key = no start — unprotected operation is not permitted.
 # ---------------------------------------------------------------------------
 $apiKey = $env:POSH_API_KEY
-if ([string]::IsNullOrEmpty($apiKey)) {
+if ([string]::IsNullOrEmpty($apiKey) -and -not $DumpConfig) {
     $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | STARTUP | ERROR: Environment variable POSH_API_KEY is not set. Server will not start."
     try {
         if (-not (Test-Path $baseDir)) { $null = New-Item -ItemType Directory -Path $baseDir -Force }
@@ -270,40 +275,87 @@ $cfg = @{
 }
 
 # ---------------------------------------------------------------------------
+# Derived-field fallbacks — keys whose default is computed from another $cfg
+# value rather than being a literal. Extracted into a function so the
+# -DumpConfig path can apply the same defaults without duplicating logic.
+# ---------------------------------------------------------------------------
+function Set-CfgDerivedDefaults {
+    param([Parameter(Mandatory)] [hashtable] $Cfg)
+    if ([string]::IsNullOrEmpty($Cfg.ErrorPagesRoot)) { $Cfg.ErrorPagesRoot = Join-Path $Cfg.WebRoot '_error' }
+    if ([string]::IsNullOrEmpty($Cfg.JobsLogFile))    { $Cfg.JobsLogFile    = Join-Path $Cfg.LogDir 'jobs.log' }
+    if ([string]::IsNullOrEmpty($Cfg.AuditLogFile))   { $Cfg.AuditLogFile   = Join-Path $Cfg.LogDir 'audit.log' }
+    if ([string]::IsNullOrEmpty($Cfg.SlowLogFile))    { $Cfg.SlowLogFile    = Join-Path $Cfg.LogDir 'slow.log' }
+    if ([string]::IsNullOrEmpty($Cfg.StaticRoot))     { $Cfg.StaticRoot     = $Cfg.WebRoot }
+}
+
+# ---------------------------------------------------------------------------
+# -DumpConfig: emit the inline $cfg defaults (after derived-field fallbacks)
+# as JSON and exit. tools\Initialize-Config.ps1 consumes this to seed a
+# fresh config.psd1 without ever touching the listener.
+# ---------------------------------------------------------------------------
+if ($DumpConfig) {
+    Set-CfgDerivedDefaults -Cfg $cfg
+    $cfg | ConvertTo-Json -Depth 20 -Compress
+    exit 0
+}
+
+# ---------------------------------------------------------------------------
+# config.psd1 is mandatory at startup — generate it once via
+# tools\Initialize-Config.ps1. The inline $cfg block above remains the
+# upstream schema (and supplies fallbacks for keys missing from the file),
+# but every install must own a personalised runtime config so changes are
+# visible in `git diff`/the editor and not buried in script defaults.
+# ---------------------------------------------------------------------------
+$resolvedConfigFile = if (-not [string]::IsNullOrEmpty($ConfigFile)) { $ConfigFile } else { Join-Path $baseDir 'config.psd1' }
+if (-not (Test-Path -LiteralPath $resolvedConfigFile -PathType Leaf)) {
+    $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | STARTUP | ERROR: config.psd1 not found at '$resolvedConfigFile'. Run tools\Initialize-Config.ps1 first."
+    try {
+        if (-not (Test-Path $baseDir)) { $null = New-Item -ItemType Directory -Path $baseDir -Force }
+        [System.IO.File]::AppendAllText((Join-Path $baseDir 'logs\startup.log'), $line + [System.Environment]::NewLine, [System.Text.Encoding]::UTF8)
+    } catch { }
+    Write-Output $line
+    Write-Output ''
+    Write-Output "ERROR: config.psd1 is required but was not found at: $resolvedConfigFile"
+    Write-Output ''
+    Write-Output 'Solution: generate it once from the inline defaults via:'
+    Write-Output '  .\tools\Initialize-Config.ps1'
+    Write-Output ''
+    Write-Output 'Or pass an explicit path:'
+    Write-Output "  .\Start-WebServer.ps1 -ConfigFile 'D:\posh\custom.psd1'"
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
 # External configuration file (PSD1) — applied BEFORE derived-field fallbacks
 # so values overridden in the file (e.g. WebRoot, LogDir) flow through into
 # StaticRoot / ErrorPagesRoot / JobsLogFile defaults correctly.
 #
-# Standard path: '<baseDir>\config.psd1'. Override via the -ConfigFile script
-# parameter. Import-PowerShellDataFile only parses static data — no script
-# execution, safer than dot-sourcing or Invoke-Expression.
+# Import-PowerShellDataFile only parses static data — no script execution,
+# safer than dot-sourcing or Invoke-Expression.
 #
 # A malformed psd1 hard-exits so misconfigurations surface immediately at
 # startup instead of producing subtle later failures.
 # ---------------------------------------------------------------------------
-$resolvedConfigFile = if (-not [string]::IsNullOrEmpty($ConfigFile)) { $ConfigFile } else { Join-Path $baseDir 'config.psd1' }
-if (Test-Path -LiteralPath $resolvedConfigFile -PathType Leaf) {
-    $external = $null
+$external = $null
+try {
+    $external = Import-PowerShellDataFile -LiteralPath $resolvedConfigFile
+} catch {
+    $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | STARTUP | ERROR: External config '$resolvedConfigFile' could not be parsed: $_"
     try {
-        $external = Import-PowerShellDataFile -LiteralPath $resolvedConfigFile
-    } catch {
-        $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | STARTUP | ERROR: External config '$resolvedConfigFile' could not be parsed: $_"
-        try {
-            if (-not (Test-Path $baseDir)) { $null = New-Item -ItemType Directory -Path $baseDir -Force }
-            [System.IO.File]::AppendAllText((Join-Path $baseDir 'logs\startup.log'), $line + [System.Environment]::NewLine, [System.Text.Encoding]::UTF8)
-        } catch { }
-        Write-Output $line
-        Write-Output ''
-        Write-Output "ERROR: External config '$resolvedConfigFile' is not a valid PowerShell data file."
-        Write-Output 'Inspect the file and ensure it contains only a single hashtable: @{ Key = Value; ... }'
-        exit 1
-    }
-    if ($null -ne $external) {
-        foreach ($k in $external.Keys) { $cfg[$k] = $external[$k] }
-        # Stash the success line for Write-StartupLog further down (Write-StartupLog
-        # is not defined yet at this point; we want this in startup.log, not just Write-Output).
-        $script:externalConfigStartupNote = "External config loaded: $resolvedConfigFile ($($external.Count) key(s) overridden)"
-    }
+        if (-not (Test-Path $baseDir)) { $null = New-Item -ItemType Directory -Path $baseDir -Force }
+        [System.IO.File]::AppendAllText((Join-Path $baseDir 'logs\startup.log'), $line + [System.Environment]::NewLine, [System.Text.Encoding]::UTF8)
+    } catch { }
+    Write-Output $line
+    Write-Output ''
+    Write-Output "ERROR: External config '$resolvedConfigFile' is not a valid PowerShell data file."
+    Write-Output 'Inspect the file and ensure it contains only a single hashtable: @{ Key = Value; ... }'
+    exit 1
+}
+if ($null -ne $external) {
+    foreach ($k in $external.Keys) { $cfg[$k] = $external[$k] }
+    # Stash the success line for Write-StartupLog further down (Write-StartupLog
+    # is not defined yet at this point; we want this in startup.log, not just Write-Output).
+    $script:externalConfigStartupNote = "External config loaded: $resolvedConfigFile ($($external.Count) key(s) overridden)"
 }
 
 # ---------------------------------------------------------------------------
@@ -317,28 +369,9 @@ if (-not $cfg.ApiKeys -or $cfg.ApiKeys.Count -eq 0) {
     }
 }
 
-# CustomErrorPages root fallback — empty string means '<WebRoot>\_error'. Resolved here so the
-# Send-Response helper can use the path without recomputing per request.
-if ([string]::IsNullOrEmpty($cfg.ErrorPagesRoot)) {
-    $cfg.ErrorPagesRoot = Join-Path $cfg.WebRoot '_error'
-}
-# Jobs log path fallback — analogous to ErrorPagesRoot. Resolved here so background-job
-# runspaces (created later) get the final value at instantiation time.
-if ([string]::IsNullOrEmpty($cfg.JobsLogFile)) {
-    $cfg.JobsLogFile = Join-Path $cfg.LogDir 'jobs.log'
-}
-# F5: audit-log file path fallback.
-if ([string]::IsNullOrEmpty($cfg.AuditLogFile)) {
-    $cfg.AuditLogFile = Join-Path $cfg.LogDir 'audit.log'
-}
-# F6: slow-log file path fallback.
-if ([string]::IsNullOrEmpty($cfg.SlowLogFile)) {
-    $cfg.SlowLogFile = Join-Path $cfg.LogDir 'slow.log'
-}
-
-# StaticRoot fallback — empty string means: reuse WebRoot. Resolved here rather than at
-# request time so the static handler can compare full paths without per-request work.
-if ([string]::IsNullOrEmpty($cfg.StaticRoot)) { $cfg.StaticRoot = $cfg.WebRoot }
+# Apply derived-field fallbacks AFTER the external psd1 has merged so file
+# overrides on WebRoot / LogDir flow into ErrorPagesRoot / JobsLogFile / etc.
+Set-CfgDerivedDefaults -Cfg $cfg
 
 # Runtime measurement from server start — used for health check uptime.
 $startTime = [System.Diagnostics.Stopwatch]::StartNew()

@@ -37,7 +37,7 @@ Place a `.ps1` file in `webroot\` — it is immediately reachable as an HTTP end
 - **PHP-CGI handler** — opt-in `.php` routing through an external `php-cgi.exe`. CGI/1.1 environment, body streaming to stdin, `Status` / `Content-Type` / `Location` parsed from PHP stdout.
 
 ### Operations
-- **External config file** — drop a `config.psd1` next to `Start-WebServer.ps1` (or pass `-ConfigFile`) to override any `$cfg` default. Parsed via `Import-PowerShellDataFile` (data-only, no script execution). A sample lives at `config.psd1.example`.
+- **Runtime config file (`config.psd1`)** — mandatory at startup; generated per install by `tools\Initialize-Config.ps1` from the inline `$cfg` defaults. Parsed via `Import-PowerShellDataFile` (data-only, no script execution). Edit directly or via the upcoming `tools\Edit-PoshSettings.ps1` browser editor.
 - **Brotli + GZIP compression** — Brotli preferred when the client advertises `br`; falls back to GZIP, then uncompressed. Same eligibility gates (`GzipMinBytes`, `GzipMaxBytes`, `GzipMimeTypes`) for both.
 - **Forms, cookies, CORS** — `application/x-www-form-urlencoded` POST bodies, opt-in HttpOnly session cookies (`SessionEnabled`), full CORS with `OPTIONS` preflight.
 - **Custom HTML error pages** — when the client `Accept`s `text/html`, 4xx/5xx responses serve `<ErrorPagesRoot>\<code>.html` instead of the JSON envelope.
@@ -69,6 +69,7 @@ Copy-Item -Path ".\*" -Destination "C:\posh\" -Recurse -Force
 # 2. Register as a Windows Scheduled Task (Administrator PowerShell 7)
 cd C:\posh
 .\Register-ScheduledTask.ps1        # prompts for username, password, API key, and optional HTTPS
+                                    # also generates config.psd1 on first install
 
 # 3. Start immediately (no reboot needed)
 Start-ScheduledTask -TaskName 'PowerShell-Webserver'
@@ -76,6 +77,8 @@ Start-ScheduledTask -TaskName 'PowerShell-Webserver'
 # 4. Verify
 Invoke-RestMethod -Uri 'http://localhost/health'
 ```
+
+> If you deploy without `Register-ScheduledTask.ps1` (e.g. running the server manually for development), you must seed the runtime config yourself once: `.\tools\Initialize-Config.ps1`. The server hard-fails at startup without `config.psd1`.
 
 Expected response from `/health`:
 
@@ -175,8 +178,10 @@ Rules for webroot scripts: use `Write-Output` for normal output, `Write-Error` f
 
 Configuration resolves from two layers:
 
-1. Inline defaults in the `$cfg` hashtable inside `Start-WebServer.ps1`.
-2. An optional external `config.psd1` next to the script (or `-ConfigFile <path>`). Every key it sets overrides the inline default; missing keys keep their defaults. See `config.psd1.example` for a documented template.
+1. **`config.psd1`** next to `Start-WebServer.ps1` (or `-ConfigFile <path>`) — runtime source of truth, **mandatory**, generated per install by `tools\Initialize-Config.ps1`. Gitignored.
+2. Inline `$cfg` defaults inside `Start-WebServer.ps1` — schema and fallback. Supplies a default when a key is missing from `config.psd1` so old configs survive upgrades.
+
+The server refuses to start if `config.psd1` does not exist. Generate it once via `.\tools\Initialize-Config.ps1` (or let `Register-ScheduledTask.ps1` do it for you on first install).
 
 HTTP/HTTPS ports and HTTPS activation are runtime parameters:
 

@@ -2,35 +2,49 @@
 
 ## Configuration Sources
 
-posh resolves its configuration from two sources, in order:
+posh resolves its configuration in two layers:
 
-1. **Inline defaults** in the `$cfg` hashtable inside `Start-WebServer.ps1` (this file is your source of truth for the full key list).
-2. **External `.psd1` file** (optional) — overrides any keys you set.
+1. **`config.psd1`** — the runtime source of truth. **Mandatory** at startup. Generated per install by `tools\Initialize-Config.ps1`, gitignored, contains every key with the install's chosen value.
+2. **Inline `$cfg`** in `Start-WebServer.ps1` — the upstream schema and fallback. Supplies a default for any key missing from `config.psd1` so old configs keep working when new versions add keys.
 
-### External Config File (PSD1)
+The server hard-fails at startup if `config.psd1` does not exist. The inline `$cfg` block is never consulted on its own — it only fills in the gaps.
 
-If a `config.psd1` is present next to `Start-WebServer.ps1` (default path: `C:\posh\config.psd1`), every key in the file's hashtable overrides the inline default for that key. Anything not listed keeps its default.
+### Generating config.psd1
+
+Run once per install:
 
 ```powershell
-# C:\posh\config.psd1
+.\tools\Initialize-Config.ps1
+```
+
+The script asks `Start-WebServer.ps1 -DumpConfig` for its current inline defaults, then writes a grouped, human-readable `config.psd1` next to the server script. Re-running the script aborts unless `-Force` is passed; with `-Force`, the previous file is moved to `config.psd1.bak.<timestamp>` before the new one is written.
+
+`Register-ScheduledTask.ps1` invokes `Initialize-Config.ps1` automatically during installation when no `config.psd1` exists yet — fresh installs are wired up end-to-end.
+
+### Editing config.psd1
+
+Two supported paths:
+
+- `tools\Edit-PoshSettings.ps1` — browser-based editor with validation, diff preview, and backups (recommended for junior admins; ships in PR 2 of this work)
+- Direct edit (`notepad`, VSCode, …) — `Import-PowerShellDataFile` only parses static data, so the file is safe to keep in version-controlled local notes; a syntactically broken `.psd1` causes a hard startup failure with a clear error message.
+
+```powershell
+# C:\posh\config.psd1 — excerpt
 @{
     HttpPort               = 18080
     LogRetentionDays       = 7
     RateLimitPerIdentity   = $true
     AuditLogEnabled        = $true
     SlowRequestThresholdMs = 5000
+    # ...all other keys stay at their generated defaults
 }
 ```
 
-Override the path with the `-ConfigFile` parameter on the script:
+Override the file location with the `-ConfigFile` parameter on the server:
 
 ```powershell
 .\Start-WebServer.ps1 -ConfigFile 'D:\posh\custom.psd1'
 ```
-
-`Import-PowerShellDataFile` parses only static data — no script execution, no `Invoke-Expression`. A syntactically broken `.psd1` causes a hard startup failure with a clear error message.
-
-A documented sample lives at `config.psd1.example` in the repository root.
 
 **Inline file location:** `C:\posh\Start-WebServer.ps1`
 
@@ -171,7 +185,7 @@ $cfg = @{
 }
 ```
 
-> After editing `Start-WebServer.ps1`, restart the Scheduled Task for changes to take effect:
+> After editing `config.psd1` (or, more rarely, `Start-WebServer.ps1` itself for a new schema key), restart the Scheduled Task for changes to take effect:
 > ```powershell
 > Stop-ScheduledTask  -TaskName 'PowerShell-Webserver'
 > Start-ScheduledTask -TaskName 'PowerShell-Webserver'
@@ -203,7 +217,7 @@ These are passed on the command line when starting the server. `Register-Schedul
 | `-HttpsEnabled` | `switch` | off | Enables HTTPS. Requires a valid `netsh http sslcert` binding for `-HttpsPort`. The server exits with an error if HTTPS is enabled but no binding exists. |
 | `-HttpPort` | `int` | `80` | HTTP listen port. Set to `0` to disable HTTP entirely (HTTPS-only mode). |
 | `-HttpsPort` | `int` | `443` | HTTPS listen port. Only evaluated when `-HttpsEnabled` is set. |
-| `-ConfigFile` | `string` | `''` (auto = `<baseDir>\config.psd1`) | Absolute path to an external PSD1 config file whose hashtable entries override the inline `$cfg` defaults. When empty, the standard path `<baseDir>\config.psd1` is auto-discovered. A malformed file aborts startup with a clear error. |
+| `-ConfigFile` | `string` | `''` (resolves to `<baseDir>\config.psd1`) | Absolute path to the runtime PSD1 config file. **Mandatory** — the server hard-fails at startup if the resolved path does not exist. Generate it once via `tools\Initialize-Config.ps1`. A malformed file also aborts startup with a clear error. |
 
 ### Start-WebServer.ps1 — $cfg Hashtable
 

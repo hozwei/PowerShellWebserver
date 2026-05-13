@@ -18,6 +18,16 @@ encrypted_pw/encryptedString_*.txt
 !encrypted_pw/.gitkeep
 
 # ---------------------------------------------------------------------------
+# Runtime configuration — generated per install by tools\Initialize-Config.ps1
+# ---------------------------------------------------------------------------
+# config.psd1 is the runtime source of truth for the posh server. It is
+# generated locally from the inline $cfg defaults in Start-WebServer.ps1
+# and contains personalised values (ports, IPs, API-key labels, paths) —
+# never commit it.
+config.psd1
+config.psd1.bak.*
+
+# ---------------------------------------------------------------------------
 # Project-specific exclusions
 # ---------------------------------------------------------------------------
 AGENTS.md

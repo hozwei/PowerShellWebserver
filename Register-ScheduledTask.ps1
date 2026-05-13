@@ -569,6 +569,34 @@ try {
     Write-Output "Arguments   : $scriptArgs"
     Write-Output ''
 
+    # ------------------------------------------------------------------
+    # config.psd1 is mandatory at server start — generate one from the
+    # inline $cfg defaults if the deployment directory does not already
+    # have a personalised file. tools\Initialize-Config.ps1 is the only
+    # supported way to seed it; it asks Start-WebServer.ps1 for its
+    # current defaults via -DumpConfig and writes a grouped, human-
+    # readable psd1.
+    # ------------------------------------------------------------------
+    $configFile       = Join-Path $baseDir 'config.psd1'
+    $initConfigScript = Join-Path $baseDir 'tools\Initialize-Config.ps1'
+    if (Test-Path -LiteralPath $configFile -PathType Leaf) {
+        Write-Output "config.psd1  : exists ($configFile) — keeping as-is."
+        Write-Output ''
+    } elseif (-not (Test-Path -LiteralPath $initConfigScript -PathType Leaf)) {
+        Write-Output "WARNING: tools\Initialize-Config.ps1 not found at $initConfigScript."
+        Write-Output '         Server will hard-fail at startup until you create config.psd1 manually.'
+        Write-Output ''
+    } else {
+        Write-Output 'Generating config.psd1 from inline defaults...'
+        & $initConfigScript -ServerScript $SCRIPT_PATH -OutputFile $configFile
+        if ($LASTEXITCODE -ne 0) {
+            Write-Output ''
+            Write-Output "WARNING: Initialize-Config.ps1 exited with code $LASTEXITCODE."
+            Write-Output '         Server will hard-fail at startup until config.psd1 is fixed or regenerated.'
+        }
+        Write-Output ''
+    }
+
     # Network configuration summary
     Write-Output 'Network configuration:'
     if (-not $httpsEnabled -or -not $httpDisabled) {
