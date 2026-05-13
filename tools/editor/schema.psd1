@@ -199,6 +199,40 @@
             Choices   = @('ApiKey', 'Basic', 'Both')
         }
         @{
+            Name      = 'BasicAuthUser'
+            File      = 'config.psd1'
+            Group     = 'auth'
+            Type      = 'string'
+            Label     = 'BasicAuthUser'
+            Help      = "HTTP Basic auth username. Leave empty to disable. Can also be set via POSH_BASIC_USER env var (env wins)."
+            Validator = '^[^\s:]*$'
+        }
+        @{
+            Name      = 'BasicAuthPass'
+            File      = 'config.psd1'
+            Group     = 'auth'
+            Type      = 'password'
+            Label     = 'BasicAuthPass'
+            Help      = "HTTP Basic auth password. Stored as plaintext in config.psd1 — prefer the POSH_BASIC_PASS env var for production."
+        }
+        @{
+            Name      = 'BasicAuthRealm'
+            File      = 'config.psd1'
+            Group     = 'auth'
+            Type      = 'string'
+            Label     = 'BasicAuthRealm'
+            Help      = "Realm string sent in the WWW-Authenticate header on 401 challenges."
+            Validator = '^[\w\s\-\.]+$|^$'
+        }
+        @{
+            Name      = 'ApiKeys'
+            File      = 'config.psd1'
+            Group     = 'auth'
+            Type      = 'keymap'
+            Label     = 'ApiKeys'
+            Help      = "Label -> X-Api-Key map. The legacy single-key 'ApiKey' is auto-merged as 'default' at startup if this is empty. Labels must be unique and match A-Z, 0-9, _, -. Keys must be at least 16 characters."
+        }
+        @{
             Name      = 'MaxConcurrent'
             File      = 'config.psd1'
             Group     = 'auth'

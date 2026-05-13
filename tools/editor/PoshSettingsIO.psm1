@@ -462,6 +462,7 @@ function ConvertTo-PoshLiteral {
     )
     switch ($Type) {
         'string'       { return "'" + ([string]$Value -replace "'", "''") + "'" }
+        'password'     { return "'" + ([string]$Value -replace "'", "''") + "'" }
         'enum'         { return "'" + ([string]$Value -replace "'", "''") + "'" }
         'int' {
             $n = [long]$Value
@@ -482,6 +483,23 @@ function ConvertTo-PoshLiteral {
             if ($arr.Count -eq 0) { return '@()' }
             $items = $arr | ForEach-Object { "'" + ($_ -replace "'", "''") + "'" }
             return '@(' + ($items -join ', ') + ')'
+        }
+        'keymap' {
+            # label -> key hashtable. Emitted multi-line for readability so
+            # `git diff` on config.psd1 shows clean per-row changes when
+            # rotating individual keys.
+            if ($null -eq $Value) { return '@{}' }
+            $pairs = @()
+            $coerced = if ($Value -is [hashtable]) { $Value } else { @{} }
+            foreach ($k in @($coerced.Keys | Sort-Object)) {
+                $label = [string]$k
+                $val   = [string]$coerced[$k]
+                $keyQuoted = "'" + ($label -replace "'", "''") + "'"
+                $valQuoted = "'" + ($val -replace "'", "''") + "'"
+                $pairs += ("            {0,-20} = {1}" -f $keyQuoted, $valQuoted)
+            }
+            if ($pairs.Count -eq 0) { return '@{}' }
+            return ("@{`r`n" + ($pairs -join "`r`n") + "`r`n        }")
         }
         default { throw "Unknown type for serialization: $Type" }
     }
@@ -507,6 +525,14 @@ function Test-PoshFieldValue {
                     return "Value does not match the expected format ($($Field.Validator))"
                 }
             }
+            return $null
+        }
+        'password' {
+            # Passwords are opaque strings — no format validation beyond
+            # the universal "no newlines" rule. The UI masks them; the
+            # server stores them plaintext in config.psd1.
+            $s = if ($null -eq $Value) { '' } else { [string]$Value }
+            if ($s -match "[`r`n]") { return 'Password must not contain line breaks' }
             return $null
         }
         'enum' {
@@ -547,6 +573,24 @@ function Test-PoshFieldValue {
             }
             return $null
         }
+        'keymap' {
+            if ($null -eq $Value) { return $null }
+            if ($Value -isnot [hashtable]) { return 'Keymap value must be an object (label -> key)' }
+            $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            foreach ($k in @($Value.Keys)) {
+                $label = [string]$k
+                if ([string]::IsNullOrWhiteSpace($label)) { return 'Empty label not allowed' }
+                if ($label -notmatch '^[A-Za-z0-9_-]+$') {
+                    return "Label '$label' must match A-Z, 0-9, _ and -"
+                }
+                if (-not $seen.Add($label)) { return "Duplicate label '$label'" }
+                $apiKey = [string]$Value[$k]
+                if ([string]::IsNullOrEmpty($apiKey)) { return "Key for label '$label' is empty" }
+                if ($apiKey.Length -lt 16) { return "Key for label '$label' must be at least 16 characters" }
+                if ($apiKey -match "[`r`n]") { return "Key for label '$label' must not contain line breaks" }
+            }
+            return $null
+        }
         default { return "Unknown field type: $($Field.Type)" }
     }
 }
@@ -564,6 +608,7 @@ function ConvertTo-PoshTypedValue {
     )
     switch ($Field.Type) {
         'string'       { if ($null -eq $RawValue) { return '' } else { return [string]$RawValue } }
+        'password'     { if ($null -eq $RawValue) { return '' } else { return [string]$RawValue } }
         'enum'         { if ($null -eq $RawValue) { return '' } else { return [string]$RawValue } }
         'int' {
             # Return $null on bad input — the caller's Test-PoshFieldValue
@@ -593,6 +638,32 @@ function ConvertTo-PoshTypedValue {
                 return @(($RawValue -split "`r?`n") | ForEach-Object { $_.Trim() } | Where-Object { $_ })
             }
             return @($RawValue | ForEach-Object { [string]$_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        }
+        'keymap' {
+            # JSON arrives as a hashtable thanks to ConvertFrom-Json
+            # -AsHashtable. Re-emit a clean hashtable with trimmed labels
+            # so trailing spaces from copy-paste don't sneak into the file.
+            $out = @{}
+            if ($null -eq $RawValue) { return $out }
+            if ($RawValue -isnot [hashtable]) {
+                # Be liberal: also accept array-of-pair objects {label, key}.
+                foreach ($entry in @($RawValue)) {
+                    if ($entry -is [hashtable] -and $entry.ContainsKey('label') -and $entry.ContainsKey('key')) {
+                        $label = [string]$entry['label']
+                        $key   = [string]$entry['key']
+                        if (-not [string]::IsNullOrWhiteSpace($label)) {
+                            $out[$label.Trim()] = $key
+                        }
+                    }
+                }
+                return $out
+            }
+            foreach ($k in @($RawValue.Keys)) {
+                $label = [string]$k
+                if ([string]::IsNullOrWhiteSpace($label)) { continue }
+                $out[$label.Trim()] = [string]$RawValue[$k]
+            }
+            return $out
         }
         default { throw "Unknown type for coercion: $($Field.Type)" }
     }
@@ -633,6 +704,19 @@ function Compare-PoshScalar {
     param($A, $B)
     if ($null -eq $A -and $null -eq $B) { return $false }
     if ($null -eq $A -or $null -eq $B)  { return $true }
+    # Hashtables must be compared key-by-key — naively enumerating both
+    # only yields DictionaryEntry stringifications, which collide on
+    # 'System.Collections.DictionaryEntry' and report "no change" even
+    # when keys/values differ.
+    if ($A -is [hashtable] -or $B -is [hashtable]) {
+        if ($A -isnot [hashtable] -or $B -isnot [hashtable]) { return $true }
+        if ($A.Count -ne $B.Count) { return $true }
+        foreach ($k in @($A.Keys)) {
+            if (-not $B.ContainsKey($k)) { return $true }
+            if ([string]$A[$k] -ne [string]$B[$k]) { return $true }
+        }
+        return $false
+    }
     if ($A -is [System.Collections.IEnumerable] -and $A -isnot [string]) {
         $aArr = @($A | ForEach-Object { [string]$_ })
         $bArr = @($B | ForEach-Object { [string]$_ })
@@ -649,10 +733,30 @@ function ConvertTo-PoshDisplayString {
     param($Value, [string] $Type)
     if ($null -eq $Value) { return '(not set)' }
     if ($Type -eq 'bool') { if ($Value) { return '$true' } else { return '$false' } }
+    if ($Type -eq 'password') {
+        $s = [string]$Value
+        if ([string]::IsNullOrEmpty($s)) { return '(empty)' }
+        # Never echo the actual value back to the UI even in the diff —
+        # an over-the-shoulder reader shouldn't be able to read a password
+        # from the change preview.
+        return ('●' * [Math]::Min($s.Length, 12))
+    }
     if ($Type -eq 'string-array') {
         $arr = @($Value | ForEach-Object { [string]$_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
         if ($arr.Count -eq 0) { return '(empty)' }
         return ($arr -join ', ')
+    }
+    if ($Type -eq 'keymap') {
+        if ($Value -isnot [hashtable]) { return '(empty)' }
+        if ($Value.Count -eq 0) { return '(empty)' }
+        # Show labels + masked key length per row so the operator sees what
+        # changed without exposing the secrets in the diff.
+        $parts = foreach ($k in @($Value.Keys | Sort-Object)) {
+            $key = [string]$Value[$k]
+            $mask = '●' * [Math]::Min($key.Length, 8)
+            "{0}={1}({2})" -f $k, $mask, $key.Length
+        }
+        return ($parts -join ', ')
     }
     return [string]$Value
 }

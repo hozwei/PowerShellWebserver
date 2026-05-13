@@ -259,6 +259,67 @@
             font: inherit;
             margin-top: 4px;
         }
+
+        /* Keymap fields span the full content width — the right column of
+           the standard grid is too narrow for label + key + actions. */
+        .field-keymap { grid-template-columns: 1fr; }
+        .field-keymap > .keymap-host { display: block; }
+        .keymap-list {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            margin-top: 8px;
+        }
+        .keymap-row {
+            display: grid;
+            grid-template-columns: 180px 1fr auto auto auto;
+            gap: 6px;
+            align-items: center;
+        }
+        .keymap-row input {
+            width: 100%;
+            padding: 6px 10px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            font: 13px ui-monospace, Consolas, monospace;
+            background: var(--panel);
+            color: var(--text);
+        }
+        .keymap-row .keymap-key {
+            font-family: ui-monospace, Consolas, monospace;
+            letter-spacing: 0.5px;
+        }
+        .keymap-row .icon-btn {
+            border: 1px solid var(--border);
+            background: var(--panel);
+            color: var(--muted);
+            border-radius: 6px;
+            padding: 6px 10px;
+            cursor: pointer;
+            font: inherit;
+            min-width: 32px;
+            line-height: 1;
+        }
+        .keymap-row .icon-btn:hover { background: var(--bg); color: var(--text); }
+        .keymap-row .icon-btn.danger:hover { background: #ffeef0; color: var(--danger); border-color: var(--danger); }
+        .keymap-empty {
+            margin-top: 8px;
+            padding: 16px;
+            border: 1px dashed var(--border);
+            border-radius: 6px;
+            color: var(--muted);
+            text-align: center;
+            font-size: 13px;
+        }
+        .keymap-add {
+            margin-top: 10px;
+        }
+        .keymap-row-err {
+            grid-column: 1 / -1;
+            color: var(--danger);
+            font-size: 12px;
+            margin-top: -2px;
+        }
     </style>
 </head>
 <body>
@@ -419,6 +480,18 @@
             for (let i = 0; i < aa.length; i++) if (String(aa[i]) !== String(bb[i])) return true;
             return false;
         }
+        if (field.Type === 'keymap') {
+            const aMap = (a && typeof a === 'object' && !Array.isArray(a)) ? a : {};
+            const bMap = (b && typeof b === 'object' && !Array.isArray(b)) ? b : {};
+            const aKeys = Object.keys(aMap).sort();
+            const bKeys = Object.keys(bMap).sort();
+            if (aKeys.length !== bKeys.length) return true;
+            for (let i = 0; i < aKeys.length; i++) {
+                if (aKeys[i] !== bKeys[i]) return true;
+                if (String(aMap[aKeys[i]]) !== String(bMap[bKeys[i]])) return true;
+            }
+            return false;
+        }
         if (field.Type === 'bool') return Boolean(a) !== Boolean(b);
         return String(a ?? '') !== String(b ?? '');
     };
@@ -437,7 +510,7 @@
     };
 
     const validateField = (field, raw) => {
-        if (field.Type === 'string' || field.Type === 'enum') {
+        if (field.Type === 'string' || field.Type === 'enum' || field.Type === 'password') {
             const s = String(raw ?? '');
             if (field.Validator) {
                 try {
@@ -464,11 +537,155 @@
         const v = state.current[field.Name];
         if (v === undefined || v === null) return '(not set)';
         if (field.Type === 'bool') return v ? '$true' : '$false';
+        if (field.Type === 'password') {
+            const s = String(v);
+            if (s.length === 0) return '(empty)';
+            // Never echo the value back as plaintext in help text, even
+            // though an over-the-shoulder threat is unlikely on loopback.
+            return '●'.repeat(Math.min(s.length, 12));
+        }
         if (field.Type === 'string-array') {
             const arr = Array.isArray(v) ? v : [v];
             return arr.length === 0 ? '(empty)' : arr.join(', ');
         }
+        if (field.Type === 'keymap') {
+            if (!v || typeof v !== 'object' || Array.isArray(v)) return '(empty)';
+            const keys = Object.keys(v);
+            if (keys.length === 0) return '(empty)';
+            return keys.length + (keys.length === 1 ? ' key' : ' keys') + ': ' + keys.sort().join(', ');
+        }
         return String(v);
+    };
+
+    // 32 random bytes -> URL-safe Base64, ~43 chars. Falls back to a
+    // (lower-entropy) Math.random path on the unlikely chance crypto is
+    // unavailable — the local editor is on loopback so we don't fail hard.
+    const generateApiKey = () => {
+        try {
+            const arr = new Uint8Array(32);
+            crypto.getRandomValues(arr);
+            let b64 = btoa(String.fromCharCode.apply(null, arr));
+            return b64.replace(/=+$/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+        } catch (e) {
+            let s = '';
+            const alpha = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+            for (let i = 0; i < 32; i++) s += alpha[Math.floor(Math.random() * alpha.length)];
+            return s;
+        }
+    };
+
+    const renderKeymapField = (field, left, right, vmsg) => {
+        // Working copy lives in state.proposed[field.Name] as a plain
+        // object; the canonical map is in state.current[field.Name].
+        const current = state.current[field.Name] && typeof state.current[field.Name] === 'object'
+            ? state.current[field.Name] : {};
+        const working = (field.Name in state.proposed && typeof state.proposed[field.Name] === 'object')
+            ? state.proposed[field.Name]
+            : Object.assign({}, current);
+        state.proposed[field.Name] = working;
+
+        const host = document.createElement('div');
+        host.className = 'keymap-host';
+
+        const list = document.createElement('div');
+        list.className = 'keymap-list';
+        host.appendChild(list);
+
+        const emptyEl = document.createElement('div');
+        emptyEl.className = 'keymap-empty';
+        emptyEl.textContent = 'No API keys configured. Click "Add key" to create one.';
+        host.appendChild(emptyEl);
+
+        const addBtn = document.createElement('button');
+        addBtn.type = 'button';
+        addBtn.className = 'btn keymap-add';
+        addBtn.textContent = '+ Add key';
+        host.appendChild(addBtn);
+
+        const validateAndCommit = () => {
+            // Rebuild working from inputs (preserves row order while typing).
+            const next = {};
+            const labelCounts = {};
+            const rows = Array.from(list.querySelectorAll('.keymap-row'));
+            for (const r of rows) {
+                const lbl = r.querySelector('.keymap-label').value.trim();
+                const key = r.querySelector('.keymap-key').value;
+                if (lbl) {
+                    labelCounts[lbl] = (labelCounts[lbl] || 0) + 1;
+                    next[lbl] = key;
+                }
+            }
+            // Per-row error rendering.
+            for (const r of rows) {
+                const lbl = r.querySelector('.keymap-label').value.trim();
+                const key = r.querySelector('.keymap-key').value;
+                const errEl = r.querySelector('.keymap-row-err');
+                let msg = '';
+                if (!lbl) msg = 'Label required.';
+                else if (!/^[A-Za-z0-9_-]+$/.test(lbl)) msg = 'Label must match A-Z, 0-9, _ or -.';
+                else if (labelCounts[lbl] > 1) msg = 'Duplicate label.';
+                else if (!key) msg = 'Key required.';
+                else if (key.length < 16) msg = 'Key must be at least 16 characters.';
+                errEl.textContent = msg;
+                errEl.style.display = msg ? 'block' : 'none';
+                r.querySelector('.keymap-label').classList.toggle('invalid', msg === 'Label required.' || msg.startsWith('Label must') || msg === 'Duplicate label.');
+                r.querySelector('.keymap-key').classList.toggle('invalid', msg === 'Key required.' || msg.startsWith('Key must'));
+            }
+            state.proposed[field.Name] = next;
+            const anyErr = Array.from(list.querySelectorAll('.keymap-row-err')).some(e => e.textContent !== '');
+            vmsg.textContent = anyErr ? 'Fix the rows highlighted in red before saving.' : '';
+            vmsg.style.display = anyErr ? 'block' : 'none';
+            emptyEl.style.display = rows.length === 0 ? 'block' : 'none';
+            updateSaveButton();
+        };
+
+        const addRow = (label, key) => {
+            const r = document.createElement('div');
+            r.className = 'keymap-row';
+            r.innerHTML =
+                '<input class="keymap-label" type="text" autocomplete="off" placeholder="label">' +
+                '<input class="keymap-key" type="password" autocomplete="off" spellcheck="false" placeholder="API key (>= 16 chars)">' +
+                '<button type="button" class="icon-btn" title="Show/hide key">👁</button>' +
+                '<button type="button" class="icon-btn" title="Generate a new 32-byte key">↻</button>' +
+                '<button type="button" class="icon-btn danger" title="Remove this entry">✕</button>' +
+                '<div class="keymap-row-err" style="display:none"></div>';
+            r.querySelector('.keymap-label').value = label || '';
+            r.querySelector('.keymap-key').value   = key   || '';
+            list.appendChild(r);
+            const labelInput = r.querySelector('.keymap-label');
+            const keyInput   = r.querySelector('.keymap-key');
+            const [showBtn, genBtn, rmBtn] = r.querySelectorAll('.icon-btn');
+            labelInput.addEventListener('input', validateAndCommit);
+            keyInput.addEventListener('input',   validateAndCommit);
+            showBtn.addEventListener('click', () => {
+                keyInput.type = keyInput.type === 'password' ? 'text' : 'password';
+            });
+            genBtn.addEventListener('click', () => {
+                keyInput.value = generateApiKey();
+                keyInput.type = 'text';                // reveal the freshly generated key so the operator can copy it
+                validateAndCommit();
+            });
+            rmBtn.addEventListener('click', () => {
+                r.remove();
+                validateAndCommit();
+            });
+        };
+
+        for (const [lbl, key] of Object.entries(working).sort((a, b) => a[0].localeCompare(b[0]))) {
+            addRow(lbl, key);
+        }
+
+        addBtn.addEventListener('click', () => {
+            addRow('', generateApiKey());
+            const last = list.lastElementChild;
+            if (last) last.querySelector('.keymap-label').focus();
+            validateAndCommit();
+        });
+
+        right.appendChild(host);
+        // Defer initial validation so the empty-state element placement is
+        // computed after the rows are in the DOM.
+        setTimeout(validateAndCommit, 0);
     };
 
     const renderField = (field) => {
@@ -492,6 +709,18 @@
         left.append(label, help, vmsg);
 
         const right = document.createElement('div');
+
+        if (field.Type === 'keymap') {
+            row.classList.add('field-keymap');
+            renderKeymapField(field, left, right, vmsg);
+            const def = document.createElement('div');
+            def.className = 'help';
+            def.innerHTML = 'current value in file: <code>' + formatCurrent(field).replace(/</g, '&lt;') + '</code>';
+            right.appendChild(def);
+            row.append(left, right);
+            return row;
+        }
+
         let input;
 
         const initial = state.current[field.Name];
@@ -525,6 +754,12 @@
             input = document.createElement('textarea');
             input.value = initialStr;
             input.placeholder = 'One entry per line';
+        } else if (field.Type === 'password') {
+            input = document.createElement('input');
+            input.type = 'password';
+            input.autocomplete = 'new-password';
+            input.spellcheck = false;
+            input.value = initialStr;
         } else {
             input = document.createElement('input');
             input.type = 'text';
