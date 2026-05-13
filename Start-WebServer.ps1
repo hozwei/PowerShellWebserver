@@ -264,6 +264,9 @@ $cfg = @{
     IndexShowMetadata        = $true   # F7: GET / returns enriched objects with synopsis + parameters parsed from each script's AST. Set $false to revert to the flat path list.
     PromMetricsEnabled       = $true   # F8: expose GET /metrics-prom in Prometheus text-format. Same auth-exempt treatment as /metrics.
     PathPlaceholders         = $false  # F9: match webroot/users/[id].ps1 (Next.js-style) against /users/<anything>. Placeholders are injected as named -Key Value args.
+    OpenApiEnabled           = $true   # F10: expose GET /openapi.json with an OpenAPI 3.1 spec auto-generated from webroot script metadata.
+    OpenApiTitle             = 'posh'  # 'info.title' in the spec
+    OpenApiVersion           = '1.0.0' # 'info.version' in the spec
 }
 
 # ---------------------------------------------------------------------------
@@ -526,7 +529,7 @@ function Write-Log {
 # ---------------------------------------------------------------------------
 function Write-AuditLog {
     param(
-        [Parameter(Mandatory)][string] $Event,
+        [Parameter(Mandatory)][string] $EventName,
         [string] $Identity = '-',
         [string] $ClientIP = '-',
         [string] $Path     = '-',
@@ -536,7 +539,7 @@ function Write-AuditLog {
 
     $obj = [ordered]@{
         ts       = (Get-Date).ToString('o')
-        event    = $Event
+        event    = $EventName
         identity = $Identity
         ip       = $ClientIP
         path     = $Path
@@ -2328,6 +2331,131 @@ function Get-ScriptMetadata {
 }
 
 # ---------------------------------------------------------------------------
+# Build-OpenApiSpec (F10)
+# Walks every webroot script registered in $cfg.ScriptExtensionMap, reuses
+# Get-ScriptMetadata (F7), and produces an OpenAPI 3.1 document. Routes with
+# placeholders (`webroot/users/[id].ps1`, F9) are rewritten to OpenAPI-style
+# path templates (`/users/{id}.ps1`) and the corresponding parameters appear
+# with `in: path, required: true`.
+#
+# Response schema:
+#   .ps1  → JSON envelope `{ exitCode, output, error }`
+#   .psxml / .posh / .psapi → free-form text response with the script-mapped
+#                              Content-Type (no schema; content-type only).
+# ---------------------------------------------------------------------------
+function Get-OpenApiSchemaForType {
+    param([string] $PsTypeName)
+    if ([string]::IsNullOrEmpty($PsTypeName)) { return @{ type = 'string' } }
+    $t = $PsTypeName.ToLowerInvariant()
+    if ($t.EndsWith('[]')) {
+        $inner = Get-OpenApiSchemaForType -PsTypeName ($PsTypeName.Substring(0, $PsTypeName.Length - 2))
+        return @{ type = 'array'; items = $inner }
+    }
+    switch -Regex ($t) {
+        '^(int|int32|long|int64|byte|short|sbyte|uint16|uint32|uint64)$' { return @{ type = 'integer' } }
+        '^(double|float|single|decimal)$'                                { return @{ type = 'number' } }
+        '^(bool|boolean|switch|switchparameter)$'                        { return @{ type = 'boolean' } }
+        '^(datetime|date)$'                                              { return @{ type = 'string'; format = 'date-time' } }
+        '^(guid)$'                                                       { return @{ type = 'string'; format = 'uuid' } }
+        default                                                          { return @{ type = 'string' } }
+    }
+}
+
+function Build-OpenApiSpec {
+    $paths = [ordered]@{}
+
+    $envelopeSchema = [ordered]@{
+        type       = 'object'
+        properties = [ordered]@{
+            exitCode = [ordered]@{ type = 'integer' }
+            output   = [ordered]@{ type = 'string' }
+            error    = [ordered]@{ type = 'string' }
+        }
+    }
+
+    if (Test-Path -LiteralPath $script:cfg.WebRoot -PathType Container) {
+        $exts = @($script:cfg.ScriptExtensionMap.Keys)
+        $files = Get-ChildItem -Path $script:cfg.WebRoot -Recurse -File -ErrorAction SilentlyContinue | Where-Object {
+            $itemExt = $_.Extension
+            $matched = $false
+            foreach ($e in $exts) {
+                if ([string]::Equals($itemExt, $e, [System.StringComparison]::OrdinalIgnoreCase)) { $matched = $true; break }
+            }
+            $matched
+        }
+        foreach ($file in $files) {
+            $rel = '/' + $file.FullName.Substring($script:cfg.WebRoot.Length).TrimStart('\').Replace('\','/')
+            # F9: rewrite [id] → {id} in the OpenAPI path so tools (Swagger UI, Postman)
+            # display the placeholders correctly. Track which placeholders need 'in: path'
+            # via a parallel extraction since regex replace + side-effect-in-callback
+            # is unreliable across scopes in PS scriptblocks.
+            $openapiPath = [regex]::Replace($rel, '\[([^\[\]]+)\]', '{$1}')
+            $placeholderNames = @([regex]::Matches($rel, '\[([^\[\]]+)\]') | ForEach-Object { $_.Groups[1].Value })
+
+            $meta = $null
+            try { $meta = Get-ScriptMetadata -ScriptPath $file.FullName } catch { }
+
+            $parameters = @()
+            if ($null -ne $meta -and $meta.parameters) {
+                foreach ($p in $meta.parameters) {
+                    $isPath = $placeholderNames -contains $p.name
+                    $schema = Get-OpenApiSchemaForType -PsTypeName $p.type
+                    $paramObj = [ordered]@{
+                        name        = $p.name
+                        'in'        = if ($isPath) { 'path' } else { 'query' }
+                        required    = $isPath -or ($null -eq $p.default)
+                        description = if ($p.description) { [string]$p.description } else { '' }
+                        schema      = $schema
+                    }
+                    $parameters += $paramObj
+                }
+            }
+
+            $contentTypeOverride = [string]$script:cfg.ScriptExtensionMap[$file.Extension]
+            $responseContent = if ([string]::IsNullOrEmpty($contentTypeOverride)) {
+                [ordered]@{ 'application/json' = [ordered]@{ schema = $envelopeSchema } }
+            } else {
+                $ctKey = ($contentTypeOverride -split ';')[0].Trim()
+                [ordered]@{ $ctKey = [ordered]@{ schema = [ordered]@{ type = 'string' } } }
+            }
+
+            $operation = [ordered]@{
+                summary     = if ($null -ne $meta) { [string]$meta.synopsis } else { '' }
+                description = if ($null -ne $meta) { [string]$meta.description } else { '' }
+                parameters  = $parameters
+                responses   = [ordered]@{
+                    '200' = [ordered]@{
+                        description = 'Success (script exited with code 0).'
+                        content     = $responseContent
+                    }
+                    '500' = [ordered]@{
+                        description = 'Script exited with a non-zero code.'
+                        content     = [ordered]@{ 'application/json' = [ordered]@{ schema = $envelopeSchema } }
+                    }
+                    '504' = [ordered]@{
+                        description = 'Script execution exceeded ScriptTimeoutSec.'
+                    }
+                }
+            }
+            $methods = if ($file.Extension -eq '.ps1') { @('get', 'post') } else { @('get') }
+            $pathItem = [ordered]@{}
+            foreach ($m in $methods) { $pathItem[$m] = $operation }
+            $paths[$openapiPath] = $pathItem
+        }
+    }
+
+    $spec = [ordered]@{
+        openapi = '3.1.0'
+        info    = [ordered]@{
+            title   = [string]$script:cfg.OpenApiTitle
+            version = [string]$script:cfg.OpenApiVersion
+        }
+        paths   = $paths
+    }
+    return $spec | ConvertTo-Json -Compress -Depth 12
+}
+
+# ---------------------------------------------------------------------------
 # Format-PromMetrics (F8)
 # Builds a Prometheus text-format body from the live counters/gauges. Same
 # numbers /metrics already exposes — just expressed in the format Prometheus
@@ -2634,6 +2762,8 @@ $shared = @{
     FnPromMetrics    = ${function:Format-PromMetrics}
     FnRouteTable     = ${function:Get-RouteTable}
     FnResolveRoute   = ${function:Resolve-RoutedScript}
+    FnOpenApiSchema  = ${function:Get-OpenApiSchemaForType}
+    FnOpenApiSpec    = ${function:Build-OpenApiSpec}
     FnGetMime        = ${function:Get-MimeType}
     FnSendStatic     = ${function:Send-StaticFile}
     FnAddCors        = ${function:Add-CorsHeaders}
@@ -2678,6 +2808,8 @@ $requestHandler = {
     ${function:Format-PromMetrics} = $shared.FnPromMetrics
     ${function:Get-RouteTable}   = $shared.FnRouteTable
     ${function:Resolve-RoutedScript} = $shared.FnResolveRoute
+    ${function:Get-OpenApiSchemaForType} = $shared.FnOpenApiSchema
+    ${function:Build-OpenApiSpec} = $shared.FnOpenApiSpec
     ${function:Get-MimeType}     = $shared.FnGetMime
     ${function:Send-StaticFile}  = $shared.FnSendStatic
     ${function:Add-CorsHeaders}  = $shared.FnAddCors
@@ -2834,7 +2966,7 @@ $requestHandler = {
                 Send-Response -Response $resp -StatusCode 429 -Body $body -RequestId $requestId
                 $rlIdentity = if (-not [string]::IsNullOrEmpty($rateLimitIdentity)) { $rateLimitIdentity } else { '-' }
                 Write-Log -ClientIP $clientIP -Request $requestLine -Status 'RATE LIMITED' -ExitCode '-' -RequestId $requestId -Identity $rlIdentity
-                Write-AuditLog -Event 'RATE_LIMITED' -Identity $rlIdentity -ClientIP $clientIP -Path $urlPath -Detail ("retryAfter={0}" -f $rl.RetryAfterSec)
+                Write-AuditLog -EventName 'RATE_LIMITED' -Identity $rlIdentity -ClientIP $clientIP -Path $urlPath -Detail ("retryAfter={0}" -f $rl.RetryAfterSec)
                 $null = [System.Threading.Interlocked]::Increment($script:rateLimitedTotal)
                 return
             }
@@ -2902,7 +3034,7 @@ $requestHandler = {
                 Send-Response -Response $resp -StatusCode 401 -Body $body -RequestId $requestId
                 Write-Log -ClientIP $clientIP -Request $requestLine -Status 'UNAUTHORIZED' -ExitCode '-' -RequestId $requestId -Identity '-'
                 # F5: audit security-relevant denial — operators can correlate with brute-force attempts.
-                Write-AuditLog -Event 'AUTH_FAIL' -ClientIP $clientIP -Path $urlPath -Detail ("mode=$authMode")
+                Write-AuditLog -EventName 'AUTH_FAIL' -ClientIP $clientIP -Path $urlPath -Detail ("mode=$authMode")
                 return
             }
         }
@@ -2977,6 +3109,24 @@ $requestHandler = {
             $promBody = Format-PromMetrics
             Send-Response -Response $resp -StatusCode 200 -Body $promBody -RequestId $requestId -ContentType 'text/plain; version=0.0.4; charset=utf-8'
             Write-Log -ClientIP $clientIP -Request $requestLine -Status 'METRICS-PROM' -ExitCode '-' -RequestId $requestId
+            return
+        }
+
+        # --------------------------------------------------------------
+        # F10: GET /openapi.json -> auto-generated OpenAPI 3.1 spec for the
+        # current webroot. Auth-exempt so tools (Swagger UI, Postman) can
+        # discover the API without credentials.
+        # --------------------------------------------------------------
+        if ($urlPath -eq '/openapi.json') {
+            if (-not $script:cfg.OpenApiEnabled) {
+                $body = New-JsonResponse -ExitCode 404 -Output '' -Err 'OpenAPI endpoint disabled.'
+                Send-Response -Response $resp -StatusCode 404 -Body $body -RequestId $requestId
+                Write-Log -ClientIP $clientIP -Request $requestLine -Status 'NOT FOUND' -ExitCode '-' -RequestId $requestId
+                return
+            }
+            $specBody = Build-OpenApiSpec
+            Send-Response -Response $resp -StatusCode 200 -Body $specBody -RequestId $requestId -ContentType 'application/json; charset=utf-8'
+            Write-Log -ClientIP $clientIP -Request $requestLine -Status 'OPENAPI' -ExitCode '-' -RequestId $requestId
             return
         }
 
