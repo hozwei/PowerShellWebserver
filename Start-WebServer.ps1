@@ -134,6 +134,21 @@ $cfg = @{
     MinRequestIntervalSec    = 1      # minimum seconds between dispatched requests, globally — 0 = disabled. /health and /metrics are always exempt.
     AllowedIPs               = @()    # IP allowlist — empty = all IPs allowed; non-empty = only listed IPs pass (except /health)
     BlockedIPs               = @()    # IP blocklist — always rejected before AllowedIPs check (except /health); empty = no blocks
+    GzipEnabled              = $true  # GZIP response compression — only applied when client sent Accept-Encoding: gzip AND body >= GzipMinBytes AND Content-Type matches GzipMimeTypes
+    GzipMinBytes             = 1024   # responses smaller than this byte count are never compressed (compression overhead exceeds savings)
+    GzipMimeTypes            = @(     # response Content-Types eligible for compression — checked via StartsWith, so 'application/json' covers 'application/json; charset=utf-8'
+        'application/json',
+        'application/xml',
+        'application/javascript',
+        'text/html',
+        'text/plain',
+        'text/css',
+        'text/javascript',
+        'text/xml'
+    )
+    LogIntegrityHash         = $false # write <logfile>.md5 next to every completed log file at startup (legacy PoSH Server parity); current day's file is left alone
+    LogSchedule              = 'Daily' # 'Daily' = YYYY-MM-DD.log | 'Hourly' = YYYY-MM-DDTHH.log
+    LogFormat                = 'Native' # 'Native' = current pipe-delimited format | 'IIS-W3C' = W3C Extended Log File Format with #Fields header
 }
 
 # Runtime measurement from server start — used for health check uptime.
@@ -160,6 +175,16 @@ $script:logMutex = [System.Threading.Mutex]::new($false, 'Global\PoshWebserverLo
 # Writes to the log file AND to stdout (visible in Scheduled Task event log).
 # No Write-Host with -ForegroundColor — throws IOException in non-interactive contexts.
 # $script:cfg instead of $cfg — function also runs in RunspacePool instances.
+#
+# Format-aware:
+#   Native   — pipe-delimited line as before, file = YYYY-MM-DD.log (or YYYY-MM-DDTHH.log when Hourly).
+#   IIS-W3C  — W3C Extended Log File Format, file name identical, first write to a new file
+#              emits #Software / #Version / #Date / #Fields header lines.
+#
+# Optional W3C extras ($HttpStatus / $Method / $UriStem / $UriQuery / $UserAgent) are only
+# consulted in IIS-W3C mode. When omitted, they are derived from $Request as a best-effort
+# fallback so existing callers do not need to change. $Status (text) is mapped onto sc-status
+# heuristically as a last resort.
 # ---------------------------------------------------------------------------
 function Write-Log {
     param(
@@ -167,19 +192,79 @@ function Write-Log {
         [string] $Request    = '-',
         [string] $Status     = '-',
         [string] $ExitCode   = '-',
-        [string] $RequestId  = '-'
+        [string] $RequestId  = '-',
+        # W3C-only extras — ignored in Native format.
+        [int]    $HttpStatus = 0,
+        [string] $Method     = '',
+        [string] $UriStem    = '',
+        [string] $UriQuery   = '',
+        [string] $UserAgent  = '-'
     )
 
-    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $line = '{0} | {1} | {2} | EXIT:{3} | {4} | {5}' -f `
-        $timestamp,
-        $ClientIP.PadRight(15),
-        $Request.PadRight(60),
-        $ExitCode.PadRight(4),
-        $Status.PadRight(13),
-        $RequestId
+    $now      = Get-Date
+    $schedule = if ($script:cfg.LogSchedule -eq 'Hourly') { 'Hourly' } else { 'Daily' }
+    $format   = if ($script:cfg.LogFormat   -eq 'IIS-W3C') { 'IIS-W3C' } else { 'Native' }
 
-    $logFile = Join-Path $script:cfg.LogDir ((Get-Date -Format 'yyyy-MM-dd') + '.log')
+    $fileStem = if ($schedule -eq 'Hourly') { $now.ToString('yyyy-MM-ddTHH') } else { $now.ToString('yyyy-MM-dd') }
+    $logFile  = Join-Path $script:cfg.LogDir ($fileStem + '.log')
+
+    if ($format -eq 'IIS-W3C') {
+        # Derive missing W3C fields from the Native-style $Request "GET /path?query" as a fallback.
+        if ($Method -eq '' -or $UriStem -eq '') {
+            $parts = $Request -split ' ', 2
+            if ($Method -eq '' -and $parts.Count -ge 1) { $Method = $parts[0] }
+            if ($parts.Count -ge 2) {
+                $uri = $parts[1]
+                $qIx = $uri.IndexOf('?')
+                if ($qIx -ge 0) {
+                    if ($UriStem  -eq '') { $UriStem  = $uri.Substring(0, $qIx) }
+                    if ($UriQuery -eq '') { $UriQuery = $uri.Substring($qIx + 1) }
+                } elseif ($UriStem -eq '') {
+                    $UriStem = $uri
+                }
+            }
+        }
+        if ($HttpStatus -le 0) {
+            # Map textual $Status onto sc-status when caller did not pass an explicit HTTP code.
+            $HttpStatus = switch -Regex ($Status) {
+                '^OK$|^INDEX$|^HEALTH$|^METRICS$' { 200; break }
+                '^METHOD NOT ALLOWED$'            { 405; break }
+                '^UNAUTHORIZED$'                  { 401; break }
+                '^FORBIDDEN$|^IP BLOCKED$|^IP NOT ALLOWED$' { 403; break }
+                '^NOT FOUND$'                     { 404; break }
+                '^RATE LIMITED$'                  { 429; break }
+                '^TIMEOUT$'                       { 504; break }
+                '^BAD REQUEST$|^HTTP \d+$'        { 400; break }
+                '^ERROR$|^REQUEST-ERROR'          { 500; break }
+                default                           { 0 }
+            }
+        }
+        if ([string]::IsNullOrEmpty($UriStem))  { $UriStem  = '-' }
+        if ([string]::IsNullOrEmpty($UriQuery)) { $UriQuery = '-' }
+        if ([string]::IsNullOrEmpty($Method))   { $Method   = '-' }
+        if ([string]::IsNullOrEmpty($UserAgent)){ $UserAgent = '-' }
+        # W3C requires UA without spaces — collapse whitespace to '+'.
+        $UserAgent = ($UserAgent -replace '\s+', '+')
+
+        $line = '{0} {1} {2} {3} {4} {5} {6} {7} {8}' -f `
+            $now.ToString('yyyy-MM-dd'),
+            $now.ToString('HH:mm:ss'),
+            $ClientIP,
+            $Method,
+            $UriStem,
+            $UriQuery,
+            $HttpStatus,
+            $UserAgent,
+            $RequestId
+    } else {
+        $line = '{0} | {1} | {2} | EXIT:{3} | {4} | {5}' -f `
+            $now.ToString('yyyy-MM-dd HH:mm:ss'),
+            $ClientIP.PadRight(15),
+            $Request.PadRight(60),
+            $ExitCode.PadRight(4),
+            $Status.PadRight(13),
+            $RequestId
+    }
 
     # Mutex prevents corrupted lines from parallel writes across RunspacePool Runspaces.
     # WaitOne(500): wait at most 500ms — on failure continue silently, never kill the process.
@@ -188,6 +273,17 @@ function Write-Log {
     $acquired = $false
     try {
         $acquired = $script:logMutex.WaitOne(500)
+        if ($format -eq 'IIS-W3C' -and -not (Test-Path -LiteralPath $logFile -PathType Leaf)) {
+            # Emit W3C header block once per file — the #Fields line is what tools like
+            # logparser require to interpret subsequent records.
+            $header = @(
+                '#Software: posh-webserver'
+                '#Version: 1.0'
+                ('#Date: {0}' -f $now.ToString('yyyy-MM-dd HH:mm:ss'))
+                '#Fields: date time c-ip cs-method cs-uri-stem cs-uri-query sc-status cs(User-Agent) x-request-id'
+            ) -join [System.Environment]::NewLine
+            Add-Content -LiteralPath $logFile -Value $header -Encoding UTF8
+        }
         Add-Content -LiteralPath $logFile -Value $line -Encoding UTF8
     } catch { } finally {
         try { if ($acquired) { $script:logMutex.ReleaseMutex() } } catch { }
@@ -236,10 +332,62 @@ function Remove-OldLogs {
             try {
                 Remove-Item -LiteralPath $_.FullName -Force
                 $deleted++
+                # Companion MD5 file (if LogIntegrityHash was enabled previously) is removed too —
+                # leaving orphan .md5 files would clutter the directory and confuse audit consumers.
+                $md5 = $_.FullName + '.md5'
+                if (Test-Path -LiteralPath $md5 -PathType Leaf) {
+                    try { Remove-Item -LiteralPath $md5 -Force } catch { }
+                }
             } catch { }
         }
 
     return $deleted
+}
+
+# ---------------------------------------------------------------------------
+# Save-LogIntegrityHashes
+# Writes an MD5 hash file next to every completed log file in LogDir.
+# A log file is "completed" when its file stem differs from the current
+# YYYY-MM-DD (Daily) or YYYY-MM-DDTHH (Hourly) stem — the currently-active
+# file is left untouched so its hash never goes out of sync with a partial
+# write.
+# Runs once at startup — never during operation. Caller controls invocation
+# via $cfg.LogIntegrityHash. Idempotent: an existing .md5 file is not rewritten.
+# Returns the number of hash files newly created.
+# ---------------------------------------------------------------------------
+function Save-LogIntegrityHashes {
+    # MD5 is intentional: this is a basic at-rest integrity tag for log audit, NOT a security
+    # primitive. The format matches `md5sum` for tool compatibility, and that is what the
+    # legacy PoSH Server emitted — replacing MD5 with SHA256 here would break audit consumers
+    # without strengthening anything (a log-rewriter on the same box can also rewrite the .md5).
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingBrokenHashAlgorithms', '',
+        Justification = 'MD5 chosen for md5sum-compatible at-rest log integrity tagging, not for cryptographic use')]
+    param(
+        [string] $LogDir,
+        [string] $Schedule = 'Daily'   # 'Daily' or 'Hourly' — controls which file stem counts as "current"
+    )
+
+    if (-not (Test-Path -LiteralPath $LogDir -PathType Container)) { return 0 }
+
+    $currentStem = if ($Schedule -eq 'Hourly') { (Get-Date).ToString('yyyy-MM-ddTHH') } else { (Get-Date).ToString('yyyy-MM-dd') }
+    $created     = 0
+
+    Get-ChildItem -Path $LogDir -Filter '*.log' -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.BaseName -ne $currentStem -and $_.BaseName -ne 'startup' -and $_.BaseName -ne 'jobs' } |
+        ForEach-Object {
+            $hashFile = $_.FullName + '.md5'
+            if (Test-Path -LiteralPath $hashFile -PathType Leaf) { return }
+            try {
+                # Get-FileHash is the canonical way; .NET MD5 wrapper avoids spawning Format-* pipelines.
+                $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm MD5).Hash.ToLowerInvariant()
+                # Format mirrors `md5sum` so the file is consumable by standard audit tools.
+                $line = '{0}  {1}' -f $hash, $_.Name
+                [System.IO.File]::WriteAllText($hashFile, $line + [System.Environment]::NewLine, [System.Text.Encoding]::UTF8)
+                $created++
+            } catch { }
+        }
+
+    return $created
 }
 
 # ---------------------------------------------------------------------------
@@ -372,6 +520,18 @@ if ($deletedLogs -gt 0) {
 }
 
 # ---------------------------------------------------------------------------
+# Log integrity hashes at startup (opt-in, $cfg.LogIntegrityHash).
+# Writes <logfile>.md5 next to every completed log file — the file currently
+# being written to is intentionally skipped so the hash never goes stale.
+# ---------------------------------------------------------------------------
+if ($cfg.LogIntegrityHash) {
+    $hashesCreated = Save-LogIntegrityHashes -LogDir $cfg.LogDir -Schedule $cfg.LogSchedule
+    if ($hashesCreated -gt 0) {
+        Write-StartupLog "Log integrity: $hashesCreated MD5 hash file(s) created."
+    }
+}
+
+# ---------------------------------------------------------------------------
 # POST JSON file cleanup at startup
 # Deletes .json files in PostJsonDir older than PostJsonRetentionDays days.
 # Files are intentionally kept after processing for audit/debugging purposes.
@@ -467,12 +627,59 @@ function Send-Response {
         [System.Net.HttpListenerResponse] $Response,
         [int]    $StatusCode,
         [string] $Body,
-        [string] $RequestId = ''
+        [string] $RequestId      = '',
+        [string] $ContentType    = 'application/json; charset=utf-8',
+        [AllowNull()]
+        [string] $AcceptEncoding = $null
     )
     try {
+        # Default $AcceptEncoding to the per-request value the handler stashes in $script:
+        # scope before calling. Keeps the 13 existing call sites unchanged while still
+        # giving Send-Response access to the client's Accept-Encoding header.
+        if ($null -eq $AcceptEncoding) {
+            try { $AcceptEncoding = $script:acceptEncoding } catch { $AcceptEncoding = '' }
+            if ($null -eq $AcceptEncoding) { $AcceptEncoding = '' }
+        }
+
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($Body)
+
+        # GZIP compression — opt-in via $cfg.GzipEnabled, gated on three conditions:
+        #   1. Client advertised gzip via Accept-Encoding.
+        #   2. Body is large enough that compression actually saves bytes (GzipMinBytes).
+        #   3. Content-Type matches one of the configured prefixes — only text-ish payloads
+        #      benefit; pre-compressed binary types (PNG, JPEG, ZIP) would only inflate.
+        # The comparison uses StartsWith so 'application/json' covers 'application/json; charset=utf-8'.
+        if ($script:cfg.GzipEnabled -and
+            $AcceptEncoding -and
+            $AcceptEncoding.IndexOf('gzip', [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+            $bytes.Length -ge $script:cfg.GzipMinBytes) {
+
+            $mimeOk = $false
+            foreach ($mime in $script:cfg.GzipMimeTypes) {
+                if ($ContentType.StartsWith($mime, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    $mimeOk = $true
+                    break
+                }
+            }
+            if ($mimeOk) {
+                $ms = $null
+                $gz = $null
+                try {
+                    $ms = [System.IO.MemoryStream]::new()
+                    $gz = [System.IO.Compression.GZipStream]::new($ms, [System.IO.Compression.CompressionLevel]::Optimal, $true)
+                    $gz.Write($bytes, 0, $bytes.Length)
+                    $gz.Dispose(); $gz = $null
+                    $bytes = $ms.ToArray()
+                    $Response.AddHeader('Content-Encoding', 'gzip')
+                } finally {
+                    if ($null -ne $gz) { try { $gz.Dispose() } catch { } }
+                    if ($null -ne $ms) { try { $ms.Dispose() } catch { } }
+                }
+            }
+        }
+
         $Response.StatusCode      = $StatusCode
-        $Response.ContentType     = 'application/json; charset=utf-8'
+        $Response.ContentType     = $ContentType
         $Response.ContentLength64 = $bytes.Length
         # X-Request-Id header allows clients to correlate requests to log entries.
         if ($RequestId -ne '') { $Response.AddHeader('X-Request-Id', $RequestId) }
@@ -828,6 +1035,12 @@ $requestHandler = {
     try {
         $req  = $context.Request
         $resp = $context.Response
+
+        # Stash Accept-Encoding in $script: scope so Send-Response can pick it up without
+        # every call site having to forward an extra parameter — the value is per-request
+        # and per-runspace, so $script:-scope is safe here.
+        $script:acceptEncoding = $req.Headers['Accept-Encoding']
+        if ($null -eq $script:acceptEncoding) { $script:acceptEncoding = '' }
 
         $clientIP    = $req.RemoteEndPoint.Address.ToString()
         $urlPath     = $req.Url.AbsolutePath

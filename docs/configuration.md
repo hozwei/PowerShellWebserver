@@ -34,6 +34,12 @@ $cfg = @{
     MinRequestIntervalSec    = 1
     AllowedIPs               = @()
     BlockedIPs               = @()
+    GzipEnabled              = $true
+    GzipMinBytes             = 1024
+    GzipMimeTypes            = @('application/json', 'application/xml', 'application/javascript', 'text/html', 'text/plain', 'text/css', 'text/javascript', 'text/xml')
+    LogIntegrityHash         = $false
+    LogSchedule              = 'Daily'
+    LogFormat                = 'Native'
 }
 ```
 
@@ -65,6 +71,12 @@ $cfg = @{
     MinRequestIntervalSec    = 1
     AllowedIPs               = @('192.168.1.0', '192.168.1.1', '10.0.0.5')
     BlockedIPs               = @()
+    GzipEnabled              = $true
+    GzipMinBytes             = 2048
+    GzipMimeTypes            = @('application/json', 'text/html', 'text/plain')
+    LogIntegrityHash         = $true
+    LogSchedule              = 'Hourly'
+    LogFormat                = 'IIS-W3C'
 }
 ```
 
@@ -124,6 +136,12 @@ These are passed on the command line when starting the server. `Register-Schedul
 | `MinRequestIntervalSec` | `integer` | `1` | Minimum number of seconds that must elapse between two dispatched requests, globally across all clients. Requests arriving before this interval elapses receive HTTP 429 with a `Retry-After` header. Enforced in the main thread before any runspace is started — the RunspacePool is never touched for throttled requests. `GET /health` and `GET /metrics` are always exempt regardless of this setting. Set to `0` to disable. |
 | `AllowedIPs` | `string[]` | `@()` | IP address allowlist. Empty array = all client IPs are allowed (default). Non-empty = only the listed IP addresses may send requests. Checked in the main thread after the IP blocklist. `GET /health` is always exempt. Use exact IP strings (e.g. `'192.168.1.10'`). |
 | `BlockedIPs` | `string[]` | `@()` | IP address blocklist. Listed IPs are always rejected with HTTP 403, regardless of `AllowedIPs`. Checked in the main thread before `AllowedIPs`. `GET /health` is always exempt. Empty array = no IPs blocked (default). |
+| `GzipEnabled` | `bool` | `$true` | Enable GZIP response compression. Only applied when the client advertises `Accept-Encoding: gzip` AND the response body size is ≥ `GzipMinBytes` AND the response Content-Type starts with one of the entries in `GzipMimeTypes`. Pre-compressed binary types (images, ZIPs) are never compressed regardless of this setting because their MIME prefixes do not match. |
+| `GzipMinBytes` | `integer` | `1024` | Minimum response body size in bytes for which GZIP compression is attempted. Smaller responses are sent uncompressed because compression overhead would exceed the savings. |
+| `GzipMimeTypes` | `string[]` | see code | Allow-list of Content-Type prefixes eligible for GZIP. Matched via `StartsWith` so `'application/json'` covers `'application/json; charset=utf-8'`. Defaults include JSON, XML, JavaScript, HTML, CSS, and plain text. |
+| `LogIntegrityHash` | `bool` | `$false` | At startup, write an `.md5` companion file next to every completed log file in `LogDir`. The currently-active log file is intentionally skipped so its hash never goes stale. Output format matches `md5sum` (lowercase hash + two spaces + filename). Provides a basic audit trail for log files at rest. |
+| `LogSchedule` | `string` | `'Daily'` | Log file rotation schedule. `'Daily'` (default): file name is `YYYY-MM-DD.log`. `'Hourly'`: file name is `YYYY-MM-DDTHH.log` (one file per hour). `LogRetentionDays` is interpreted as days in both cases — at hourly granularity, ~24 files per day age out together. |
+| `LogFormat` | `string` | `'Native'` | Log line format. `'Native'` (default): pipe-delimited columns matching the existing format. `'IIS-W3C'`: W3C Extended Log File Format with `#Software`, `#Version`, `#Date`, and `#Fields` header lines emitted on first write to a new file — consumable by `logparser` and similar tools. Fields: `date time c-ip cs-method cs-uri-stem cs-uri-query sc-status cs(User-Agent) x-request-id`. |
 
 ### Register-ScheduledTask.ps1 — Scheduled Task Options
 

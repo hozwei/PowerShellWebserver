@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Added
+- **GZIP response compression** — `GzipEnabled` (default `$true`), `GzipMinBytes` (default `1024`), `GzipMimeTypes` (default JSON/XML/JS/HTML/CSS/text). Responses are compressed only when the client advertises `Accept-Encoding: gzip`, the body size is `>= GzipMinBytes`, and the Content-Type matches one of the configured prefixes. The matching uses `StartsWith` so charsets and parameters are tolerated. Implemented in `Send-Response`; the per-request `Accept-Encoding` header is stashed in `$script:acceptEncoding` so all 13 existing call sites pick it up without forwarding an extra parameter.
+- **Hourly log rotation option** — new `LogSchedule` configuration key with values `'Daily'` (default, file = `YYYY-MM-DD.log`) and `'Hourly'` (file = `YYYY-MM-DDTHH.log`). `Remove-OldLogs` is format-agnostic and applies `LogRetentionDays` to either layout.
+- **IIS W3C log format option** — new `LogFormat` configuration key with values `'Native'` (default, current pipe-delimited format) and `'IIS-W3C'` (W3C Extended Log File Format with `#Software` / `#Version` / `#Date` / `#Fields` header lines on first write to a new file). Fields: `date time c-ip cs-method cs-uri-stem cs-uri-query sc-status cs(User-Agent) x-request-id`. `Write-Log` derives missing W3C fields from the Native-style `$Request` string as a fallback so the 13 existing call sites need no changes.
+- **Log integrity hashes** — new `LogIntegrityHash` configuration key (default `$false`). When `$true`, `Save-LogIntegrityHashes` writes an `.md5` companion file in `md5sum`-compatible format next to every completed log file at startup. The currently-active log file is intentionally skipped so its hash never goes stale; `startup.log` and `jobs.log` are also excluded. Companion `.md5` files are removed alongside their `.log` files in `Remove-OldLogs`.
+
 ### Changed
 - **POST request handling**: JSON body is no longer parsed into flat `-Key Value` parameters. Instead the raw body is written to `C:\posh\postjson\YYYYMMDD_HHmmss_<requestId>.json` and the absolute file path is passed to the webroot script as `-JsonFilePath`. Nested objects, arrays, and large payloads are fully supported. Query string parameters on POST requests are rejected with HTTP 400.
 - `ScriptTimeoutSec` default reduced from `900` (15 min) to `300` (5 min) — scripts running longer than 5 minutes are forcibly terminated and the caller receives HTTP 504.
