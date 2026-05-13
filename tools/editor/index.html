@@ -617,7 +617,12 @@
                 const r = await api('POST', '/api/initkey', { force });
                 toast('Schlüssel gespeichert. Backup: ' + (r.backup || '(keines)'));
                 await loadAll();
-                renderSetup(main);
+                // Re-render the whole 'setup' group: renderSetup APPENDS to
+                // main, it doesn't clear first. Calling it directly stacked
+                // a duplicate set of cards on top of the existing ones, and
+                // since both Buttons had id='aes-gen' the live click-handler
+                // ended up on the orphaned (hidden) one.
+                renderGroup('setup');
             } catch (e) { toast(formatApiError(e), 'err'); }
         });
 
@@ -649,7 +654,7 @@
                 $('#sec-pw').value = '';
                 $('#sec-force').checked = false;
                 await loadAll();
-                renderSetup(main);
+                renderGroup('setup');
             } catch (e) { toast(formatApiError(e), 'err'); }
         });
 
@@ -680,7 +685,7 @@
                     toast('POSH_API_KEY gesetzt. Scheduled Task neu starten, damit der neue Wert greift.');
                     $('#env-val').value = '';
                     await loadAll();
-                    renderSetup(main);
+                    renderGroup('setup');
                 } catch (e) { toast(formatApiError(e), 'err'); }
             });
         }
