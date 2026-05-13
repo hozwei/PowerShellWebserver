@@ -23,7 +23,7 @@
 @{
     Groups = @(
         @{ Id = 'globalvars'; Title = 'globalvars.ps1' }
-        @{ Id = 'server';     Title = 'Server ports and TLS' }
+        @{ Id = 'server';     Title = 'Server runtime' }
         @{ Id = 'auth';       Title = 'Authentication and limits' }
         @{ Id = 'logging';    Title = 'Logging' }
         @{ Id = 'features';   Title = 'Quality-of-life features' }
@@ -187,6 +187,23 @@
             Min       = 1024
             Max       = 1073741824
         }
+        @{
+            Name      = 'ExecutionMode'
+            File      = 'config.psd1'
+            Group     = 'server'
+            Type      = 'enum'
+            Label     = 'ExecutionMode'
+            Help      = "Subprocess: every request spawns pwsh.exe (isolated, slower, default). Same-Process: dispatch in-process (faster, shares state, no per-request hard timeout)."
+            Choices   = @('Subprocess', 'Same-Process')
+        }
+        @{
+            Name      = 'InjectContextVars'
+            File      = 'config.psd1'
+            Group     = 'server'
+            Type      = 'bool'
+            Label     = 'InjectContextVars'
+            Help      = "Inject `$AuthUser, `$AuthKey, `$ClientIP into every script's session-state before dispatch. Off by default to keep scripts portable."
+        }
 
         # -- Authentication and limits (config.psd1) ------------------------
         @{
@@ -315,6 +332,24 @@
             Label     = 'BlockedIPs'
             Help      = "One entry per line. Evaluated before AllowedIPs."
         }
+        @{
+            Name      = 'MinRequestIntervalSec'
+            File      = 'config.psd1'
+            Group     = 'auth'
+            Type      = 'int'
+            Label     = 'MinRequestIntervalSec'
+            Help      = "Global minimum seconds between dispatched requests (coarse throttle, applies to all callers). 0 = disabled."
+            Min       = 0
+            Max       = 3600
+        }
+        @{
+            Name      = 'AcceptedContentTypes'
+            File      = 'config.psd1'
+            Group     = 'auth'
+            Type      = 'string-array'
+            Label     = 'AcceptedContentTypes'
+            Help      = "Whitelist of Content-Type prefixes accepted for POST bodies. One per line. Default: application/json, application/x-www-form-urlencoded."
+        }
 
         # -- Logging (config.psd1) ------------------------------------------
         @{
@@ -362,6 +397,16 @@
             Help      = "Requests >= N ms get an entry in slow.log (0 = off)."
             Min       = 0
             Max       = 86400000
+        }
+        @{
+            Name      = 'PostJsonRetentionDays'
+            File      = 'config.psd1'
+            Group     = 'logging'
+            Type      = 'int'
+            Label     = 'PostJsonRetentionDays'
+            Help      = "Days to keep captured POST-body JSON files in PostJsonDir (0 = forever). Pruned at server start."
+            Min       = 0
+            Max       = 3650
         }
         @{
             Name      = 'LogIntegrityHash'
@@ -428,6 +473,89 @@
             Type      = 'bool'
             Label     = 'PathPlaceholders'
             Help      = "Enables '[id].ps1' as a placeholder for /users/123 etc."
+        }
+        @{
+            Name      = 'SessionEnabled'
+            File      = 'config.psd1'
+            Group     = 'features'
+            Type      = 'bool'
+            Label     = 'SessionEnabled'
+            Help      = "Sets an HttpOnly session cookie on responses so scripts can keep per-client state across requests."
+        }
+        @{
+            Name      = 'SessionCookieName'
+            File      = 'config.psd1'
+            Group     = 'features'
+            Type      = 'string'
+            Label     = 'SessionCookieName'
+            Help      = "Name of the session cookie. Letters, digits, dash, underscore, dot only."
+            Validator = '^[A-Za-z0-9_\-\.]+$|^$'
+        }
+        @{
+            Name      = 'DirectoryBrowsing'
+            File      = 'config.psd1'
+            Group     = 'features'
+            Type      = 'bool'
+            Label     = 'DirectoryBrowsing'
+            Help      = "Serve an HTML listing for directory URLs that don't have an index file. Off by default."
+        }
+        @{
+            Name      = 'DirectoryBrowsingHidden'
+            File      = 'config.psd1'
+            Group     = 'features'
+            Type      = 'string-array'
+            Label     = 'DirectoryBrowsingHidden'
+            Help      = "Names hidden from directory listings (one per line). Default: _error, .git, .gitignore."
+        }
+        @{
+            Name      = 'CustomErrorPages'
+            File      = 'config.psd1'
+            Group     = 'features'
+            Type      = 'bool'
+            Label     = 'CustomErrorPages'
+            Help      = "Serve <ErrorPagesRoot>\\<code>.html for 4xx/5xx when the client Accepts text/html. Falls back to JSON envelope otherwise."
+        }
+        @{
+            Name      = 'ErrorPagesRoot'
+            File      = 'config.psd1'
+            Group     = 'features'
+            Type      = 'string'
+            Label     = 'ErrorPagesRoot'
+            Help      = "Directory containing <code>.html templates for CustomErrorPages. Absolute path."
+        }
+        @{
+            Name      = 'PostJsonDir'
+            File      = 'config.psd1'
+            Group     = 'features'
+            Type      = 'string'
+            Label     = 'PostJsonDir'
+            Help      = "Directory where POST-body JSON files are captured by post-json.ps1. Absolute path."
+        }
+        @{
+            Name      = 'PhpCgiEnabled'
+            File      = 'config.psd1'
+            Group     = 'features'
+            Type      = 'bool'
+            Label     = 'PhpCgiEnabled'
+            Help      = "Route .php requests through an external php-cgi.exe (CGI/1.1). PhpCgiPath must point at the executable."
+        }
+        @{
+            Name      = 'PhpCgiPath'
+            File      = 'config.psd1'
+            Group     = 'features'
+            Type      = 'string'
+            Label     = 'PhpCgiPath'
+            Help      = "Absolute path to php-cgi.exe. Only consulted when PhpCgiEnabled is true."
+        }
+        @{
+            Name      = 'PhpCgiTimeoutSec'
+            File      = 'config.psd1'
+            Group     = 'features'
+            Type      = 'int'
+            Label     = 'PhpCgiTimeoutSec'
+            Help      = "Per-request timeout for the php-cgi subprocess. Exceeded -> HTTP 504."
+            Min       = 1
+            Max       = 3600
         }
     )
 }
