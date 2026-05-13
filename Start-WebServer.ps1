@@ -2331,7 +2331,11 @@ function Get-ScriptMetadata {
         if ($null -eq $helpComment) {
             try {
                 $raw       = [System.IO.File]::ReadAllText($ScriptPath, [System.Text.Encoding]::UTF8)
-                $stripped  = $raw -replace '(?m)^#Requires[^\r\n]*', ''
+                # Strip every leading #Requires line so the help block (or param
+                # block) becomes the first real statement. TrimStart removes the
+                # blank line(s) the strip leaves behind, which would otherwise
+                # confuse GetHelpContent's "directly above param/function" anchor.
+                $stripped  = ($raw -replace '(?m)^#Requires[^\r\n]*', '').TrimStart([char[]]@("`r","`n","`t",' '))
                 $astRetry  = [System.Management.Automation.Language.Parser]::ParseInput($stripped, [ref]$null, [ref]$null)
                 if ($null -ne $astRetry) { $helpComment = $astRetry.GetHelpContent() }
             } catch { }
