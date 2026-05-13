@@ -59,6 +59,17 @@ function Invoke-Posh {
     .PARAMETER SkipHttpErrorCheck
         Same as the Invoke-RestMethod parameter — when set, 4xx/5xx
         responses do not throw and the JSON envelope can be inspected.
+
+    .PARAMETER TimeoutSec
+        Per-call request timeout. Defaults to 30s; pass 0 to use the
+        Invoke-RestMethod default (effectively unbounded).
+
+    .PARAMETER Retry
+        Retry transient failures (Invoke-RestMethod's built-in retry on
+        408 / 429 / 5xx). Pass 0 to disable. Defaults to 0.
+
+    .PARAMETER RetryIntervalSec
+        Seconds between retries. Defaults to 2; ignored when -Retry = 0.
     #>
     param(
         [Parameter(Mandatory)][string] $Path,
@@ -67,7 +78,10 @@ function Invoke-Posh {
         $Body,
         [string] $ContentType,
         [Microsoft.PowerShell.Commands.WebRequestSession] $Session,
-        [switch] $SkipHttpErrorCheck
+        [switch] $SkipHttpErrorCheck,
+        [int] $TimeoutSec      = 30,
+        [int] $Retry           = 0,
+        [int] $RetryIntervalSec = 2
     )
 
     $uri = "$script:PoshBaseUrl$Path"
@@ -86,6 +100,11 @@ function Invoke-Posh {
         SkipHttpErrorCheck  = [bool]$SkipHttpErrorCheck
     }
     if ($Session) { $args.WebSession = $Session }
+    if ($TimeoutSec -gt 0) { $args.TimeoutSec = $TimeoutSec }
+    if ($Retry -gt 0) {
+        $args.MaximumRetryCount = $Retry
+        $args.RetryIntervalSec  = $RetryIntervalSec
+    }
 
     if ($null -ne $Body) {
         $isString = $Body -is [string]
