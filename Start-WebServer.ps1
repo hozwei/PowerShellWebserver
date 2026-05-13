@@ -232,6 +232,14 @@ $cfg = @{
     BasicAuthUser            = $basicUser # from $env:POSH_BASIC_USER — only validated at startup when AuthMode requires Basic
     BasicAuthPass            = $basicPass # from $env:POSH_BASIC_PASS — kept in process memory only, never written to disk
     BasicAuthRealm           = 'posh'  # value of the WWW-Authenticate realm parameter on 401 responses
+    ExecutionMode            = 'Subprocess' # 'Subprocess' (default, reliable exit codes + timeout) or 'InProcess' (faster, no isolation, exit codes via exception only)
+    InjectContextVars        = $false # in 'InProcess' mode, expose $PoSHQuery / $PoSHPost / $PoSHCookies / $PoSHHeaders to webroot scripts (legacy PoSH compat)
+    ScriptExtensionMap       = @{      # supported webroot file extensions and their response Content-Type. Match is case-insensitive.
+        '.ps1'   = ''                  # empty = use JSON envelope (existing behaviour) — server wraps stdout/stderr in { exitCode, output, error }
+        '.psxml' = 'text/xml; charset=utf-8'           # raw stdout passed through as XML
+        '.posh'  = 'text/html; charset=utf-8'          # raw stdout passed through as HTML
+        '.psapi' = 'application/xml; charset=utf-8'    # raw stdout passed through as XML — legacy PoSH 'API' endpoint type
+    }
 }
 
 # StaticRoot fallback — empty string means: reuse WebRoot. Resolved here rather than at
@@ -1216,6 +1224,148 @@ function Send-StaticFile {
     return [PSCustomObject]@{ StatusCode = $Response.StatusCode; Reason = $reason; Length = $contentLength }
 }
 
+# ---------------------------------------------------------------------------
+# Test-IsScriptPath
+# Returns $true when the URL path ends in one of the configured script
+# extensions (.ps1, .psxml, .posh, .psapi by default). Comparison is
+# case-insensitive. Used by the routing branch to decide between the static
+# branch (PR-2) and the executable branch (PR-5).
+# ---------------------------------------------------------------------------
+function Test-IsScriptPath {
+    param([string] $Path)
+    if ([string]::IsNullOrEmpty($Path)) { return $false }
+    foreach ($ext in $script:cfg.ScriptExtensionMap.Keys) {
+        if ($Path.EndsWith($ext, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}
+
+# ---------------------------------------------------------------------------
+# Get-ScriptContentType
+# Returns the configured Content-Type for the matched script extension, or
+# an empty string when no override applies (caller defaults to the JSON
+# envelope). Empty string is also the marker that means "wrap output in
+# { exitCode, output, error }".
+# ---------------------------------------------------------------------------
+function Get-ScriptContentType {
+    param([string] $Path)
+    if ([string]::IsNullOrEmpty($Path)) { return '' }
+    foreach ($ext in $script:cfg.ScriptExtensionMap.Keys) {
+        if ($Path.EndsWith($ext, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return [string]$script:cfg.ScriptExtensionMap[$ext]
+        }
+    }
+    return ''
+}
+
+# ---------------------------------------------------------------------------
+# Invoke-ScriptInProcess
+# Runs a webroot script inside a fresh runspace rather than spawning pwsh.exe.
+#
+# Trade-offs vs. Invoke-Script (Subprocess):
+#   - Faster: no process-startup cost (~400 ms saved per request under load).
+#   - Less isolation: a script crash within the script's own try/catch can
+#     leak module state. We mitigate by giving each request its own runspace
+#     and disposing it after the call.
+#   - Exit codes are best-effort: `exit 1` from the script ends the pipeline
+#     with $? = $false, but the numeric code is not always recoverable across
+#     PowerShell pipelines. We treat any pipeline error/exception as exit 1
+#     and successful completion as exit 0.
+#   - Timeout uses Runspace.Stop() which is best-effort — long-running native
+#     calls inside the script may not honor it immediately.
+#
+# Context variables ($PoSHQuery, $PoSHPost, $PoSHCookies, $PoSHHeaders) are
+# injected into the runspace's InitialSessionState when $cfg.InjectContextVars
+# is $true — legacy PoSH Server compatibility for scripts that read those
+# globals directly.
+# ---------------------------------------------------------------------------
+function Invoke-ScriptInProcess {
+    param(
+        [string]    $ScriptPath,
+        [hashtable] $Params,
+        [int]       $TimeoutSec,
+        [string]    $JsonFilePath = '',
+        [hashtable] $ContextVars  = $null
+    )
+
+    $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault2()
+
+    if ($script:cfg.InjectContextVars -and $null -ne $ContextVars) {
+        foreach ($k in $ContextVars.Keys) {
+            $entry = [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new($k, $ContextVars[$k], $null)
+            $iss.Variables.Add($entry)
+        }
+    }
+
+    $rs = $null
+    $ps = $null
+    try {
+        $rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace($iss)
+        $rs.Open()
+
+        $ps = [System.Management.Automation.PowerShell]::Create()
+        $ps.Runspace = $rs
+        # Use & '<path>' so the script's param() block binds named parameters from -Args.
+        # Wrap in a try/catch so we surface non-terminating errors uniformly via Streams.Error.
+        $null = $ps.AddScript({ param($Path) & $Path @args }, $true)
+        $null = $ps.AddArgument($ScriptPath)
+        foreach ($k in $Params.Keys) {
+            $null = $ps.AddArgument("-$k")
+            $null = $ps.AddArgument($Params[$k])
+        }
+        if ($JsonFilePath -ne '') {
+            $null = $ps.AddArgument('-JsonFilePath')
+            $null = $ps.AddArgument($JsonFilePath)
+        }
+
+        $handle = $ps.BeginInvoke()
+        $done   = $handle.AsyncWaitHandle.WaitOne($TimeoutSec * 1000)
+
+        if (-not $done) {
+            try { $ps.Stop() } catch { }
+            return [PSCustomObject]@{
+                ExitCode = -1
+                Output   = ''
+                Error    = "Timeout: script was terminated after $TimeoutSec seconds (InProcess mode)."
+                TimedOut = $true
+            }
+        }
+
+        $outputObjs = $null
+        $hadError   = $false
+        $errorText  = ''
+        try {
+            $outputObjs = $ps.EndInvoke($handle)
+        } catch {
+            $hadError  = $true
+            $errorText = $_.ToString()
+        }
+
+        if ($ps.Streams.Error.Count -gt 0) {
+            $hadError = $true
+            $errParts = foreach ($e in $ps.Streams.Error) { $e.ToString() }
+            $errorText = ($errParts -join [System.Environment]::NewLine).Trim()
+        }
+        if ($ps.HadErrors) { $hadError = $true }
+
+        $outText = ''
+        if ($null -ne $outputObjs) {
+            $strings = foreach ($o in $outputObjs) { [string]$o }
+            $outText = ($strings -join [System.Environment]::NewLine).TrimEnd()
+        }
+
+        return [PSCustomObject]@{
+            ExitCode = if ($hadError) { 1 } else { 0 }
+            Output   = $outText
+            Error    = $errorText
+            TimedOut = $false
+        }
+    } finally {
+        if ($null -ne $ps) { try { $ps.Dispose() } catch { } }
+        if ($null -ne $rs) { try { $rs.Dispose() } catch { } }
+    }
+}
+
 function Invoke-Script {
     param(
         [string]    $ScriptPath,
@@ -1317,10 +1467,25 @@ function Invoke-Script {
 
 function Get-ScriptIndex {
     # @() forces array serialisation even on an empty result — prevents $null instead of [].
+    # Indexes every extension registered in ScriptExtensionMap (.ps1, .psxml, .posh, .psapi
+    # by default), not just .ps1, so non-default aliases are discoverable too.
+    $exts = @($script:cfg.ScriptExtensionMap.Keys)
     $list = if (Test-Path -LiteralPath $script:cfg.WebRoot -PathType Container) {
-        Get-ChildItem -Path $script:cfg.WebRoot -Recurse -Filter '*.ps1' | ForEach-Object {
-            '/' + $_.FullName.Substring($script:cfg.WebRoot.Length).TrimStart('\').Replace('\','/')
-        }
+        Get-ChildItem -Path $script:cfg.WebRoot -Recurse -File |
+            Where-Object {
+                $itemExt = $_.Extension
+                $matched = $false
+                foreach ($e in $exts) {
+                    if ([string]::Equals($itemExt, $e, [System.StringComparison]::OrdinalIgnoreCase)) {
+                        $matched = $true
+                        break
+                    }
+                }
+                $matched
+            } |
+            ForEach-Object {
+                '/' + $_.FullName.Substring($script:cfg.WebRoot.Length).TrimStart('\').Replace('\','/')
+            }
     } else {
         @()
     }
@@ -1443,6 +1608,9 @@ $shared = @{
     FnSendStatic     = ${function:Send-StaticFile}
     FnAddCors        = ${function:Add-CorsHeaders}
     FnCorsPreflight  = ${function:Send-CorsPreflight}
+    FnIsScriptPath   = ${function:Test-IsScriptPath}
+    FnScriptCT       = ${function:Get-ScriptContentType}
+    FnInvScriptIP    = ${function:Invoke-ScriptInProcess}
 }
 
 # ---------------------------------------------------------------------------
@@ -1473,6 +1641,9 @@ $requestHandler = {
     ${function:Send-StaticFile}  = $shared.FnSendStatic
     ${function:Add-CorsHeaders}  = $shared.FnAddCors
     ${function:Send-CorsPreflight} = $shared.FnCorsPreflight
+    ${function:Test-IsScriptPath} = $shared.FnIsScriptPath
+    ${function:Get-ScriptContentType} = $shared.FnScriptCT
+    ${function:Invoke-ScriptInProcess} = $shared.FnInvScriptIP
     $script:cfg              = $shared.Cfg
 
     # Live .NET objects were injected via InitialSessionState.Variables — plain names.
@@ -1701,15 +1872,17 @@ $requestHandler = {
         }
 
         # --------------------------------------------------------------
-        # Non-.ps1 path → static file branch (opt-in via StaticServingEnabled).
-        # POST requests to non-.ps1 paths are always rejected — static content is
+        # Non-script path → static file branch (opt-in via StaticServingEnabled).
+        # "Script path" = any URL ending in one of the extensions registered in
+        # ScriptExtensionMap (.ps1, .psxml, .posh, .psapi by default).
+        # POST requests to non-script paths are always rejected — static content is
         # GET-only by design and POST would otherwise silently no-op.
         # When StaticServingEnabled is off, fall back to the legacy HTTP 400.
         # --------------------------------------------------------------
-        if (-not $urlPath.EndsWith('.ps1', [System.StringComparison]::OrdinalIgnoreCase)) {
+        if (-not (Test-IsScriptPath -Path $urlPath)) {
 
             if (-not $script:cfg.StaticServingEnabled) {
-                $body = New-JsonResponse -ExitCode 400 -Output '' -Err "Only .ps1 files are allowed. Requested: $urlPath"
+                $body = New-JsonResponse -ExitCode 400 -Output '' -Err "Only registered script extensions are allowed. Requested: $urlPath"
                 Send-Response -Response $resp -StatusCode 400 -Body $body -RequestId $requestId
                 Write-Log -ClientIP $clientIP -Request $requestLine -Status 'BAD REQUEST' -ExitCode '-' -RequestId $requestId
                 return
@@ -1803,6 +1976,10 @@ $requestHandler = {
         # Invoke-Script blocks until the script finishes or the timeout
         # (ScriptTimeoutSec) elapses — the client waits accordingly.
         # --------------------------------------------------------------
+        $jsonFilePath  = ''
+        $bodyResult    = $null
+        $scriptParams  = @{}
+
         if ($req.HttpMethod -eq 'POST') {
             # Reject query string parameters on POST — all input must be in the JSON body.
             $queryKeys = @($req.QueryString.AllKeys | Where-Object { $null -ne $_ -and $_ -ne '' })
@@ -1817,8 +1994,8 @@ $requestHandler = {
             if ($bodyResult.Error -ne 0) {
                 $errMsg = switch ($bodyResult.Error) {
                     413     { 'Request body too large. Maximum size: {0} MB.' -f [math]::Round($script:cfg.MaxRequestBodyBytes / 1MB) }
-                    415     { 'Content-Type must be application/json.' }
-                    400     { 'Invalid JSON body.' }
+                    415     { 'Content-Type must be one of the AcceptedContentTypes (application/json or application/x-www-form-urlencoded by default).' }
+                    400     { 'Invalid request body.' }
                     default { 'Request error.' }
                 }
                 $body = New-JsonResponse -ExitCode $bodyResult.Error -Output '' -Err $errMsg
@@ -1827,25 +2004,39 @@ $requestHandler = {
                 return
             }
 
-            # Write body to file — script receives path via -JsonFilePath.
             $jsonFilePath = Save-PostJson -RawJson $bodyResult.RawJson -RequestId $requestId
-
-            # Build per-request env vars for the child pwsh.exe. Only populated when something
-            # actually changes from the parent environment — keeps the hot path zero-cost.
-            $scriptEnvVars = @{}
-            if (-not [string]::IsNullOrEmpty($rawCookieHeader)) { $scriptEnvVars['POSH_COOKIES']    = $rawCookieHeader }
-            if (-not [string]::IsNullOrEmpty($sessionId))       { $scriptEnvVars['POSH_SESSION_ID'] = $sessionId }
-
-            $result = Invoke-Script -ScriptPath $resolvedPath -Params @{} -TimeoutSec $script:cfg.ScriptTimeoutSec -JsonFilePath $jsonFilePath -EnvVars $scriptEnvVars
         } else {
-            # GET: pass query string key/value pairs as named arguments.
-            $scriptParams  = Get-QueryParams -QueryString $req.QueryString
+            $scriptParams = Get-QueryParams -QueryString $req.QueryString
+        }
 
-            $scriptEnvVars = @{}
-            if (-not [string]::IsNullOrEmpty($rawCookieHeader)) { $scriptEnvVars['POSH_COOKIES']    = $rawCookieHeader }
-            if (-not [string]::IsNullOrEmpty($sessionId))       { $scriptEnvVars['POSH_SESSION_ID'] = $sessionId }
+        # Env vars / context vars passed into the child process or runspace.
+        $scriptEnvVars = @{}
+        if (-not [string]::IsNullOrEmpty($rawCookieHeader)) { $scriptEnvVars['POSH_COOKIES']    = $rawCookieHeader }
+        if (-not [string]::IsNullOrEmpty($sessionId))       { $scriptEnvVars['POSH_SESSION_ID'] = $sessionId }
 
-            $result = Invoke-Script -ScriptPath $resolvedPath -Params $scriptParams -TimeoutSec $script:cfg.ScriptTimeoutSec -EnvVars $scriptEnvVars
+        $contextVars = $null
+        if ($script:cfg.ExecutionMode -eq 'InProcess' -and $script:cfg.InjectContextVars) {
+            $contextVars = @{
+                PoSHQuery   = $scriptParams
+                PoSHCookies = $rawCookieHeader
+                PoSHHeaders = @{}
+            }
+            foreach ($h in $req.Headers.AllKeys) { $contextVars.PoSHHeaders[$h] = $req.Headers[$h] }
+            if ($null -ne $bodyResult -and $bodyResult.RawJson) {
+                try {
+                    $contextVars.PoSHPost = $bodyResult.RawJson | ConvertFrom-Json -AsHashtable -Depth 10
+                } catch {
+                    $contextVars.PoSHPost = $bodyResult.RawJson
+                }
+            } else {
+                $contextVars.PoSHPost = @{}
+            }
+        }
+
+        if ($script:cfg.ExecutionMode -eq 'InProcess') {
+            $result = Invoke-ScriptInProcess -ScriptPath $resolvedPath -Params $scriptParams -TimeoutSec $script:cfg.ScriptTimeoutSec -JsonFilePath $jsonFilePath -ContextVars $contextVars
+        } else {
+            $result = Invoke-Script -ScriptPath $resolvedPath -Params $scriptParams -TimeoutSec $script:cfg.ScriptTimeoutSec -JsonFilePath $jsonFilePath -EnvVars $scriptEnvVars
         }
 
         # Script request completed — increment counter atomically (thread-safe).
@@ -1854,9 +2045,30 @@ $requestHandler = {
         $httpStatus = if     ($result.TimedOut)       { 504 }
                       elseif ($result.ExitCode -eq 0) { 200 }
                       else                            { 500 }
-        $body       = New-JsonResponse -ExitCode $result.ExitCode -Output $result.Output -Err $result.Error
 
-        Send-Response -Response $resp -StatusCode $httpStatus -Body $body -RequestId $requestId
+        # Response format depends on the script extension:
+        #   .ps1   → JSON envelope { exitCode, output, error } (legacy behavior).
+        #   .psxml → raw stdout passed through, Content-Type 'text/xml' (PoSH parity).
+        #   .posh  → raw stdout, 'text/html'.
+        #   .psapi → raw stdout, 'application/xml'.
+        # On non-zero exit, the alt-extension paths emit the error stream as body —
+        # the user-supplied Content-Type still applies, so callers see structured
+        # error text rather than a generic JSON envelope. JSON envelope is preserved
+        # for .ps1 because existing clients depend on it.
+        $scriptContentType = Get-ScriptContentType -Path $urlPath
+        if ([string]::IsNullOrEmpty($scriptContentType)) {
+            $body = New-JsonResponse -ExitCode $result.ExitCode -Output $result.Output -Err $result.Error
+            Send-Response -Response $resp -StatusCode $httpStatus -Body $body -RequestId $requestId
+        } else {
+            $rawBody = if ($result.TimedOut) {
+                'Script execution timed out.'
+            } elseif ($result.ExitCode -ne 0 -and -not [string]::IsNullOrEmpty($result.Error)) {
+                $result.Error
+            } else {
+                $result.Output
+            }
+            Send-Response -Response $resp -StatusCode $httpStatus -Body $rawBody -RequestId $requestId -ContentType $scriptContentType
+        }
 
         $statusText = if     ($result.TimedOut)       { 'TIMEOUT' }
                       elseif ($result.ExitCode -eq 0) { 'OK' }

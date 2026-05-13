@@ -58,6 +58,9 @@ $cfg = @{
     BasicAuthUser            = $env:POSH_BASIC_USER
     BasicAuthPass            = $env:POSH_BASIC_PASS
     BasicAuthRealm           = 'posh'
+    ExecutionMode            = 'Subprocess'
+    InjectContextVars        = $false
+    ScriptExtensionMap       = @{ '.ps1' = ''; '.psxml' = 'text/xml; charset=utf-8'; '.posh' = 'text/html; charset=utf-8'; '.psapi' = 'application/xml; charset=utf-8' }
 }
 ```
 
@@ -112,6 +115,8 @@ $cfg = @{
     BasicAuthUser            = $env:POSH_BASIC_USER
     BasicAuthPass            = $env:POSH_BASIC_PASS
     BasicAuthRealm           = 'posh-admin'
+    ExecutionMode            = 'InProcess'             # faster, less isolation — see PR-5 notes
+    InjectContextVars        = $true                   # expose $PoSHQuery / $PoSHPost / $PoSHCookies / $PoSHHeaders to scripts
 }
 ```
 
@@ -197,6 +202,9 @@ These are passed on the command line when starting the server. `Register-Schedul
 | `BasicAuthUser` | `string` | `$env:POSH_BASIC_USER` | Basic-Auth username. Sourced from the `POSH_BASIC_USER` env var — do not hardcode. Validated at startup when `AuthMode` requires Basic. |
 | `BasicAuthPass` | `string` | `$env:POSH_BASIC_PASS` | Basic-Auth password. Sourced from the `POSH_BASIC_PASS` env var — kept in process memory only, never written to disk. |
 | `BasicAuthRealm` | `string` | `'posh'` | Realm string in the `WWW-Authenticate` header. Browsers display this label in the login dialog. |
+| `ExecutionMode` | `string` | `'Subprocess'` | How webroot scripts are executed. `'Subprocess'` (default): each request spawns a new `pwsh.exe` process — slow startup but reliable exit codes (`exit 0` / `exit 1`) and hard timeout enforcement via `Process.Kill()`. `'InProcess'`: each request runs in a fresh runspace within the server process — ~400 ms faster but exit codes are best-effort (any error → `exitCode=1`), `Runspace.Stop()` may not interrupt native long-running calls immediately, and module state can leak between scripts. Default keeps the existing semantics. |
+| `InjectContextVars` | `bool` | `$false` | When `ExecutionMode = 'InProcess'`, expose `$PoSHQuery`, `$PoSHPost`, `$PoSHCookies`, `$PoSHHeaders` as variables in the script's runspace — legacy PoSH Server compatibility. Ignored when `ExecutionMode = 'Subprocess'`. |
+| `ScriptExtensionMap` | `hashtable` | `{ '.ps1' = ''; '.psxml' = 'text/xml; charset=utf-8'; '.posh' = 'text/html; charset=utf-8'; '.psapi' = 'application/xml; charset=utf-8' }` | File extensions that the server treats as executable webroot scripts, mapped to the Content-Type used for the response. Empty string = use the JSON envelope `{ exitCode, output, error }` (default for `.ps1`); a non-empty value means the script's stdout is passed through verbatim with that Content-Type. Add custom extensions by extending the hashtable. |
 
 ### Register-ScheduledTask.ps1 — Scheduled Task Options
 
