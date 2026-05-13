@@ -26,7 +26,8 @@ Place a `.ps1` file in `webroot\` — it is immediately reachable as an HTTP end
 
 ### Authentication & rate limiting
 - **API key + Basic Auth** — `X-Api-Key` (default), HTTP Basic, or both. The key is configured via the `POSH_API_KEY` system environment variable; Basic credentials via `POSH_BASIC_USER` / `POSH_BASIC_PASS`. Case-sensitive ordinal comparison.
-- **Per-IP rate limiting** — Fixed Window with optional flat-penalty period, `'reject'` or `'queue'` mode, configurable exempt paths.
+- **Multiple labelled API keys** — define `ApiKeys = @{ 'ci' = '...'; 'monitoring' = '...' }` in `config.psd1`. The matched label flows into every log line and into the per-key rate-limit / audit log.
+- **Per-IP rate limiting** — Fixed Window with optional flat-penalty period, `'reject'` or `'queue'` mode, configurable exempt paths. Switch to per-API-key accounting via `RateLimitPerIdentity = $true`.
 - **Global throttle** — minimum interval between dispatched requests (`MinRequestIntervalSec`, default 1 s) in the main thread before any runspace starts. `/health` and `/metrics` always exempt.
 - **IP filter** — `AllowedIPs` / `BlockedIPs` with exact, CIDR (`10.0.0.0/8`), or regex (`~^192\.168\.`) entries.
 
@@ -36,6 +37,8 @@ Place a `.ps1` file in `webroot\` — it is immediately reachable as an HTTP end
 - **PHP-CGI handler** — opt-in `.php` routing through an external `php-cgi.exe`. CGI/1.1 environment, body streaming to stdin, `Status` / `Content-Type` / `Location` parsed from PHP stdout.
 
 ### Operations
+- **External config file** — drop a `config.psd1` next to `Start-WebServer.ps1` (or pass `-ConfigFile`) to override any `$cfg` default. Parsed via `Import-PowerShellDataFile` (data-only, no script execution). A sample lives at `config.psd1.example`.
+- **Brotli + GZIP compression** — Brotli preferred when the client advertises `br`; falls back to GZIP, then uncompressed. Same eligibility gates (`GzipMinBytes`, `GzipMaxBytes`, `GzipMimeTypes`) for both.
 - **Forms, cookies, CORS** — `application/x-www-form-urlencoded` POST bodies, opt-in HttpOnly session cookies (`SessionEnabled`), full CORS with `OPTIONS` preflight.
 - **Custom HTML error pages** — when the client `Accept`s `text/html`, 4xx/5xx responses serve `<ErrorPagesRoot>\<code>.html` instead of the JSON envelope.
 - **Background jobs on interval** — `BackgroundJobs = @(@{ Path; IntervalSec })` runs scripts on a recurring schedule, separately logged.
@@ -43,7 +46,16 @@ Place a `.ps1` file in `webroot\` — it is immediately reachable as an HTTP end
 - **Request tracing** — every response carries an 8-character hex `X-Request-Id` matching the log line.
 - **Script timeout enforcement** — scripts exceeding `ScriptTimeoutSec` (default 300 s) are killed and the caller receives HTTP 504.
 - **Daily or hourly log rotation** — `LogSchedule = 'Daily' | 'Hourly'`. Optional `IIS-W3C` log format and MD5 integrity hashes (`LogIntegrityHash`) for audit.
-- **Built-in `/health` + `/metrics`** — `/health` open, `/metrics` returns counters incl. `rateLimitedTotal`.
+- **NDJSON audit log** — opt-in via `AuditLogEnabled`. Security-relevant events (`AUTH_FAIL`, `IP_BLOCKED`, `RATE_LIMITED`) appended to `audit.log` as one JSON line per event — SIEM-friendly.
+- **Slow-request log** — opt-in via `SlowRequestThresholdMs`. Requests exceeding the threshold get a parallel line in `slow.log`.
+- **Built-in `/health` + `/metrics` + `/metrics-prom`** — `/health` and `/metrics` (JSON) for human consumption, `/metrics-prom` (Prometheus text-format) for scrapers.
+- **OpenAPI 3.1 spec** — `GET /openapi.json` auto-generates a complete spec from each webroot script's comment-based help + `param()` block. Importable into Swagger UI, Postman, API gateways.
+
+### REST routing & discovery
+- **Path placeholders** — opt-in via `PathPlaceholders`. `webroot/users/[id].ps1` matches `/users/123` (Next.js convention); captured values arrive as `-id 123` named args. Multiple placeholders per route allowed; literal-segment specificity wins.
+- **Index metadata** — `GET /` returns enriched objects (`{ path, methods, synopsis, description, parameters }`) parsed from each script's AST. Cached per file; re-parsed on edit. Toggle via `IndexShowMetadata`.
+
+### Lifecycle
 - **Windows Scheduled Task** — `Register-ScheduledTask.ps1` installs the server as an auto-starting task in one command.
 
 ## Quick Start
@@ -161,13 +173,19 @@ Rules for webroot scripts: use `Write-Output` for normal output, `Write-Error` f
 
 ## Configuration
 
-All configuration is inline in `Start-WebServer.ps1` as the `$cfg` hashtable. There is no external config file. HTTP/HTTPS ports and HTTPS activation are runtime parameters.
+Configuration resolves from two layers:
+
+1. Inline defaults in the `$cfg` hashtable inside `Start-WebServer.ps1`.
+2. An optional external `config.psd1` next to the script (or `-ConfigFile <path>`). Every key it sets overrides the inline default; missing keys keep their defaults. See `config.psd1.example` for a documented template.
+
+HTTP/HTTPS ports and HTTPS activation are runtime parameters:
 
 | Option | Default | Description |
 |---|---|---|
 | `-HttpPort` | `80` | HTTP listen port; `0` = HTTP disabled |
 | `-HttpsEnabled` | off | Enable HTTPS (requires `netsh sslcert` binding) |
 | `-HttpsPort` | `443` | HTTPS listen port |
+| `-ConfigFile` | auto = `<baseDir>\config.psd1` | Override path of the external PSD1 |
 | `WebRoot` | `C:\posh\webroot` | Directory containing the `.ps1` endpoint scripts |
 | `LogDir` | `C:\posh\logs` | Directory for daily log files |
 | `ApiKey` | `$env:POSH_API_KEY` | API key — always read from the environment variable |

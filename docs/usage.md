@@ -28,7 +28,7 @@ For all configuration options see [Configuration](./configuration.md).
 
 ### Listing all available endpoints
 
-Retrieve a JSON array of every `.ps1` file currently in `webroot\`, including subdirectories.
+By default (`IndexShowMetadata = $true`), `GET /` returns an enriched object per script — the path, the methods it accepts, the synopsis pulled from comment-based help, and the parsed `param()` block:
 
 ```powershell
 Invoke-RestMethod -Uri 'http://localhost/' -Headers @{ 'X-Api-Key' = 'your-api-key' }
@@ -37,8 +37,21 @@ Invoke-RestMethod -Uri 'http://localhost/' -Headers @{ 'X-Api-Key' = 'your-api-k
 Expected result:
 
 ```json
-["/script1.ps1", "/subdir/script2.ps1"]
+[
+  {
+    "path":     "/script1.ps1",
+    "methods":  ["GET", "POST"],
+    "synopsis": "Returns basic system information.",
+    "description": "Used by monitoring dashboards as a smoke check.",
+    "parameters": [
+      { "name": "ComputerName", "type": "String", "default": "$env:COMPUTERNAME", "description": "Target host." },
+      { "name": "Detail",       "type": "Boolean", "default": "$false", "description": "Include extended OS info." }
+    ]
+  }
+]
 ```
+
+Metadata is parsed lazily via the script's AST and cached per file; edits invalidate the cache automatically. Set `IndexShowMetadata = $false` to revert to the legacy flat path array (`["/script1.ps1", "/subdir/script2.ps1"]`).
 
 ---
 
@@ -301,6 +314,70 @@ Calling `GET /api-status.psxml` returns `text/xml` with the script's stdout as t
 | `.psxml` | `text/xml; charset=utf-8` (raw stdout) |
 | `.posh` | `text/html; charset=utf-8` (raw stdout) |
 | `.psapi` | `application/xml; charset=utf-8` (raw stdout) |
+
+---
+
+### Scraping Prometheus metrics (F8)
+
+`GET /metrics-prom` exposes the same counters as `/metrics` in Prometheus text-format. Auth-exempt — point any scraper at it:
+
+```bash
+curl http://localhost/metrics-prom
+```
+
+```text
+# HELP posh_uptime_seconds Server uptime since process start.
+# TYPE posh_uptime_seconds gauge
+posh_uptime_seconds 8061
+# HELP posh_requests_total Number of completed script requests.
+# TYPE posh_requests_total counter
+posh_requests_total 42
+# HELP posh_rate_limited_total Per-identity/IP rate-limit rejections from Test-RateLimit.
+# TYPE posh_rate_limited_total counter
+posh_rate_limited_total 3
+# HELP posh_in_flight_requests Currently occupied request slots.
+# TYPE posh_in_flight_requests gauge
+posh_in_flight_requests 0
+# HELP posh_rate_limit_table_size Per-key/IP rate-limit table entries.
+# TYPE posh_rate_limit_table_size gauge
+posh_rate_limit_table_size 12
+# HELP posh_script_metadata_cache_size Cached AST metadata entries.
+# TYPE posh_script_metadata_cache_size gauge
+posh_script_metadata_cache_size 6
+```
+
+Toggle via `PromMetricsEnabled` in `config.psd1` (default `$true`).
+
+---
+
+### REST routing with path placeholders (F9)
+
+Set `PathPlaceholders = $true` and name files Next.js-style. Each `[name]` segment in the filename matches one URL segment, and the captured value is injected as a named parameter:
+
+```powershell
+# webroot\users\[id].ps1
+param([string] $id)
+Write-Output "user=$id"
+```
+
+```bash
+curl -H "X-Api-Key: ..." http://localhost/users/123
+# → {"exitCode":0,"output":"user=123","error":""}
+```
+
+Multiple placeholders work too — `webroot\api\[v]\users\[id].ps1` matches `/api/v2/users/123` and the script receives `-v v2 -id 123`. Literal segments win over placeholders (so `webroot\users\admin.ps1` shadows `webroot\users\[id].ps1` for `/users/admin`). Adding or removing top-level subdirectories invalidates the route cache automatically; deeper edits require a restart.
+
+---
+
+### OpenAPI 3.1 spec (F10)
+
+`GET /openapi.json` returns an auto-generated OpenAPI spec for the entire webroot. Auth-exempt, importable into Swagger UI, Postman, or any API gateway:
+
+```bash
+curl http://localhost/openapi.json | jq '.paths | keys'
+```
+
+The spec is rebuilt fresh per request (the per-file AST cache from F7 carries the heavy lifting). Title and version are controlled via `OpenApiTitle` / `OpenApiVersion`. Path placeholders (F9) appear as `{name}` in the spec with `in: path, required: true`.
 
 ## Tips & Tricks
 

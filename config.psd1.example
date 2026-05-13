@@ -56,6 +56,13 @@
     # -- Routing ------------------------------------------------------------
     # PathPlaceholders = $true           # enable webroot/users/[id].ps1 style routes
 
+    # -- Index + auto-discovery (default-ON — uncomment to opt OUT) --------
+    # IndexShowMetadata  = $false        # revert GET / to the legacy flat path array
+    # PromMetricsEnabled = $false        # disable GET /metrics-prom
+    # OpenApiEnabled     = $false        # disable GET /openapi.json
+    # OpenApiTitle       = 'My posh deployment'
+    # OpenApiVersion     = '2.3.1'
+
     # -- IP filter (exact / CIDR / ~regex) ----------------------------------
     # AllowedIPs = @('10.0.0.0/8', '~^192\.168\.')
     # BlockedIPs = @('1.2.3.4')
