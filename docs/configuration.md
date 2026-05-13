@@ -69,6 +69,8 @@ $cfg = @{
     Prefixes                 = @()    # empty = build from HttpPort/HttpsPort with '+' wildcard binding
     BackgroundJobs           = @()
     JobsLogFile              = ''     # empty = '<LogDir>\jobs.log'
+    DirectoryBrowsing        = $false
+    DirectoryBrowsingHidden  = @('_error', '.git', '.gitignore')
 }
 ```
 
@@ -136,6 +138,8 @@ $cfg = @{
         @{ Path = 'D:\automation\posh\jobs\rotate-tokens.ps1'; IntervalSec = 3600 }
     )
     JobsLogFile              = 'D:\automation\posh\logs\jobs.log'
+    DirectoryBrowsing        = $true
+    DirectoryBrowsingHidden  = @('_error', '.git', '.gitignore', 'private')
 }
 ```
 
@@ -200,6 +204,8 @@ These are passed on the command line when starting the server. `Register-Schedul
 | `Prefixes` | `string[]` | `@()` | Explicit `HttpListener` URL prefixes. When non-empty, overrides the default `+`-wildcard binding constructed from `HttpPort` / `HttpsPort`. Each prefix MUST end with `/` (`HttpListener` requirement). Allows hostname-bound listeners and mixed-port scenarios. Empty = legacy behavior. |
 | `BackgroundJobs` | `hashtable[]` | `@()` | Array of background jobs to run on a recurring interval. Each entry: `@{ Path = '<absolute path to a .ps1 script>'; IntervalSec = <seconds> }`. Each job runs in its own runspace; the script is invoked via `pwsh.exe` (same isolation as the request handler's Subprocess mode). Job output is appended to `JobsLogFile`. Jobs are stopped during graceful shutdown. Replacement for the legacy PoSH Server `-CustomJob` option. |
 | `JobsLogFile` | `string` | `''` (= `<LogDir>\jobs.log`) | Absolute path of the log file for `BackgroundJobs`. Kept separate from the request log so background activity does not pollute request traces. Empty = `<LogDir>\jobs.log`. |
+| `DirectoryBrowsing` | `bool` | `$false` | When enabled (and `StaticServingEnabled = $true`), requests that resolve to a directory with no matching `DefaultDocuments` render an HTML index listing instead of returning HTTP 404. Path-traversal protection still applies. Filenames in `DirectoryBrowsingHidden` are omitted. |
+| `DirectoryBrowsingHidden` | `string[]` | `@('_error', '.git', '.gitignore')` | Names hidden from directory listings (case-insensitive). Useful for keeping internal directories like `_error` or VCS metadata out of public indexes. |
 | `GzipEnabled` | `bool` | `$true` | Enable GZIP response compression. Only applied when the client advertises `Accept-Encoding: gzip` AND the response body size is ≥ `GzipMinBytes` AND the response Content-Type starts with one of the entries in `GzipMimeTypes`. Pre-compressed binary types (images, ZIPs) are never compressed regardless of this setting because their MIME prefixes do not match. |
 | `GzipMinBytes` | `integer` | `1024` | Minimum response body size in bytes for which GZIP compression is attempted. Smaller responses are sent uncompressed because compression overhead would exceed the savings. |
 | `GzipMimeTypes` | `string[]` | see code | Allow-list of Content-Type prefixes eligible for GZIP. Matched via `StartsWith` so `'application/json'` covers `'application/json; charset=utf-8'`. Defaults include JSON, XML, JavaScript, HTML, CSS, and plain text. |

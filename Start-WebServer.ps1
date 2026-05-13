@@ -248,6 +248,8 @@ $cfg = @{
     Prefixes                 = @()     # explicit HttpListener prefixes (e.g. @('http://api.example.com:80/', 'http://localhost:80/')). Empty = build from HttpPort/HttpsPort with '+' wildcard binding (existing behavior).
     BackgroundJobs           = @()     # array of @{ Path = '<absolute>'; IntervalSec = 300 } — each job runs in its own background runspace on the configured interval; output goes to '<LogDir>\jobs.log'
     JobsLogFile              = ''      # absolute path to the jobs log file; empty = '<LogDir>\jobs.log'
+    DirectoryBrowsing        = $false  # render an HTML index listing when a static directory has no DefaultDocuments match. Requires StaticServingEnabled.
+    DirectoryBrowsingHidden  = @('_error', '.git', '.gitignore') # entries hidden from the directory listing (case-insensitive match on file/folder name)
 }
 
 # CustomErrorPages root fallback — empty string means '<WebRoot>\_error'. Resolved here so the
@@ -1502,6 +1504,78 @@ function Invoke-ScriptInProcess {
 }
 
 # ---------------------------------------------------------------------------
+# Send-DirectoryListing
+# Renders an HTML directory listing when DirectoryBrowsing is enabled, the
+# request resolved to a directory, and none of $cfg.DefaultDocuments existed
+# inside it. The HTML is intentionally minimal — name, size, modified date,
+# one link per entry. Items whose name appears in $cfg.DirectoryBrowsingHidden
+# (case-insensitive) are omitted.
+#
+# Returns PSCustomObject { StatusCode; Reason; Length }.
+# Caller is responsible for path-traversal protection — Send-DirectoryListing
+# trusts that $DirPath is already inside StaticRoot.
+# ---------------------------------------------------------------------------
+function Send-DirectoryListing {
+    param(
+        [System.Net.HttpListenerResponse] $Response,
+        [string]                          $DirPath,
+        [string]                          $UrlPath,
+        [string]                          $RequestId
+    )
+
+    $hidden = @{}
+    foreach ($h in $script:cfg.DirectoryBrowsingHidden) {
+        if (-not [string]::IsNullOrEmpty($h)) { $hidden[$h.ToLowerInvariant()] = $true }
+    }
+
+    $entries = Get-ChildItem -LiteralPath $DirPath -Force -ErrorAction SilentlyContinue |
+        Where-Object {
+            $name = $_.Name.ToLowerInvariant()
+            -not $hidden.ContainsKey($name)
+        } |
+        Sort-Object @{ Expression = { -not $_.PSIsContainer } }, Name
+
+    $sb = [System.Text.StringBuilder]::new(8192)
+    $null = $sb.AppendLine('<!DOCTYPE html>')
+    $null = $sb.AppendLine('<html lang="en"><head>')
+    $null = $sb.AppendLine(('<title>Index of {0}</title>' -f [System.Net.WebUtility]::HtmlEncode($UrlPath)))
+    $null = $sb.AppendLine('<meta charset="utf-8">')
+    $null = $sb.AppendLine('<style>body{font-family:Segoe UI,Arial,sans-serif;margin:2em;color:#222}h1{font-size:1.4em;margin-bottom:.4em}table{border-collapse:collapse;width:100%;max-width:60em}th,td{padding:.4em .8em;text-align:left;border-bottom:1px solid #eee}th{background:#f6f6f6}td.size{text-align:right;font-variant-numeric:tabular-nums;color:#555}a{color:#0a58ca;text-decoration:none}a:hover{text-decoration:underline}</style>')
+    $null = $sb.AppendLine('</head><body>')
+    $null = $sb.AppendLine(('<h1>Index of {0}</h1>' -f [System.Net.WebUtility]::HtmlEncode($UrlPath)))
+    $null = $sb.AppendLine('<table><thead><tr><th>Name</th><th>Size</th><th>Modified</th></tr></thead><tbody>')
+
+    # Parent-directory link unless we are at the static root.
+    if ($UrlPath -ne '/' -and $UrlPath -ne '') {
+        $null = $sb.AppendLine('<tr><td><a href="../">../</a></td><td class="size">—</td><td>—</td></tr>')
+    }
+
+    foreach ($entry in $entries) {
+        $isDir   = $entry.PSIsContainer
+        $name    = $entry.Name
+        $slash   = if ($isDir) { '/' } else { '' }
+        $sizeStr = if ($isDir) { '—' } else { '{0:N0}' -f $entry.Length }
+        $modStr  = $entry.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')
+        $href    = [Uri]::EscapeDataString($name) + $slash
+        $disp    = [System.Net.WebUtility]::HtmlEncode($name) + $slash
+        $null = $sb.AppendLine(('<tr><td><a href="{0}">{1}</a></td><td class="size">{2}</td><td>{3}</td></tr>' -f $href, $disp, $sizeStr, $modStr))
+    }
+
+    $null = $sb.AppendLine('</tbody></table></body></html>')
+    $body = $sb.ToString()
+
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
+    $Response.StatusCode      = 200
+    $Response.ContentType     = 'text/html; charset=utf-8'
+    $Response.ContentLength64 = $bytes.Length
+    if ($RequestId) { $Response.AddHeader('X-Request-Id', $RequestId) }
+    try { $Response.OutputStream.Write($bytes, 0, $bytes.Length) } catch { }
+    try { $Response.OutputStream.Close() } catch { }
+
+    return [PSCustomObject]@{ StatusCode = 200; Reason = 'DIR LISTING'; Length = $bytes.Length }
+}
+
+# ---------------------------------------------------------------------------
 # Invoke-PhpCgi
 # Runs a .php file through an external php-cgi.exe and returns the parsed
 # response so the caller can map it to an HttpListenerResponse.
@@ -2001,6 +2075,7 @@ $shared = @{
     FnInvPhpCgi      = ${function:Invoke-PhpCgi}
     FnResolveError   = ${function:Resolve-ErrorPage}
     FnToApiXml       = ${function:ConvertTo-PoshApiXml}
+    FnDirListing     = ${function:Send-DirectoryListing}
 }
 
 # ---------------------------------------------------------------------------
@@ -2037,6 +2112,7 @@ $requestHandler = {
     ${function:Invoke-PhpCgi}    = $shared.FnInvPhpCgi
     ${function:Resolve-ErrorPage} = $shared.FnResolveError
     ${function:ConvertTo-PoshApiXml} = $shared.FnToApiXml
+    ${function:Send-DirectoryListing} = $shared.FnDirListing
     $script:cfg              = $shared.Cfg
 
     # Live .NET objects were injected via InitialSessionState.Variables — plain names.
@@ -2369,8 +2445,8 @@ $requestHandler = {
             }
 
             # Directory request: try configured default documents (index.html, …) in order.
-            # If none exist, fall through to a 404 — PR-9 (DirectoryBrowsing) will plug a
-            # directory listing in here later when that feature is implemented.
+            # If none exist AND DirectoryBrowsing is enabled, render an HTML listing.
+            # Otherwise fall through to a 404.
             $isDir = Test-Path -LiteralPath $staticFull -PathType Container
             if ($isDir -or $urlPath.EndsWith('/')) {
                 $resolvedDefault = $null
@@ -2379,6 +2455,12 @@ $requestHandler = {
                     if (Test-Path -LiteralPath $probe -PathType Leaf) { $resolvedDefault = $probe; break }
                 }
                 if ($null -eq $resolvedDefault) {
+                    if ($script:cfg.DirectoryBrowsing -and $isDir) {
+                        $dirRes = Send-DirectoryListing -Response $resp -DirPath $staticFull -UrlPath $urlPath -RequestId $requestId
+                        $null   = [System.Threading.Interlocked]::Increment($requestsTotal)
+                        Write-Log -ClientIP $clientIP -Request $requestLine -Status $dirRes.Reason -ExitCode "$($dirRes.StatusCode)" -RequestId $requestId
+                        return
+                    }
                     $body = New-JsonResponse -ExitCode 404 -Output '' -Err "No default document for: $urlPath"
                     Send-Response -Response $resp -StatusCode 404 -Body $body -RequestId $requestId
                     Write-Log -ClientIP $clientIP -Request $requestLine -Status 'NOT FOUND' -ExitCode '-' -RequestId $requestId

@@ -3,6 +3,8 @@
 ## [Unreleased]
 
 ### Added
+- **Directory browsing** — new `DirectoryBrowsing` (default `$false`) and `DirectoryBrowsingHidden` (default `@('_error', '.git', '.gitignore')`) configuration keys. When enabled together with `StaticServingEnabled`, requests resolving to a directory with no matching `DefaultDocuments` render an HTML listing of name + size + modified date. Entries named in `DirectoryBrowsingHidden` are omitted (case-insensitive). New `Send-DirectoryListing` helper.
+
 - **Background jobs on interval** — new `BackgroundJobs` configuration key (default `@()`). Each entry is `@{ Path = '<absolute script path>'; IntervalSec = <seconds> }`. Each job runs in its own dedicated runspace + child `pwsh.exe` process on the configured interval; job output is appended to `JobsLogFile` (default `<LogDir>\jobs.log`) — kept separate from request logs. Stopped cleanly during graceful shutdown. Replacement for the legacy PoSH Server `-CustomJob` option.
 - **Multi-host / URL-prefix routing** — new `Prefixes` configuration key (default `@()`). When non-empty, overrides the `+`-wildcard binding built from `HttpPort` / `HttpsPort`. Allows hostname-bound listeners (`'https://api.example.com:443/'`) and mixed-port scenarios.
 - **IP filter with CIDR and regex support** — `AllowedIPs` and `BlockedIPs` now accept three entry styles in addition to exact matching: CIDR ranges (`'10.0.0.0/8'`) and regex patterns (`'~^192\.168\.'`, leading `~` denotes regex). New `Test-IpMatch` function consolidates the matching logic. Backward-compatible: exact-IP strings continue to work unchanged.
