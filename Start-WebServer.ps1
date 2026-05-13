@@ -2286,7 +2286,10 @@ function Send-StaticFile {
         $ifModifiedSince = $Request.Headers['If-Modified-Since']
         if ($ifModifiedSince) {
             try {
-                $imsDate = [datetime]::Parse($ifModifiedSince).ToUniversalTime()
+                # HTTP-date format (RFC 7231) is always en-US-style ('Wed, 21 Oct
+                # 2015 07:28:00 GMT'); parse with InvariantCulture so a server in
+                # a de-DE / fr-FR locale doesn't fail on month names like 'Oct'.
+                $imsDate = [datetime]::Parse($ifModifiedSince, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal).ToUniversalTime()
                 # Trim sub-second precision — HTTP-date format does not carry milliseconds.
                 $lastModTrimmed = [datetime]::new($lastModifiedUtc.Year, $lastModifiedUtc.Month, $lastModifiedUtc.Day, $lastModifiedUtc.Hour, $lastModifiedUtc.Minute, $lastModifiedUtc.Second, [System.DateTimeKind]::Utc)
                 if ($lastModTrimmed.Ticks -le $imsDate.Ticks) {
