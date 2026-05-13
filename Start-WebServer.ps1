@@ -4803,21 +4803,24 @@ try {
             }
         }
 
+        # Resolve once per request — every subsequent block (IP filter, throttle,
+        # semaphore) uses these. Without this, the 429 / 503 fast paths logged
+        # '-' as ClientIP because $reqClientIP was only set inside the IP-filter
+        # branch.
+        $reqUrlPath  = $context.Request.Url.AbsolutePath
+        $reqClientIP = $context.Request.RemoteEndPoint.Address.ToString()
+
         # ---------------------------------------------------------------------------
         # IP filter — checked in the main thread before the global throttle.
         # Paths listed in $cfg.IpFilterExemptPaths bypass both BlockedIPs and
         # AllowedIPs (default keeps /health reachable from external monitoring).
         # BlockedIPs is checked first — an IP on both lists is always blocked.
         # AllowedIPs empty = all IPs pass; non-empty = only listed IPs pass.
-        # Direct [System.IO.File]::AppendAllText for logging — Write-Log lives in
-        # the Runspace scope and is not available in the main thread.
         # ---------------------------------------------------------------------------
-        $reqUrlPath = $context.Request.Url.AbsolutePath
         $ipFilterExempt = @($cfg.IpFilterExemptPaths)
         if (($ipFilterExempt -notcontains $reqUrlPath) -and
             ($cfg.BlockedIPs.Count -gt 0 -or $cfg.AllowedIPs.Count -gt 0)) {
 
-            $reqClientIP = $context.Request.RemoteEndPoint.Address.ToString()
             $ipDenied    = $false
             $ipStatus    = ''
 
@@ -4841,32 +4844,12 @@ try {
                 $resp403.AddHeader('X-Request-Id', $ipReqId)
                 try { $resp403.OutputStream.Write($bodyBytes, 0, $bodyBytes.Length) } catch { }
                 try { $resp403.OutputStream.Close()                                  } catch { }
-                $ipLogLine = '{0} | {1} | {2} | EXIT:{3} | {4} | {5}' -f `
-                    (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'),
-                    $reqClientIP.PadRight(15),
-                    ('{0} {1}' -f $context.Request.HttpMethod, $context.Request.Url.PathAndQuery).PadRight(60),
-                    '-   ',
-                    $ipStatus.PadRight(13),
-                    $ipReqId
-                $ipLogFile = Join-Path $cfg.LogDir ((Get-Date -Format 'yyyy-MM-dd') + '.log')
-                # Acquire the same Mutex Write-Log uses in the RunspacePool runspaces so
-                # IP-filter log lines do not interleave with worker writes. Short timeout
-                # so a stuck holder cannot block the main thread for long; the line is
-                # dropped on contention (still echoed to stdout below).
-                $ipMutexHeld = $false
-                try {
-                    if (-not (Test-Path -LiteralPath $cfg.LogDir -PathType Container)) {
-                        $null = New-Item -ItemType Directory -Path $cfg.LogDir -Force
-                    }
-                    $ipMutexHeld = $script:logMutex.WaitOne(500)
-                    [System.IO.File]::AppendAllText($ipLogFile, $ipLogLine + [System.Environment]::NewLine, [System.Text.Encoding]::UTF8)
-                } catch { } finally {
-                    try { if ($ipMutexHeld) { $script:logMutex.ReleaseMutex() } } catch { }
-                }
-                Write-Output $ipLogLine
+                # Write-Log is defined in this scope (main thread) and uses the same
+                # mutex protocol the runspaces use -- no need for the legacy inline
+                # Add-Content / mutex dance the IP-filter path used to carry.
+                Write-Log -ClientIP $reqClientIP -Request ('{0} {1}' -f $context.Request.HttpMethod, $context.Request.Url.PathAndQuery) -Status $ipStatus -ExitCode '-' -RequestId $ipReqId
                 # F5: audit IP rejections so the audit log captures all main-thread denials too.
-                # Identity is '-' because auth never runs for blocked IPs. Write-AuditLog is in
-                # scope here at script-level; it no-ops when AuditLogEnabled is $false.
+                # Identity is '-' because auth never runs for blocked IPs.
                 Write-AuditLog -EventName 'IP_BLOCKED' -ClientIP $reqClientIP -Path $reqUrlPath -Detail $ipStatus
                 continue
             }
