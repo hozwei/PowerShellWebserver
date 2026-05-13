@@ -17,19 +17,33 @@ Place a `.ps1` file in `webroot\` — it is immediately reachable as an HTTP end
 
 ## Features
 
+### Core
 - **URL-to-script routing** — every `.ps1` file in `webroot\` is an HTTP endpoint; subdirectories map to URL path segments.
-- **GET and POST support** — GET passes URL query parameters as named PowerShell arguments. POST writes the JSON body to a file and passes the path via `-JsonFilePath` — supports nested objects, arrays, and large payloads. See [POST JSON File Passthrough](./docs/post-json.md).
-- **JSON response envelope** — all responses follow `{ "exitCode", "output", "error" }`, regardless of which script ran.
+- **GET and POST support** — GET passes URL query parameters as named PowerShell arguments. POST writes the JSON (or `application/x-www-form-urlencoded`) body to a file and passes the path via `-JsonFilePath` — supports nested objects, arrays, and large payloads. See [POST JSON File Passthrough](./docs/post-json.md).
+- **JSON response envelope** — `.ps1` responses follow `{ "exitCode", "output", "error" }`. Other registered extensions pass raw stdout through with a dedicated Content-Type — see [Usage](./docs/usage.md#calling-alternate-extension-scripts-pr-5).
 - **HTTPS support** — optional TLS on a configurable port. Certificate creation, `netsh` binding, and firewall rules are handled automatically by `Register-ScheduledTask.ps1`.
-- **API key authentication** — all endpoints except `GET /health` and `GET /metrics` require an `X-Api-Key` header. The key is configured via the `POSH_API_KEY` system environment variable.
-- **Concurrent request handling** — up to `MaxConcurrent` (default: 10) requests are processed in parallel using `RunspacePool` + `[PowerShell]::Create()` + `BeginInvoke()`. Requests beyond the limit receive HTTP 503 immediately.
-- **Rate limiting** — per-IP Fixed Window rate limiter (`RateLimitRequests` per `RateLimitWindowSec`). Violations receive HTTP 429 with a `Retry-After` header and trigger a flat penalty period (`RateLimitPenaltySec`). Supports `'reject'` (immediate) and `'queue'` modes. Configurable exempt paths.
-- **Global throttle** — enforces a minimum interval between dispatched requests (`MinRequestIntervalSec`, default: 1s) in the main thread before any runspace is started. `GET /health` and `GET /metrics` are always exempt.
-- **IP filter** — optional `AllowedIPs` allowlist and `BlockedIPs` blocklist, checked in the main thread before any runspace is started. `GET /health` is always exempt.
-- **Request tracing** — every response includes an `X-Request-Id` header (8-character hex) that matches the corresponding log line, allowing clients to correlate responses to log entries.
-- **Script timeout enforcement** — scripts exceeding `ScriptTimeoutSec` (default: 300 s) are terminated and the caller receives HTTP 504.
-- **Log rotation** — daily log files in `logs\`; files older than `LogRetentionDays` days are deleted at startup.
-- **Built-in health endpoint** — `GET /health` returns server status, uptime, and total request count without authentication.
+- **Concurrent request handling** — up to `MaxConcurrent` (default: 10) requests in parallel via `RunspacePool` + `[PowerShell]::Create()` + `BeginInvoke()`; excess receives HTTP 503.
+
+### Authentication & rate limiting
+- **API key + Basic Auth** — `X-Api-Key` (default), HTTP Basic, or both. The key is configured via the `POSH_API_KEY` system environment variable; Basic credentials via `POSH_BASIC_USER` / `POSH_BASIC_PASS`. Case-sensitive ordinal comparison.
+- **Per-IP rate limiting** — Fixed Window with optional flat-penalty period, `'reject'` or `'queue'` mode, configurable exempt paths.
+- **Global throttle** — minimum interval between dispatched requests (`MinRequestIntervalSec`, default 1 s) in the main thread before any runspace starts. `/health` and `/metrics` always exempt.
+- **IP filter** — `AllowedIPs` / `BlockedIPs` with exact, CIDR (`10.0.0.0/8`), or regex (`~^192\.168\.`) entries.
+
+### Static + alternate content
+- **Static file serving** — opt-in via `StaticServingEnabled`. ~50 MIME types out of the box. RFC-7232 conditional GET (`ETag` + `Last-Modified` → 304), RFC-7233 byte ranges (incl. suffix `bytes=-N`), GZIP for text content with `GzipMaxBytes` upper cap, MIME blacklist, optional directory browsing.
+- **Extension aliases** — `.psxml` → `text/xml`, `.posh` → `text/html`, `.psapi` → `application/xml` pass raw stdout through.
+- **PHP-CGI handler** — opt-in `.php` routing through an external `php-cgi.exe`. CGI/1.1 environment, body streaming to stdin, `Status` / `Content-Type` / `Location` parsed from PHP stdout.
+
+### Operations
+- **Forms, cookies, CORS** — `application/x-www-form-urlencoded` POST bodies, opt-in HttpOnly session cookies (`SessionEnabled`), full CORS with `OPTIONS` preflight.
+- **Custom HTML error pages** — when the client `Accept`s `text/html`, 4xx/5xx responses serve `<ErrorPagesRoot>\<code>.html` instead of the JSON envelope.
+- **Background jobs on interval** — `BackgroundJobs = @(@{ Path; IntervalSec })` runs scripts on a recurring schedule, separately logged.
+- **Multi-host prefixes** — explicit `Prefixes` list overrides the `+`-wildcard binding for hostname-bound listeners.
+- **Request tracing** — every response carries an 8-character hex `X-Request-Id` matching the log line.
+- **Script timeout enforcement** — scripts exceeding `ScriptTimeoutSec` (default 300 s) are killed and the caller receives HTTP 504.
+- **Daily or hourly log rotation** — `LogSchedule = 'Daily' | 'Hourly'`. Optional `IIS-W3C` log format and MD5 integrity hashes (`LogIntegrityHash`) for audit.
+- **Built-in `/health` + `/metrics`** — `/health` open, `/metrics` returns counters incl. `rateLimitedTotal`.
 - **Windows Scheduled Task** — `Register-ScheduledTask.ps1` installs the server as an auto-starting task in one command.
 
 ## Quick Start

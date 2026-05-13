@@ -1,0 +1,49 @@
+#Requires -Version 7.0
+<#
+.SYNOPSIS
+    Example .psxml endpoint — returns raw XML instead of a JSON envelope.
+
+.DESCRIPTION
+    PR-5 introduced extension aliases. Scripts ending in .psxml are served
+    with Content-Type 'text/xml' and the response body is the script's
+    raw stdout (no { exitCode, output, error } wrapper).
+
+    When $cfg.ExecutionMode = 'InProcess' the server injects a
+    ConvertTo-PoshApiXml helper into the runspace — this script falls
+    back to a manual here-string when the helper is unavailable
+    (Subprocess mode), so the same endpoint works in both modes.
+
+.EXAMPLE
+    Invoke-RestMethod -Uri 'http://localhost/api-status.psxml' `
+        -Headers @{ 'X-Api-Key' = 'your-api-key' }
+#>
+
+$ErrorActionPreference = 'Stop'
+
+$items = @(
+    @{ Hostname  = $env:COMPUTERNAME }
+    @{ TimeUtc   = (Get-Date).ToUniversalTime().ToString('o') }
+    @{ PSVersion = $PSVersionTable.PSVersion.ToString() }
+)
+
+# Prefer the injected helper (InProcess mode) for compact and consistent output;
+# fall back to a hand-rolled here-string under Subprocess mode where the helper
+# is not available in the child pwsh.exe session.
+if (Get-Command ConvertTo-PoshApiXml -ErrorAction SilentlyContinue) {
+    ConvertTo-PoshApiXml -Code 1 -Message 'OK' -Items $items
+} else {
+    $itemXml = $items | ForEach-Object {
+        $inner = ($_.GetEnumerator() | ForEach-Object { "    <$($_.Key)>$($_.Value)</$($_.Key)>" }) -join "`n"
+        "  <Item>`n$inner`n  </Item>"
+    }
+    @"
+<?xml version="1.0" encoding="utf-8"?>
+<Result>
+  <Code>1</Code>
+  <Message>OK</Message>
+  <Items>
+$($itemXml -join "`n")
+  </Items>
+</Result>
+"@
+}

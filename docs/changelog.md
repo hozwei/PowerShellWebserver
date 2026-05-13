@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Fixed (post-feature review pass)
+- **Auth bypass via case-insensitive credential comparison** — PowerShell's `-eq` is case-insensitive on strings. Both the `X-Api-Key` check and Basic-Auth username/password used `-eq`, so a configured key `Abc123` also accepted `aBC123`. Switched all three checks to `[string]::Equals` with `StringComparison.Ordinal`. Effective keyspace restored to byte-exact.
+- **Byte-range suffix `bytes=-N` returned wrong content** — `Send-StaticFile`'s range parser had unreachable suffix-range branch; `bytes=-100` was served as `bytes=0-100` (first 101 bytes) instead of the last 100. Rewritten as explicit if/else.
+- **GZIP unbounded memory** — `Send-StaticFile` compressed eligible text payloads in memory without an upper cap. Added `GzipMaxBytes` (default 10 MB); larger files stream uncompressed.
+- **CORS Origin echo with control characters** — wildcard+credentials mode echoed the client's `Origin` header into `Access-Control-Allow-Origin` unvalidated; a CR/LF in `Origin` would surface as an `ArgumentException` 500. Pre-validate against control characters and DEL.
+- **BG-job + IP-filter log writes raced** — multiple background jobs wrote to `JobsLogFile` via `Add-Content` without synchronisation; the main-thread IP-filter rejection log bypassed `$script:logMutex`. Both now use named Mutexes (`Global\PoshWebserverJobsLog` for jobs, the existing `Global\PoshWebserverLog` for IP filter) so concurrent writes serialise.
+- **PHP-CGI `Process.Start()` exception leaked to 500** — when `php-cgi.exe` is removed between startup validation and a request, `Start()` threw, the handler emitted a generic 500. Now returns a structured 502 with cleanup of the partial Process handle.
+- **Three IDisposable leaks in error paths** — `ConvertTo-PoshApiXml` (`StringWriter` + `XmlTextWriter`), `Send-StaticFile` GZIP branch (`MemoryStream` outside try/finally), `Invoke-PhpCgi` timeout path (`$outMs` / `$errMs` + running `CopyToAsync` tasks). All wrapped in try/finally with bounded waits on async tasks where applicable.
+- **Directory listing exposed hidden + system files** — `Send-DirectoryListing` used `Get-ChildItem -Force`. Dropped the switch so `.env`, `.htaccess`, `desktop.ini`, `Thumbs.db` etc. no longer appear in public indexes by default.
+- **`Prefixes` malformed entries failed late with obscure errors** — added explicit startup validation (must end with `/`, must start with `http://`/`https://`). Soft startup warnings for `StaticRoot` / `ErrorPagesRoot` directories that do not exist.
+
 ### Added
 - **Directory browsing** — new `DirectoryBrowsing` (default `$false`) and `DirectoryBrowsingHidden` (default `@('_error', '.git', '.gitignore')`) configuration keys. When enabled together with `StaticServingEnabled`, requests resolving to a directory with no matching `DefaultDocuments` render an HTML listing of name + size + modified date. Entries named in `DirectoryBrowsingHidden` are omitted (case-insensitive). New `Send-DirectoryListing` helper.
 

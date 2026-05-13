@@ -205,6 +205,103 @@ Expected result:
 {"exitCode":0,"output":"...","error":""}
 ```
 
+---
+
+### Posting form-urlencoded data (PR-3)
+
+When `AcceptedContentTypes` includes `application/x-www-form-urlencoded` (default), the server accepts classic HTML-form bodies in addition to JSON. The body is parsed into an ordered hashtable, re-serialised as JSON, and forwarded to the script via the same `-JsonFilePath` contract — scripts handle both encodings identically.
+
+```bash
+curl -X POST http://localhost/post-example.ps1 \
+    -H "X-Api-Key: your-api-key" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    --data 'firstName=Anna&department=IT&tags[]=admin&tags[]=user'
+```
+
+`tags[]=admin&tags[]=user` collapses into `{ tags: ['admin', 'user'] }`. Multiple plain occurrences of the same key (without `[]`) also collapse into an array.
+
+---
+
+### Using session cookies (PR-3)
+
+Set `$cfg.SessionEnabled = $true` to auto-mint a `POSH-Session-Id` cookie on requests that did not carry one. The cookie value is `HttpOnly`, `SameSite=Lax`, and `Secure` on HTTPS connections.
+
+The server itself remains stateless. Webroot scripts read the value via two environment variables that the server injects per request:
+
+```powershell
+# webroot\with-session.ps1
+$sessionId = $env:POSH_SESSION_ID   # the value of the SessionCookieName cookie
+$allCookies = $env:POSH_COOKIES     # the full raw Cookie: header
+
+Write-Output "Session: $sessionId"
+```
+
+---
+
+### CORS preflight (PR-3)
+
+Set `$cfg.CorsAllowedOrigins = @('https://app.example.com')` (or `@('*')` for any origin) to enable CORS. The server responds to `OPTIONS` preflight requests with HTTP 204 and the configured `Access-Control-Allow-*` headers — preflight bypasses auth and rate-limiting so browsers can negotiate without an API key.
+
+```bash
+# Preflight
+curl -X OPTIONS http://localhost/script1.ps1 \
+    -H "Origin: https://app.example.com" \
+    -H "Access-Control-Request-Method: POST" \
+    -i
+
+# Actual request (browser sends this after a successful preflight)
+curl -X POST http://localhost/script1.ps1 \
+    -H "X-Api-Key: your-api-key" \
+    -H "Content-Type: application/json" \
+    -H "Origin: https://app.example.com" \
+    --data '{"foo":"bar"}'
+```
+
+---
+
+### Serving static files (PR-2)
+
+Set `$cfg.StaticServingEnabled = $true` to serve non-`.ps1` files (HTML, CSS, JS, images, fonts, …) from `$cfg.StaticRoot` (defaults to `WebRoot`). The server emits `ETag` + `Last-Modified` for client-side caching, honours `If-None-Match` / `If-Modified-Since` with HTTP 304, and supports byte-range requests:
+
+```bash
+# Conditional GET — second request gets 304 if file unchanged
+curl -H "If-None-Match: \"1234-1A2B3C\"" http://localhost/style.css -i
+
+# Byte range — first 1024 bytes
+curl -H "Range: bytes=0-1023" http://localhost/big.bin -i
+
+# Suffix range — last 100 bytes
+curl -H "Range: bytes=-100" http://localhost/big.bin -i
+```
+
+---
+
+### Calling alternate-extension scripts (PR-5)
+
+`.psxml`, `.posh`, and `.psapi` are aliases for `.ps1` execution that bypass the JSON envelope and pass the script's stdout through verbatim with a dedicated Content-Type — legacy PoSH Server parity for HTML / XML endpoints:
+
+```powershell
+# webroot\api-status.psxml
+#Requires -Version 7.0
+@"
+<?xml version="1.0" encoding="utf-8"?>
+<Result>
+  <Code>1</Code>
+  <Message>OK</Message>
+  <Item><Hostname>$env:COMPUTERNAME</Hostname></Item>
+</Result>
+"@
+```
+
+Calling `GET /api-status.psxml` returns `text/xml` with the script's stdout as the body (no `{ exitCode, output, error }` wrapper).
+
+| Extension | Response Content-Type |
+|---|---|
+| `.ps1` | `application/json` (JSON envelope) |
+| `.psxml` | `text/xml; charset=utf-8` (raw stdout) |
+| `.posh` | `text/html; charset=utf-8` (raw stdout) |
+| `.psapi` | `application/xml; charset=utf-8` (raw stdout) |
+
 ## Tips & Tricks
 
 - **HTTP status codes carry semantic meaning.** A `200` response guarantees `exitCode` is `0`. A `500` means the script called `exit 1` or encountered a terminating error — inspect the `error` field. A `504` means the script exceeded `ScriptTimeoutSec` and was forcibly terminated. A `401` means the `X-Api-Key` header is missing or incorrect. A `400` on a POST request means the body is not valid JSON or query string parameters were included. A `413` means the body exceeded `MaxRequestBodyBytes`. A `415` means `Content-Type` was not `application/json`.
