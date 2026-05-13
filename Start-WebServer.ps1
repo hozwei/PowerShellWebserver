@@ -231,7 +231,10 @@ $cfg = @{
     RateLimitMode            = 'reject' # 'reject' = immediate HTTP 429 | 'queue' = wait up to RateLimitQueueTimeoutSec
     RateLimitPerIdentity     = $false   # F4: key the rate-limit table by API-key label (when authenticated) instead of client IP. Anonymous/auth-exempt requests still keyed by IP.
     RateLimitQueueTimeoutSec = 10     # 'queue' mode only: seconds to wait before returning HTTP 429
+    RateLimitQueuePollMs     = 200    # 'queue' mode only: re-check interval while waiting; lower = faster pickup of window-reset, higher = less CPU
     RateLimitExemptPaths     = @('/health', '/metrics', '/metrics-prom', '/openapi.json') # paths excluded from rate limiting — always an array
+    RateLimitSweepIntervalSec = 60    # how often the main loop sweeps stale entries from the rate-limit ConcurrentDictionary; 0 = sweep disabled (table grows unbounded over long uptimes)
+    RateLimitTableSizeWarnThreshold = 100000 # log a WARN when the rate-limit table grows past this size; potential DoS by spraying unique IPs. 0 = disabled.
     MinRequestIntervalSec    = 1      # minimum seconds between dispatched requests, globally — 0 = disabled. GlobalThrottleExemptPaths bypass this.
     GlobalThrottleExemptPaths = @('/health', '/metrics', '/metrics-prom', '/openapi.json') # paths exempt from MinRequestIntervalSec — defaults to the monitoring/discovery routes
     AuthExemptPaths          = @('/health', '/metrics', '/metrics-prom', '/openapi.json') # paths that skip authentication entirely. Identity is logged as 'anonymous'.
@@ -570,6 +573,10 @@ $numericBounds = @(
     @{ Key = 'SlowLogMaxBytes';          Min = 0;    Max = 10GB }
     @{ Key = 'JobsLogMaxBytes';          Min = 0;    Max = 10GB }
     @{ Key = 'RunspacePoolOverprovision'; Min = 1;   Max = 16 }      # 1 = no headroom (risk of dispatch hang), 16 = generous upper
+    @{ Key = 'RateLimitSweepIntervalSec'; Min = 0;   Max = 86400 }   # 0 = disabled, 24 h upper
+    @{ Key = 'RateLimitTableSizeWarnThreshold'; Min = 0; Max = 100000000 }  # 0 = disabled
+    @{ Key = 'RateLimitQueuePollMs';      Min = 10;  Max = 60000 }   # 10 ms .. 60 s
+    @{ Key = 'RateLimitPenaltySec';       Min = 0;   Max = 86400 }   # 0 = no penalty (instant unblock), 24 h upper
 )
 foreach ($b in $numericBounds) {
     $v = $cfg[$b.Key]
@@ -3926,9 +3933,11 @@ $requestHandler = {
                 # Queue mode: poll until the window resets or timeout expires.
                 # Use Ticks arithmetic — [datetime] comparison operators (op_LessThan) and
                 # .AddSeconds() fail in RunspacePool Runspace contexts on PS 7.x.
+                # Poll interval comes from $cfg.RateLimitQueuePollMs (default 200ms).
                 $queueDeadlineTicks = [datetime]::UtcNow.Ticks + ($script:cfg.RateLimitQueueTimeoutSec * [timespan]::TicksPerSecond)
+                $queuePollMs = if ($script:cfg.RateLimitQueuePollMs -gt 0) { [int]$script:cfg.RateLimitQueuePollMs } else { 200 }
                 while (-not $rl.Allowed -and [datetime]::UtcNow.Ticks -lt $queueDeadlineTicks) {
-                    Start-Sleep -Milliseconds 200
+                    Start-Sleep -Milliseconds $queuePollMs
                     $rl = Test-RateLimit -ClientIP $clientIP -Path $urlPath -Identity $rateLimitIdentity
                 }
             }
@@ -4673,6 +4682,13 @@ try {
     # Initialized to 0 — first request is always allowed.
     $lastDispatchTick = 0L
 
+    # Last time the rate-limit table got a stale-entry sweep. Without this,
+    # the table grows unbounded over long uptimes as one-shot IPs leave
+    # behind expired entries. Sweep period from $cfg.RateLimitSweepIntervalSec
+    # (default 60s) — set to 0 in config.psd1 to disable.
+    $lastRateLimitSweepTick = [System.Diagnostics.Stopwatch]::GetTimestamp()
+    $rateLimitSweepIntervalTicks = [long]($cfg.RateLimitSweepIntervalSec) * [System.Diagnostics.Stopwatch]::Frequency
+
     while ($listener.IsListening) {
         # Blocks until a request arrives or the listener is stopped.
         try {
@@ -4681,6 +4697,34 @@ try {
             # Listener was stopped (shutdown) — exit the loop.
             if (-not $listener.IsListening) { break }
             continue
+        }
+
+        # Periodic rate-limit table sweep — same request-driven timing as
+        # the dispose loop. Cheap (one ConcurrentDictionary scan), caps
+        # memory growth from one-shot IPs over long uptimes. Skipped when
+        # the operator disabled the sweep via RateLimitSweepIntervalSec=0.
+        if ($rateLimitSweepIntervalTicks -gt 0) {
+            $nowSweepTick = [System.Diagnostics.Stopwatch]::GetTimestamp()
+            if (($nowSweepTick - $lastRateLimitSweepTick) -ge $rateLimitSweepIntervalTicks) {
+                try {
+                    $swept = Remove-StaleRateLimitEntries -Table $script:rateLimitTable -WindowSec $cfg.RateLimitWindowSec
+                    $sizeAfter = $script:rateLimitTable.Count
+                    if ($swept -gt 0) {
+                        Write-StartupLog "Rate-limit table sweep: $swept stale entries removed; current size $sizeAfter."
+                    }
+                    # DoS-by-IP-spray detection: if the table stayed huge AFTER the
+                    # sweep, fresh hostile entries are still arriving faster than
+                    # we can age them out. Warn the operator so they can correlate
+                    # with the audit log.
+                    if ($cfg.RateLimitTableSizeWarnThreshold -gt 0 -and $sizeAfter -ge $cfg.RateLimitTableSizeWarnThreshold) {
+                        Write-StartupLog "WARN: rate-limit table size $sizeAfter exceeds threshold $($cfg.RateLimitTableSizeWarnThreshold) -- possible IP-spray DoS or sweep interval too long."
+                        if ($cfg.AuditLogEnabled) {
+                            Write-AuditLog -EventName 'RATE_LIMIT_TABLE_OVERSIZED' -Detail "size=$sizeAfter; threshold=$($cfg.RateLimitTableSizeWarnThreshold)"
+                        }
+                    }
+                } catch { $null = $_ }
+                $lastRateLimitSweepTick = $nowSweepTick
+            }
         }
 
         # Dispose completed [PowerShell] instances — releases RunspacePool slots.
