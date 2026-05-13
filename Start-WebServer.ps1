@@ -220,6 +220,7 @@ $cfg = @{
     ApiKeys             = [ordered]@{}                               # multi-key map: label → key. Populate via config.psd1: @{ ApiKeys = @{ 'ci' = 'k1'; 'mon' = 'k2' } }
     ScriptTimeoutSec         = 300    # 5 minutes — scripts running longer are terminated (HTTP 504)
     MaxConcurrent            = 10     # maximum parallel requests — excess requests receive HTTP 503
+    RunspacePoolOverprovision = 2     # multiplier for RunspacePool max size relative to MaxConcurrent. Slots beyond the semaphore limit absorb the gap between semaphore.Release() and the cleanup loop's Dispose(); too low = main thread hangs on BeginInvoke under burst. Recommended 2-4.
     LogRetentionDays         = 180    # date-stemmed request logs (YYYY-MM-DD.log / YYYY-MM-DDTHH.log) older than N days are deleted at startup; single-file logs (audit/slow/jobs/startup) are exempt — they have separate size-based rotation. 0 = disabled.
     PostJsonDir              = Join-Path $baseDir 'postjson' # directory where POST body JSON files are stored
     PostJsonRetentionDays    = 30     # POST JSON files older than N days are deleted at startup (0 = disabled)
@@ -568,6 +569,7 @@ $numericBounds = @(
     @{ Key = 'AuditLogMaxBytes';         Min = 0;    Max = 10GB }    # 0 = disabled, 10 GB upper
     @{ Key = 'SlowLogMaxBytes';          Min = 0;    Max = 10GB }
     @{ Key = 'JobsLogMaxBytes';          Min = 0;    Max = 10GB }
+    @{ Key = 'RunspacePoolOverprovision'; Min = 1;   Max = 16 }      # 1 = no headroom (risk of dispatch hang), 16 = generous upper
 )
 foreach ($b in $numericBounds) {
     $v = $cfg[$b.Key]
@@ -654,6 +656,11 @@ $script:requestsTotal = [ref] 0L
 # Kept separate from requestsTotal — exposed as `rateLimitedTotal` in /metrics
 # and as `posh_rate_limited_total` in /metrics-prom.
 $script:rateLimitedTotal = [ref] 0L
+
+# Counts EndInvoke/Dispose failures in the runspace-cleanup loop. Silent
+# disposal errors would leak RunspacePool slots; this counter surfaces them
+# in /metrics so operators can spot starvation before dispatch is blocked.
+$script:runspaceDisposeFailures = [ref] 0L
 
 # Rate-limit state — ConcurrentDictionary for lock-free access from RunspacePool Runspaces.
 # Key: 'ip:<address>' or 'id:<api-key-label>' depending on RateLimitPerIdentity (F4).
@@ -797,7 +804,8 @@ function Write-Log {
                 '^UNAUTHORIZED$'                  { 401; break }
                 '^FORBIDDEN$|^IP BLOCKED$|^IP NOT ALLOWED$' { 403; break }
                 '^NOT FOUND$'                     { 404; break }
-                '^RATE LIMITED$'                  { 429; break }
+                '^RATE LIMITED$|^GLOBAL THROTTLED$' { 429; break }
+                '^OVERLOAD$'                      { 503; break }
                 '^TIMEOUT$'                       { 504; break }
                 '^BAD REQUEST$'                   { 400; break }
                 '^HTTP\s+(\d+)$'                  { [int]$Matches[1]; break }
@@ -3405,6 +3413,7 @@ function Format-PromMetrics {
     $logDrops    = [System.Threading.Interlocked]::Read($script:logDropsTotal)
     $auditDrops  = [System.Threading.Interlocked]::Read($script:auditLogDropsTotal)
     $slowDrops   = [System.Threading.Interlocked]::Read($script:slowLogDropsTotal)
+    $rsFails     = [System.Threading.Interlocked]::Read($script:runspaceDisposeFailures)
 
     $sb = [System.Text.StringBuilder]::new(1024)
     $null = $sb.AppendLine('# HELP posh_uptime_seconds Server uptime since process start.')
@@ -3434,6 +3443,9 @@ function Format-PromMetrics {
     $null = $sb.AppendLine('# HELP posh_slow_log_drops_total Slow-log lines skipped because the request-log mutex was contended for >500ms.')
     $null = $sb.AppendLine('# TYPE posh_slow_log_drops_total counter')
     $null = $sb.AppendLine("posh_slow_log_drops_total $slowDrops")
+    $null = $sb.AppendLine('# HELP posh_runspace_dispose_failures_total EndInvoke/Dispose calls that threw during runspace cleanup.')
+    $null = $sb.AppendLine('# TYPE posh_runspace_dispose_failures_total counter')
+    $null = $sb.AppendLine("posh_runspace_dispose_failures_total $rsFails")
     return $sb.ToString()
 }
 
@@ -3682,6 +3694,12 @@ function Test-RateLimit {
 # $shared: serialisable values passed to every runspace via -ArgumentList.
 # Functions are exported as ScriptBlocks and injected via ${function:Name}.
 #
+# Naming convention: each function-valued key is prefixed `Fn` so all the
+# injected functions are grep-able as one set, and so accidentally adding a
+# non-function value at this position is visually obvious. The 27 entries
+# must stay in sync with the 27 reinstantiation lines inside $requestHandler
+# below — when you add a function to one side, add it to the other.
+#
 # Live .NET objects (SemaphoreSlim, Mutex, Stopwatch, ConcurrentDictionary,
 # [ref] counters) are NOT included here — they are injected directly into
 # each runspace via InitialSessionState.Variables before the runspace opens.
@@ -3731,6 +3749,15 @@ $requestHandler = {
         [hashtable]                      $shared
     )
 
+    # OUTER try/finally is a leak guard for the semaphore. The INNER try/catch
+    # (further down) wraps the request-processing logic and Write-Log's its
+    # own errors; the outer one only fires if the setup itself throws (e.g.
+    # $shared is unexpectedly null, function injection trips on a hostile
+    # ScriptBlock). Without it, an early throw never releases the semaphore
+    # and the slot leaks for the lifetime of the server.
+    $semReleased = $false
+    try {
+
     # Inject functions and configuration from $shared into the local scope.
     # $script: scope makes them visible in all injected functions (Write-Log,
     # Get-ScriptIndex, Test-RateLimit).
@@ -3774,9 +3801,10 @@ $requestHandler = {
     $script:metadataCache       = $metadataCache
     $script:routeCache          = $routeCache
     $script:rateLimitedTotal    = $rateLimitedTotal
-    $script:logDropsTotal       = $logDropsTotal
-    $script:auditLogDropsTotal  = $auditLogDropsTotal
-    $script:slowLogDropsTotal   = $slowLogDropsTotal
+    $script:logDropsTotal           = $logDropsTotal
+    $script:auditLogDropsTotal      = $auditLogDropsTotal
+    $script:slowLogDropsTotal       = $slowLogDropsTotal
+    $script:runspaceDisposeFailures = $runspaceDisposeFailures
     # $semaphore, $startTime, $requestsTotal are used directly (no $script: needed)
 
     try {
@@ -4036,13 +4064,15 @@ $requestHandler = {
             $logDrops    = [System.Threading.Interlocked]::Read($script:logDropsTotal)
             $auditDrops  = [System.Threading.Interlocked]::Read($script:auditLogDropsTotal)
             $slowDrops   = [System.Threading.Interlocked]::Read($script:slowLogDropsTotal)
+            $rsFails     = [System.Threading.Interlocked]::Read($script:runspaceDisposeFailures)
             $body        = [ordered]@{
-                uptime              = $uptimeStr
-                requestsTotal       = $total
-                rateLimitedTotal    = $rateLimited
-                logDropsTotal       = $logDrops
-                auditLogDropsTotal  = $auditDrops
-                slowLogDropsTotal   = $slowDrops
+                uptime                       = $uptimeStr
+                requestsTotal                = $total
+                rateLimitedTotal             = $rateLimited
+                logDropsTotal                = $logDrops
+                auditLogDropsTotal           = $auditDrops
+                slowLogDropsTotal            = $slowDrops
+                runspaceDisposeFailuresTotal = $rsFails
             } | ConvertTo-Json -Compress
             Send-Response -Response $resp -StatusCode 200 -Body $body -RequestId $requestId
             Write-Log -ClientIP $clientIP -Request $requestLine -Status 'METRICS' -ExitCode '-' -RequestId $requestId
@@ -4408,7 +4438,16 @@ $requestHandler = {
         } catch { }
     } finally {
         # Always release the semaphore slot — even on error or timeout.
-        try { $null = $semaphore.Release() } catch { }
+        try { $null = $semaphore.Release(); $semReleased = $true } catch { }
+    }
+
+    } finally {
+        # OUTER finally — fires if any setup line above the inner try threw,
+        # so the slot never leaks in a stuck-runspace scenario. The flag
+        # prevents a double-release when the inner finally already ran.
+        if (-not $semReleased) {
+            try { $null = $semaphore.Release() } catch { }
+        }
     }
 }
 
@@ -4452,20 +4491,36 @@ foreach ($entry in @(
     [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('rateLimitedTotal',  $script:rateLimitedTotal,    $null),
     [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('metadataCache',     $script:metadataCache,       $null),
     [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('routeCache',        $script:routeCache,          $null),
-    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('logDropsTotal',     $script:logDropsTotal,       $null),
-    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('auditLogDropsTotal',$script:auditLogDropsTotal,  $null),
-    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('slowLogDropsTotal', $script:slowLogDropsTotal,   $null)
+    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('logDropsTotal',             $script:logDropsTotal,            $null),
+    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('auditLogDropsTotal',        $script:auditLogDropsTotal,       $null),
+    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('slowLogDropsTotal',         $script:slowLogDropsTotal,        $null),
+    [System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('runspaceDisposeFailures',   $script:runspaceDisposeFailures,  $null)
 )) { $iss.Variables.Add($entry) }
 
-# RunspacePool max = MaxConcurrent * 2.
+# RunspacePool max = MaxConcurrent * RunspacePoolOverprovision (default 2).
 # The SemaphoreSlim limits real parallelism to MaxConcurrent — the pool needs
 # extra headroom because RunspacePool slots are only released when EndInvoke()+
 # Dispose() is called in the main loop (next iteration). Between semaphore.Release()
 # in the handler's finally and Dispose() in the main loop, the slot is still counted
 # as occupied by the pool. Without extra headroom BeginInvoke() blocks the main
 # thread when the pool is full — GetContext() is never called — the server hangs.
-$runspacePool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, ($cfg.MaxConcurrent * 2), $iss, $Host)
+# Multiplier is configurable so deployments with high burst-to-steady-state
+# ratio (slow requests during a spike) can raise it; tightly-bounded systems
+# can lower it to cap process memory.
+$poolMultiplier = if ($cfg.RunspacePoolOverprovision -gt 0) { [int]$cfg.RunspacePoolOverprovision } else { 2 }
+$poolMax        = $cfg.MaxConcurrent * $poolMultiplier
+$runspacePool   = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $poolMax, $iss, $Host)
 $runspacePool.Open()
+# RunspacePoolState.Opened is the only state where BeginInvoke succeeds.
+# .Open() above is synchronous but defensive — if a future PowerShell version
+# changes the contract, we want a loud failure here, not silent dispatch hangs.
+if ($runspacePool.RunspacePoolStateInfo.State -ne [System.Management.Automation.Runspaces.RunspacePoolState]::Opened) {
+    Write-StartupLog ("ERROR: RunspacePool failed to open. State={0}." -f $runspacePool.RunspacePoolStateInfo.State)
+    Write-Output ''
+    Write-Output ("ERROR: RunspacePool is in state '{0}' after Open(). Cannot dispatch requests." -f $runspacePool.RunspacePoolStateInfo.State)
+    exit 1
+}
+Write-StartupLog ("RunspacePool open: min=1 max={0} (MaxConcurrent={1} x Overprovision={2})." -f $poolMax, $cfg.MaxConcurrent, $poolMultiplier)
 
 # ---------------------------------------------------------------------------
 # Background jobs — each `$cfg.BackgroundJobs` entry runs in its own dedicated
@@ -4575,6 +4630,9 @@ if ($cfg.BackgroundJobs -and $cfg.BackgroundJobs.Count -gt 0) {
             Write-StartupLog "WARN: BackgroundJob script not found: $($jobDef.Path)"
             continue
         }
+        # Locals declared outside try so the catch can clean up partial state.
+        $rs = $null
+        $ps = $null
         try {
             $rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
             $rs.Open()
@@ -4586,6 +4644,11 @@ if ($cfg.BackgroundJobs -and $cfg.BackgroundJobs.Count -gt 0) {
             Write-StartupLog ("BackgroundJob started: {0} every {1}s" -f $jobDef.Path, $jobDef.IntervalSec)
         } catch {
             Write-StartupLog ("ERROR: BackgroundJob start failed for {0}: {1}" -f $jobDef.Path, $_)
+            # Cleanup partially-created handles so a half-started job does
+            # not hold a Runspace forever (relevant for long-running posh
+            # processes where bg-job restarts via config reload could leak).
+            try { if ($null -ne $ps) { $ps.Dispose() } } catch { $null = $_ }
+            try { if ($null -ne $rs) { $rs.Dispose() } } catch { $null = $_ }
         }
     }
 }
@@ -4622,11 +4685,24 @@ try {
 
         # Dispose completed [PowerShell] instances — releases RunspacePool slots.
         # Iterate backwards so RemoveAt() does not shift unvisited indices.
+        # Tick the dispose-failure counter so silent .Dispose() errors don't
+        # accumulate invisibly under load (RunspacePool slot leaks would
+        # eventually starve dispatch).
+        # Timing note: this loop runs at the TOP of each iteration AFTER
+        # GetContext() returned a new request. Completed runspaces from
+        # prior requests are released only when the NEXT request arrives,
+        # so an idle server holds onto disposed-ready slots until traffic
+        # resumes. Acceptable trade-off: a timer-based cleanup would need
+        # cross-thread coordination with the main dispatch flow.
         for ($i = $psInstances.Count - 1; $i -ge 0; $i--) {
             $item = $psInstances[$i]
             if ($item.Handle.IsCompleted) {
-                try { $item.Ps.EndInvoke($item.Handle) } catch { }
-                try { $item.Ps.Dispose()               } catch { }
+                try { $item.Ps.EndInvoke($item.Handle) } catch {
+                    [System.Threading.Interlocked]::Increment($script:runspaceDisposeFailures) | Out-Null
+                }
+                try { $item.Ps.Dispose() } catch {
+                    [System.Threading.Interlocked]::Increment($script:runspaceDisposeFailures) | Out-Null
+                }
                 $psInstances.RemoveAt($i)
             }
         }
@@ -4729,6 +4805,11 @@ try {
                 $resp429.AddHeader('X-Request-Id', $throttleReqId)
                 try { $resp429.OutputStream.Write($bodyBytes, 0, $bodyBytes.Length) } catch { }
                 try { $resp429.OutputStream.Close()                                  } catch { }
+                # The main-loop 429/503 paths skip Write-Log because the
+                # request never enters a runspace; the parent-scope Write-Log
+                # is still callable. Without these calls, operators see no
+                # trace of throttle/overload events.
+                Write-Log -ClientIP $reqClientIP -Request "$($context.Request.HttpMethod) $reqUrlPath" -Status 'GLOBAL THROTTLED' -ExitCode '-' -RequestId $throttleReqId
                 continue
             }
             $lastDispatchTick = $nowTick
@@ -4748,16 +4829,27 @@ try {
             $resp503.AddHeader('X-Request-Id', $overloadReqId)
             try { $resp503.OutputStream.Write($bodyBytes, 0, $bodyBytes.Length) } catch { }
             try { $resp503.OutputStream.Close()                                  } catch { }
+            Write-Log -ClientIP $reqClientIP -Request "$($context.Request.HttpMethod) $reqUrlPath" -Status 'OVERLOAD' -ExitCode '-' -RequestId $overloadReqId
             continue
         }
 
         # Dispatch request to RunspacePool — non-blocking.
-        # Semaphore is released inside $requestHandler's finally block.
-        $ps     = [System.Management.Automation.PowerShell]::Create()
-        $ps.RunspacePool = $runspacePool
-        $null   = $ps.AddScript($requestHandler).AddArgument($context).AddArgument($shared)
-        $handle = $ps.BeginInvoke()
-        $psInstances.Add([PSCustomObject]@{ Ps = $ps; Handle = $handle })
+        # Semaphore is released inside $requestHandler's finally block. If
+        # creation/BeginInvoke throws BEFORE the handler runs (RunspacePool
+        # closed during a shutdown race, AddScript ScriptBlock-clone failure),
+        # the handler's finally never fires and the slot would leak forever.
+        # Release here on failure so the server stays healthy.
+        try {
+            $ps     = [System.Management.Automation.PowerShell]::Create()
+            $ps.RunspacePool = $runspacePool
+            $null   = $ps.AddScript($requestHandler).AddArgument($context).AddArgument($shared)
+            $handle = $ps.BeginInvoke()
+            $psInstances.Add([PSCustomObject]@{ Ps = $ps; Handle = $handle })
+        } catch {
+            try { $null = $semaphore.Release() } catch { }
+            try { if ($ps) { $ps.Dispose() } } catch { }
+            try { $context.Response.StatusCode = 500; $context.Response.OutputStream.Close() } catch { }
+        }
     }
 
 } finally {
