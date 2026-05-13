@@ -5166,6 +5166,21 @@ try {
     try { $semaphore.Dispose()                            } catch { }
     try { $script:logMutex.Dispose()                      } catch { }
     try { $script:auditMutex.Dispose()                    } catch { }
+    # Final summary log line — captures the headline counters one last
+    # time so post-mortem analysis has the totals without grepping the
+    # entire request log. Each Read is wrapped in a try because by this
+    # point any of the counter [ref]s could already be in a stale state
+    # (the runspace pool was just disposed).
+    try {
+        $totalEnd     = [System.Threading.Interlocked]::Read($script:requestsTotal)
+        $rlEnd        = [System.Threading.Interlocked]::Read($script:rateLimitedTotal)
+        $authFailEnd  = [System.Threading.Interlocked]::Read($script:authFailuresTotal)
+        $logDropsEnd  = [System.Threading.Interlocked]::Read($script:logDropsTotal)
+        $timeoutsEnd  = [System.Threading.Interlocked]::Read($script:scriptTimeoutsTotal)
+        $peakEnd      = [System.Threading.Interlocked]::Read($script:inFlightPeak)
+        $uptime       = [int][math]::Floor($startTime.Elapsed.TotalSeconds)
+        Write-StartupLog ("Final stats: uptime={0}s requests={1} rateLimited={2} authFails={3} logDrops={4} scriptTimeouts={5} inFlightPeak={6}" -f $uptime, $totalEnd, $rlEnd, $authFailEnd, $logDropsEnd, $timeoutsEnd, $peakEnd)
+    } catch { $null = $_ }
     try { Write-StartupLog 'Web server stopped.'          } catch { }
     try { Write-Output 'Web server stopped.'              } catch { }
 }
