@@ -245,12 +245,20 @@ $cfg = @{
     PhpCgiTimeoutSec         = 60      # max seconds a PHP-CGI process may run before it is killed and HTTP 504 is returned
     CustomErrorPages         = $false  # render <ErrorPagesRoot>/<code>.html instead of the JSON envelope for 4xx/5xx — only when client accepts text/html
     ErrorPagesRoot           = ''      # empty = '<WebRoot>\_error' — directory containing 401.html, 403.html, 404.html, etc.
+    Prefixes                 = @()     # explicit HttpListener prefixes (e.g. @('http://api.example.com:80/', 'http://localhost:80/')). Empty = build from HttpPort/HttpsPort with '+' wildcard binding (existing behavior).
+    BackgroundJobs           = @()     # array of @{ Path = '<absolute>'; IntervalSec = 300 } — each job runs in its own background runspace on the configured interval; output goes to '<LogDir>\jobs.log'
+    JobsLogFile              = ''      # absolute path to the jobs log file; empty = '<LogDir>\jobs.log'
 }
 
 # CustomErrorPages root fallback — empty string means '<WebRoot>\_error'. Resolved here so the
 # Send-Response helper can use the path without recomputing per request.
 if ([string]::IsNullOrEmpty($cfg.ErrorPagesRoot)) {
     $cfg.ErrorPagesRoot = Join-Path $cfg.WebRoot '_error'
+}
+# Jobs log path fallback — analogous to ErrorPagesRoot. Resolved here so background-job
+# runspaces (created later) get the final value at instantiation time.
+if ([string]::IsNullOrEmpty($cfg.JobsLogFile)) {
+    $cfg.JobsLogFile = Join-Path $cfg.LogDir 'jobs.log'
 }
 
 # StaticRoot fallback — empty string means: reuse WebRoot. Resolved here rather than at
@@ -703,11 +711,17 @@ if ($cfg.RateLimitRequests -gt 0) {
 $listener = [System.Net.HttpListener]::new()
 
 $activePrefixes = [System.Collections.Generic.List[string]]::new()
-if ($cfg.HttpsEnabled) {
-    $null = $activePrefixes.Add("https://+:$($cfg.HttpsPort)/")
-}
-if ($cfg.HttpPort -gt 0) {
-    $null = $activePrefixes.Add("http://+:$($cfg.HttpPort)/")
+if ($cfg.Prefixes -and $cfg.Prefixes.Count -gt 0) {
+    # Explicit prefix list — overrides the HttpPort/HttpsPort/`+`-wildcard defaults.
+    # Caller is responsible for ending each prefix with '/'.
+    foreach ($prefix in $cfg.Prefixes) { $null = $activePrefixes.Add($prefix) }
+} else {
+    if ($cfg.HttpsEnabled) {
+        $null = $activePrefixes.Add("https://+:$($cfg.HttpsPort)/")
+    }
+    if ($cfg.HttpPort -gt 0) {
+        $null = $activePrefixes.Add("http://+:$($cfg.HttpPort)/")
+    }
 }
 foreach ($prefix in $activePrefixes) {
     $listener.Prefixes.Add($prefix)
@@ -1800,6 +1814,72 @@ function Get-ScriptIndex {
 }
 
 # ---------------------------------------------------------------------------
+# Test-IpMatch
+# Returns $true when $Ip matches any entry in $Patterns. Each pattern can be:
+#   - Exact match:  '192.168.1.10' (case-insensitive comparison).
+#   - CIDR range:   '192.168.1.0/24' — matches when the first /N bits of $Ip equal
+#                   the network bytes. IPv4 and IPv6 both supported; mismatched families
+#                   never match (so an IPv4 entry never matches an IPv6 client).
+#   - Regex:        '~^10\.' — entries that start with '~' run the rest as a regex
+#                   over the literal IP string. Useful for legacy PoSH whitelist parity.
+# Empty / null pattern list returns $false.
+# ---------------------------------------------------------------------------
+function Test-IpMatch {
+    param(
+        [string]   $Ip,
+        [string[]] $Patterns
+    )
+    if ($null -eq $Patterns -or $Patterns.Count -eq 0) { return $false }
+
+    $ipAddr  = $null
+    $ipBytes = $null
+    try {
+        $ipAddr  = [System.Net.IPAddress]::Parse($Ip)
+        $ipBytes = $ipAddr.GetAddressBytes()
+    } catch { $ipAddr = $null }
+
+    foreach ($p in $Patterns) {
+        if ([string]::IsNullOrEmpty($p)) { continue }
+
+        if ($p.StartsWith('~')) {
+            $regex = $p.Substring(1)
+            try { if ($Ip -match $regex) { return $true } } catch { } # malformed regex → skip
+            continue
+        }
+
+        $slashIx = $p.IndexOf('/')
+        if ($slashIx -gt 0 -and $null -ne $ipBytes) {
+            try {
+                $netIp    = [System.Net.IPAddress]::Parse($p.Substring(0, $slashIx))
+                $bits     = [int]$p.Substring($slashIx + 1)
+                $netBytes = $netIp.GetAddressBytes()
+                if ($netBytes.Length -ne $ipBytes.Length) { continue }
+                $remaining = $bits
+                $matched   = $true
+                for ($i = 0; $i -lt $netBytes.Length; $i++) {
+                    if ($remaining -le 0) { break }
+                    if ($remaining -ge 8) {
+                        if ($netBytes[$i] -ne $ipBytes[$i]) { $matched = $false; break }
+                        $remaining -= 8
+                    } else {
+                        $mask = (0xFF -shl (8 - $remaining)) -band 0xFF
+                        if ((($netBytes[$i] -band $mask) -bxor ($ipBytes[$i] -band $mask)) -ne 0) {
+                            $matched = $false
+                        }
+                        $remaining = 0
+                    }
+                }
+                if ($matched) { return $true }
+            } catch { }
+            continue
+        }
+
+        if ([string]::Equals($p, $Ip, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}
+
+# ---------------------------------------------------------------------------
 # Rate limiting — Fixed Window per client IP with penalty on violation.
 #
 # Returns PSCustomObject { Allowed [bool]; RetryAfterSec [int] }.
@@ -2517,6 +2597,87 @@ $runspacePool = [System.Management.Automation.Runspaces.RunspaceFactory]::Create
 $runspacePool.Open()
 
 # ---------------------------------------------------------------------------
+# Background jobs — each `$cfg.BackgroundJobs` entry runs in its own dedicated
+# runspace + Process. Output is appended to `$cfg.JobsLogFile` (separate from
+# the request log so background activity does not pollute request traces).
+# Jobs are tracked in $bgJobInstances so the shutdown handler can stop them
+# cleanly. The loop is intentionally simple — the user wanted feature parity
+# with the legacy PoSH Server's `-CustomJob`, not a full task scheduler.
+# ---------------------------------------------------------------------------
+$bgJobInstances = [System.Collections.Generic.List[object]]::new()
+
+if ($cfg.BackgroundJobs -and $cfg.BackgroundJobs.Count -gt 0) {
+    $bgScriptBlock = {
+        param([string] $Path, [int] $Interval, [string] $LogFile, [string] $PwshExeLocal)
+
+        while ($true) {
+            $startTime = Get-Date
+            try {
+                $psi = [System.Diagnostics.ProcessStartInfo]::new()
+                $psi.FileName               = $PwshExeLocal
+                $psi.UseShellExecute        = $false
+                $psi.RedirectStandardOutput = $true
+                $psi.RedirectStandardError  = $true
+                $psi.CreateNoWindow         = $true
+                foreach ($a in @('-NonInteractive', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Path)) {
+                    $null = $psi.ArgumentList.Add($a)
+                }
+                $proc = [System.Diagnostics.Process]::new()
+                $proc.StartInfo = $psi
+                $null = $proc.Start()
+                $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+                $stderrTask = $proc.StandardError.ReadToEndAsync()
+                $null = $proc.WaitForExit()
+                # stdout is drained but intentionally discarded — reading it is required to
+                # prevent the child from blocking on a full pipe buffer; the actual content
+                # is only of interest in stderr (errors) and the exit code.
+                $null   = $stdoutTask.GetAwaiter().GetResult()
+                $stderr = $stderrTask.GetAwaiter().GetResult()
+                $exitCode = $proc.ExitCode
+                $proc.Dispose()
+
+                $logLine = '{0} | JOB | {1} | EXIT:{2}' -f $startTime.ToString('yyyy-MM-dd HH:mm:ss'), $Path, $exitCode
+                try { Add-Content -LiteralPath $LogFile -Value $logLine -Encoding UTF8 } catch { }
+                if (-not [string]::IsNullOrWhiteSpace($stderr)) {
+                    foreach ($line in $stderr -split "(`r`n|`n)") {
+                        if (-not [string]::IsNullOrWhiteSpace($line)) {
+                            try { Add-Content -LiteralPath $LogFile -Value ('  STDERR: {0}' -f $line.TrimEnd()) -Encoding UTF8 } catch { }
+                        }
+                    }
+                }
+            } catch {
+                $errLine = '{0} | JOB ERROR | {1} | {2}' -f $startTime.ToString('yyyy-MM-dd HH:mm:ss'), $Path, $_
+                try { Add-Content -LiteralPath $LogFile -Value $errLine -Encoding UTF8 } catch { }
+            }
+            Start-Sleep -Seconds $Interval
+        }
+    }
+
+    foreach ($jobDef in $cfg.BackgroundJobs) {
+        if (-not $jobDef.Path -or -not $jobDef.IntervalSec -or $jobDef.IntervalSec -le 0) {
+            Write-StartupLog "WARN: skipping malformed BackgroundJob entry: $($jobDef | ConvertTo-Json -Compress)"
+            continue
+        }
+        if (-not (Test-Path -LiteralPath $jobDef.Path -PathType Leaf)) {
+            Write-StartupLog "WARN: BackgroundJob script not found: $($jobDef.Path)"
+            continue
+        }
+        try {
+            $rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+            $rs.Open()
+            $ps = [System.Management.Automation.PowerShell]::Create()
+            $ps.Runspace = $rs
+            $null = $ps.AddScript($bgScriptBlock).AddArgument($jobDef.Path).AddArgument([int]$jobDef.IntervalSec).AddArgument($cfg.JobsLogFile).AddArgument($cfg.PwshExe)
+            $handle = $ps.BeginInvoke()
+            $null   = $bgJobInstances.Add([PSCustomObject]@{ Ps = $ps; Rs = $rs; Handle = $handle; Path = $jobDef.Path; Interval = $jobDef.IntervalSec })
+            Write-StartupLog ("BackgroundJob started: {0} every {1}s" -f $jobDef.Path, $jobDef.IntervalSec)
+        } catch {
+            Write-StartupLog ("ERROR: BackgroundJob start failed for {0}: {1}" -f $jobDef.Path, $_)
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Main loop
 # GetContext() blocks synchronously until a request arrives.
 # A PowerShell instance is started per request via the RunspacePool —
@@ -2573,10 +2734,10 @@ try {
             $ipDenied    = $false
             $ipStatus    = ''
 
-            if ($cfg.BlockedIPs -contains $reqClientIP) {
+            if (Test-IpMatch -Ip $reqClientIP -Patterns $cfg.BlockedIPs) {
                 $ipDenied = $true
                 $ipStatus = 'IP BLOCKED'
-            } elseif ($cfg.AllowedIPs.Count -gt 0 -and $cfg.AllowedIPs -notcontains $reqClientIP) {
+            } elseif ($cfg.AllowedIPs.Count -gt 0 -and -not (Test-IpMatch -Ip $reqClientIP -Patterns $cfg.AllowedIPs)) {
                 $ipDenied = $true
                 $ipStatus = 'IP NOT ALLOWED'
             }
@@ -2684,6 +2845,16 @@ try {
     try { if ($listener.IsListening) { $listener.Stop() } } catch { }
     try { Start-Sleep -Seconds 5                          } catch { }
     try { $listener.Close()                               } catch { }
+    # Stop background jobs — their script blocks loop forever, so Stop() is the only way out.
+    try {
+        if ($null -ne $bgJobInstances) {
+            foreach ($bg in $bgJobInstances) {
+                try { $bg.Ps.Stop()        } catch { }
+                try { $bg.Ps.Dispose()     } catch { }
+                try { $bg.Rs.Dispose()     } catch { }
+            }
+        }
+    } catch { }
     # Dispose any remaining tracked [PowerShell] instances.
     try {
         if ($null -ne $psInstances) {

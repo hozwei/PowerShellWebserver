@@ -66,6 +66,9 @@ $cfg = @{
     PhpCgiTimeoutSec         = 60
     CustomErrorPages         = $false
     ErrorPagesRoot           = ''     # empty = '<WebRoot>\_error'
+    Prefixes                 = @()    # empty = build from HttpPort/HttpsPort with '+' wildcard binding
+    BackgroundJobs           = @()
+    JobsLogFile              = ''     # empty = '<LogDir>\jobs.log'
 }
 ```
 
@@ -127,6 +130,12 @@ $cfg = @{
     PhpCgiTimeoutSec         = 30
     CustomErrorPages         = $true
     ErrorPagesRoot           = 'D:\automation\posh\public\_error'
+    Prefixes                 = @('https://api.internal.example.com:443/', 'https://localhost:443/')
+    BackgroundJobs           = @(
+        @{ Path = 'D:\automation\posh\jobs\refresh-cache.ps1'; IntervalSec = 300 }
+        @{ Path = 'D:\automation\posh\jobs\rotate-tokens.ps1'; IntervalSec = 3600 }
+    )
+    JobsLogFile              = 'D:\automation\posh\logs\jobs.log'
 }
 ```
 
@@ -186,8 +195,11 @@ These are passed on the command line when starting the server. `Register-Schedul
 | `RateLimitQueueTimeoutSec` | `integer` | `10` | Maximum seconds a request waits in queue mode before receiving HTTP 429. Only evaluated when `RateLimitMode = 'queue'`. |
 | `RateLimitExemptPaths` | `string[]` | `@('/health', '/metrics')` | URL paths excluded from rate limiting. Must be an array even if only one path is exempt. Comparison is case-insensitive. |
 | `MinRequestIntervalSec` | `integer` | `1` | Minimum number of seconds that must elapse between two dispatched requests, globally across all clients. Requests arriving before this interval elapses receive HTTP 429 with a `Retry-After` header. Enforced in the main thread before any runspace is started — the RunspacePool is never touched for throttled requests. `GET /health` and `GET /metrics` are always exempt regardless of this setting. Set to `0` to disable. |
-| `AllowedIPs` | `string[]` | `@()` | IP address allowlist. Empty array = all client IPs are allowed (default). Non-empty = only the listed IP addresses may send requests. Checked in the main thread after the IP blocklist. `GET /health` is always exempt. Use exact IP strings (e.g. `'192.168.1.10'`). |
-| `BlockedIPs` | `string[]` | `@()` | IP address blocklist. Listed IPs are always rejected with HTTP 403, regardless of `AllowedIPs`. Checked in the main thread before `AllowedIPs`. `GET /health` is always exempt. Empty array = no IPs blocked (default). |
+| `AllowedIPs` | `string[]` | `@()` | IP address allowlist. Empty = all IPs allowed (default). Non-empty = only matching client IPs pass. Each entry may be an exact IP (`'192.168.1.10'`), a CIDR range (`'10.0.0.0/8'`), or a regex when prefixed with `~` (`'~^192\.168\.'`). IPv4 and IPv6 both supported. `GET /health` is always exempt. |
+| `BlockedIPs` | `string[]` | `@()` | IP address blocklist. Same matching syntax as `AllowedIPs` (exact / CIDR / `~regex`). Listed IPs are always rejected with HTTP 403, regardless of `AllowedIPs`. Checked first. `GET /health` is always exempt. |
+| `Prefixes` | `string[]` | `@()` | Explicit `HttpListener` URL prefixes. When non-empty, overrides the default `+`-wildcard binding constructed from `HttpPort` / `HttpsPort`. Each prefix MUST end with `/` (`HttpListener` requirement). Allows hostname-bound listeners and mixed-port scenarios. Empty = legacy behavior. |
+| `BackgroundJobs` | `hashtable[]` | `@()` | Array of background jobs to run on a recurring interval. Each entry: `@{ Path = '<absolute path to a .ps1 script>'; IntervalSec = <seconds> }`. Each job runs in its own runspace; the script is invoked via `pwsh.exe` (same isolation as the request handler's Subprocess mode). Job output is appended to `JobsLogFile`. Jobs are stopped during graceful shutdown. Replacement for the legacy PoSH Server `-CustomJob` option. |
+| `JobsLogFile` | `string` | `''` (= `<LogDir>\jobs.log`) | Absolute path of the log file for `BackgroundJobs`. Kept separate from the request log so background activity does not pollute request traces. Empty = `<LogDir>\jobs.log`. |
 | `GzipEnabled` | `bool` | `$true` | Enable GZIP response compression. Only applied when the client advertises `Accept-Encoding: gzip` AND the response body size is ≥ `GzipMinBytes` AND the response Content-Type starts with one of the entries in `GzipMimeTypes`. Pre-compressed binary types (images, ZIPs) are never compressed regardless of this setting because their MIME prefixes do not match. |
 | `GzipMinBytes` | `integer` | `1024` | Minimum response body size in bytes for which GZIP compression is attempted. Smaller responses are sent uncompressed because compression overhead would exceed the savings. |
 | `GzipMimeTypes` | `string[]` | see code | Allow-list of Content-Type prefixes eligible for GZIP. Matched via `StartsWith` so `'application/json'` covers `'application/json; charset=utf-8'`. Defaults include JSON, XML, JavaScript, HTML, CSS, and plain text. |
