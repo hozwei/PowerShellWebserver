@@ -416,6 +416,48 @@
         }
         .field-reset:hover { background: var(--bg); color: var(--text); }
         .field.dirty .field-reset { display: inline-block; }
+
+        .password-wrap { position: relative; }
+        .password-wrap input { padding-right: 38px; }
+        .password-wrap .pw-toggle {
+            position: absolute;
+            right: 4px;
+            top: 50%;
+            transform: translateY(-50%);
+            background: transparent;
+            border: 0;
+            cursor: pointer;
+            color: var(--muted);
+            padding: 4px 8px;
+            font: inherit;
+        }
+        .password-wrap .pw-toggle:hover { color: var(--text); }
+        .password-strength {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-top: 6px;
+            font-size: 12px;
+            color: var(--muted);
+        }
+        .password-strength .ps-bar {
+            flex: 1;
+            height: 4px;
+            background: var(--border);
+            border-radius: 2px;
+            overflow: hidden;
+        }
+        .password-strength .ps-fill {
+            height: 100%;
+            width: 0%;
+            background: var(--danger);
+            transition: width .15s, background .15s;
+        }
+        .password-strength.s-weak    .ps-fill { width: 25%; background: var(--danger); }
+        .password-strength.s-fair    .ps-fill { width: 50%; background: var(--warn-bd); }
+        .password-strength.s-strong  .ps-fill { width: 75%; background: var(--accent); }
+        .password-strength.s-best    .ps-fill { width: 100%; background: var(--ok); }
+        .password-strength.s-empty   .ps-fill { width: 0%; }
     </style>
 </head>
 <body>
@@ -754,11 +796,28 @@
         emptyEl.textContent = 'No API keys configured. Click "Add key" to create one.';
         host.appendChild(emptyEl);
 
+        const actionRow = document.createElement('div');
+        actionRow.style.cssText = 'display:flex; gap:8px; align-items:center; margin-top:10px;';
+
         const addBtn = document.createElement('button');
         addBtn.type = 'button';
-        addBtn.className = 'btn keymap-add';
+        addBtn.className = 'btn';
         addBtn.textContent = '+ Add key';
-        host.appendChild(addBtn);
+        actionRow.appendChild(addBtn);
+
+        const showAllBtn = document.createElement('button');
+        showAllBtn.type = 'button';
+        showAllBtn.className = 'btn';
+        showAllBtn.textContent = 'Show all';
+        let allShown = false;
+        showAllBtn.addEventListener('click', () => {
+            allShown = !allShown;
+            showAllBtn.textContent = allShown ? 'Hide all' : 'Show all';
+            list.querySelectorAll('.keymap-key').forEach(k => { k.type = allShown ? 'text' : 'password'; });
+        });
+        actionRow.appendChild(showAllBtn);
+
+        host.appendChild(actionRow);
 
         const validateAndCommit = () => {
             // Rebuild working from inputs (preserves row order while typing).
@@ -940,6 +999,29 @@
             input.value = initialStr;
         }
 
+        // Password fields render with a wrapper for the show/hide toggle.
+        // Initialised below; left empty for non-password types.
+        let strengthEl = null;
+
+        const scorePassword = (pw) => {
+            // Simple heuristic — length-dominant, character-class bonus.
+            // Not crypto strength; enough to nudge the operator off
+            // 8-char ASCII passwords without scaring them about Klingon
+            // entropy estimates.
+            const s = String(pw || '');
+            if (s.length === 0)            return { cls: 's-empty',  label: '' };
+            if (s.length < 8)              return { cls: 's-weak',   label: 'Weak' };
+            let classes = 0;
+            if (/[a-z]/.test(s)) classes++;
+            if (/[A-Z]/.test(s)) classes++;
+            if (/[0-9]/.test(s)) classes++;
+            if (/[^A-Za-z0-9]/.test(s)) classes++;
+            if (s.length >= 16 && classes >= 3) return { cls: 's-best',   label: 'Excellent' };
+            if (s.length >= 12 && classes >= 2) return { cls: 's-strong', label: 'Strong' };
+            if (s.length >= 10)                 return { cls: 's-fair',   label: 'Fair' };
+            return { cls: 's-weak', label: 'Weak' };
+        };
+
         const commit = () => {
             let raw;
             if (field.Type === 'bool')        raw = (input.value === 'true');
@@ -951,13 +1033,70 @@
             vmsg.textContent = err || '';
             vmsg.style.display = err ? 'block' : 'none';
             state.proposed[field.Name] = raw;
+            if (strengthEl) {
+                const score = scorePassword(raw);
+                strengthEl.className = 'password-strength ' + score.cls;
+                strengthEl.querySelector('.ps-label').textContent = score.label;
+            }
             updateSaveButton();
         };
 
-        input.addEventListener('input',  commit);
-        input.addEventListener('change', commit);
+        // Validation timing — numbers and enums/bools update on every
+        // input event (cheap, gives immediate min/max feedback). String
+        // fields with a regex validator only check on blur so each
+        // keystroke doesn't redden the field while the operator is still
+        // mid-typing a DN or FQDN. State updates happen on every keystroke
+        // either way so dirty tracking + Discard work normally.
+        const writeOnly = () => {
+            let raw;
+            if (field.Type === 'bool')        raw = (input.value === 'true');
+            else if (field.Type === 'int')    raw = input.value === '' ? null : Number(input.value);
+            else if (field.Type === 'string-array') raw = input.value.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+            else                              raw = input.value;
+            state.proposed[field.Name] = raw;
+            updateSaveButton();
+            if (strengthEl) {
+                const score = scorePassword(raw);
+                strengthEl.className = 'password-strength ' + score.cls;
+                strengthEl.querySelector('.ps-label').textContent = score.label;
+            }
+        };
+        const isLazyString = (field.Type === 'string' || field.Type === 'password')
+            && field.Validator;
+        if (isLazyString) {
+            input.addEventListener('input', writeOnly);
+            input.addEventListener('blur',  commit);
+            input.addEventListener('change', commit);
+        } else {
+            input.addEventListener('input',  commit);
+            input.addEventListener('change', commit);
+        }
 
-        right.appendChild(input);
+        if (field.Type === 'password') {
+            const wrap = document.createElement('div');
+            wrap.className = 'password-wrap';
+            wrap.appendChild(input);
+            const toggle = document.createElement('button');
+            toggle.type = 'button';
+            toggle.className = 'pw-toggle';
+            toggle.title = 'Show/hide';
+            toggle.textContent = '👁';
+            toggle.addEventListener('click', () => {
+                input.type = input.type === 'password' ? 'text' : 'password';
+            });
+            wrap.appendChild(toggle);
+            right.appendChild(wrap);
+            strengthEl = document.createElement('div');
+            strengthEl.className = 'password-strength s-empty';
+            strengthEl.innerHTML = '<div class="ps-bar"><div class="ps-fill"></div></div><span class="ps-label"></span>';
+            right.appendChild(strengthEl);
+            // Prime the indicator with the initial value.
+            const initialScore = scorePassword(input.value);
+            strengthEl.className = 'password-strength ' + initialScore.cls;
+            strengthEl.querySelector('.ps-label').textContent = initialScore.label;
+        } else {
+            right.appendChild(input);
+        }
         const def = document.createElement('div');
         def.className = 'help';
         def.innerHTML = 'current value in file: <code>' + formatCurrent(field).replace(/</g, '&lt;') + '</code>';

@@ -348,6 +348,21 @@ function Invoke-RouteDiff {
         return
     }
     $current = Get-FlatCurrentValues -EffectiveSchema $eff
+    # Same cross-field gate as /api/save — fail early so the operator
+    # never sees a green diff modal for a config that would be rejected
+    # on confirm. Less rage, fewer support tickets.
+    $effective = @{}
+    foreach ($name in @($current.Keys)) { $effective[$name] = $current[$name] }
+    foreach ($name in @($proposed.Keys)) { $effective[$name] = $proposed[$name] }
+    $crossErrors = Test-PoshCrossFieldRules -Effective $effective
+    if ($crossErrors.Count -gt 0) {
+        Send-PoshJsonResponse -Response $Response -StatusCode 422 -Payload @{
+            ok     = $false
+            error  = 'Validation failed (cross-field rules)'
+            fields = $crossErrors
+        }
+        return
+    }
     $changes = Compare-PoshFieldValues -Schema $eff.Fields -Current $current -Proposed $proposed
     Send-PoshJsonResponse -Response $Response -Payload @{
         ok      = $true
@@ -387,6 +402,22 @@ function Invoke-RouteSave {
         }
         return
     }
+    # Cross-field rules — run AFTER per-field validation has passed so the
+    # effective post-save state is sound. Effective value for a key is the
+    # proposed one if dirty, else the current one in the file.
+    $current = Get-FlatCurrentValues -EffectiveSchema $eff
+    $effective = @{}
+    foreach ($name in @($current.Keys)) { $effective[$name] = $current[$name] }
+    foreach ($name in @($proposed.Keys)) { $effective[$name] = $proposed[$name] }
+    $crossErrors = Test-PoshCrossFieldRules -Effective $effective
+    if ($crossErrors.Count -gt 0) {
+        Send-PoshJsonResponse -Response $Response -StatusCode 422 -Payload @{
+            ok     = $false
+            error  = 'Validation failed (cross-field rules)'
+            fields = $crossErrors
+        }
+        return
+    }
     try {
         $backups = Save-PoshFieldChanges -Schema $eff.Fields -Proposed $proposed
     } catch {
@@ -397,6 +428,49 @@ function Invoke-RouteSave {
         ok      = $true
         backups = $backups
     }
+}
+
+# Cross-field rules enforced server-side. The UI can warn about these too,
+# but the editor's auth surface is exactly the kind of place where two
+# legitimate-looking individual edits combine into a misconfiguration
+# (Basic auth selected, no creds set; or AuthMode=ApiKey + every ApiKeys
+# entry deleted + POSH_API_KEY env var blank). Reject at save time so we
+# never write a config.psd1 that boots into a useless state.
+function Test-PoshCrossFieldRules {
+    param([Parameter(Mandatory)] [hashtable] $Effective)
+    $out = @{}
+
+    $authMode = if ($Effective.ContainsKey('AuthMode')) { [string]$Effective['AuthMode'] } else { '' }
+    $basicUser = if ($Effective.ContainsKey('BasicAuthUser')) { [string]$Effective['BasicAuthUser'] } else { '' }
+    $basicPass = if ($Effective.ContainsKey('BasicAuthPass')) { [string]$Effective['BasicAuthPass'] } else { '' }
+    # Env vars trump the config values at server start; treat them as
+    # satisfying the requirement so the editor doesn't refuse a save
+    # just because the operator chose to keep the secret outside config.
+    $envBasicUser = $env:POSH_BASIC_USER
+    $envBasicPass = $env:POSH_BASIC_PASS
+    $effectiveBasicUser = if (-not [string]::IsNullOrEmpty($envBasicUser)) { $envBasicUser } else { $basicUser }
+    $effectiveBasicPass = if (-not [string]::IsNullOrEmpty($envBasicPass)) { $envBasicPass } else { $basicPass }
+
+    if ($authMode -in @('Basic','Both')) {
+        if ([string]::IsNullOrEmpty($effectiveBasicUser)) {
+            $out['BasicAuthUser'] = "Required when AuthMode is '$authMode' (set BasicAuthUser or POSH_BASIC_USER)."
+        }
+        if ([string]::IsNullOrEmpty($effectiveBasicPass)) {
+            $out['BasicAuthPass'] = "Required when AuthMode is '$authMode' (set BasicAuthPass or POSH_BASIC_PASS)."
+        }
+    }
+
+    if ($authMode -in @('ApiKey','Both')) {
+        $apiKeys = if ($Effective.ContainsKey('ApiKeys')) { $Effective['ApiKeys'] } else { $null }
+        $hasKeys = $apiKeys -is [hashtable] -and $apiKeys.Count -gt 0
+        $envKey  = $env:POSH_API_KEY
+        $hasEnv  = -not [string]::IsNullOrEmpty($envKey)
+        if (-not $hasKeys -and -not $hasEnv) {
+            $out['ApiKeys'] = "AuthMode '$authMode' requires at least one entry in ApiKeys or the POSH_API_KEY env var."
+        }
+    }
+
+    return $out
 }
 
 function Invoke-RouteGlobalvarAdd {
