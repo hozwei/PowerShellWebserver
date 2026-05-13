@@ -1,0 +1,685 @@
+<!doctype html>
+<html lang="de">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>posh Einstellungen</title>
+    <script>const POSH_TOKEN = '__POSH_TOKEN__';</script>
+    <style>
+        :root {
+            --bg:        #f7f8fa;
+            --panel:     #ffffff;
+            --text:      #1f2328;
+            --muted:     #6b7380;
+            --border:    #d8dee4;
+            --accent:    #0969da;
+            --accent-dim:#54aeff;
+            --danger:    #cf222e;
+            --ok:        #1a7f37;
+            --warn-bg:   #fff8c5;
+            --warn-bd:   #eac54f;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            color: var(--text);
+            background: var(--bg);
+        }
+        header {
+            padding: 12px 24px;
+            background: var(--panel);
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+        }
+        header h1 { margin: 0; font-size: 18px; font-weight: 600; }
+        header .meta { color: var(--muted); font-size: 12px; }
+        .layout { display: flex; min-height: calc(100vh - 56px); }
+        nav.tabs {
+            width: 220px;
+            border-right: 1px solid var(--border);
+            background: var(--panel);
+            padding: 12px 0;
+        }
+        nav.tabs button {
+            display: block;
+            width: 100%;
+            text-align: left;
+            border: 0;
+            background: transparent;
+            padding: 8px 24px;
+            cursor: pointer;
+            font: inherit;
+            color: var(--text);
+            border-left: 3px solid transparent;
+        }
+        nav.tabs button:hover { background: var(--bg); }
+        nav.tabs button.active {
+            border-left-color: var(--accent);
+            background: var(--bg);
+            font-weight: 600;
+        }
+        main { flex: 1; padding: 24px 32px 96px; max-width: 980px; }
+        h2 { font-size: 18px; margin: 0 0 4px; }
+        .group-desc { color: var(--muted); margin: 0 0 20px; }
+        .field {
+            padding: 12px 0;
+            border-bottom: 1px solid var(--border);
+            display: grid;
+            grid-template-columns: 1fr 320px;
+            gap: 16px;
+            align-items: start;
+        }
+        .field:last-child { border-bottom: 0; }
+        .field label { font-weight: 600; }
+        .field .help  { color: var(--muted); font-size: 12px; margin-top: 4px; }
+        .field input, .field select, .field textarea {
+            width: 100%;
+            padding: 6px 10px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            font: inherit;
+            background: var(--panel);
+        }
+        .field input:focus, .field select:focus, .field textarea:focus {
+            outline: 2px solid var(--accent-dim);
+            outline-offset: 0;
+            border-color: var(--accent);
+        }
+        .field input.invalid { border-color: var(--danger); background: #ffeef0; }
+        .field textarea { min-height: 72px; resize: vertical; font-family: ui-monospace, Consolas, monospace; }
+        .field .dirty-marker {
+            display: inline-block;
+            width: 8px; height: 8px;
+            border-radius: 50%;
+            background: var(--accent);
+            vertical-align: middle;
+            margin-left: 6px;
+            visibility: hidden;
+        }
+        .field.dirty .dirty-marker { visibility: visible; }
+        .field .validator-msg { color: var(--danger); font-size: 12px; margin-top: 4px; }
+        .savebar {
+            position: fixed;
+            bottom: 0; left: 0; right: 0;
+            background: var(--panel);
+            border-top: 1px solid var(--border);
+            padding: 12px 32px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+        }
+        .savebar .status { color: var(--muted); font-size: 13px; }
+        .btn {
+            border: 1px solid var(--border);
+            background: var(--panel);
+            padding: 6px 14px;
+            border-radius: 6px;
+            font: inherit;
+            cursor: pointer;
+        }
+        .btn:hover { background: var(--bg); }
+        .btn-primary { background: var(--accent); color: white; border-color: var(--accent); }
+        .btn-primary:hover { background: #0860c8; }
+        .btn-primary:disabled { background: var(--muted); border-color: var(--muted); cursor: not-allowed; }
+        .btn-danger { color: var(--danger); }
+
+        .modal-bg {
+            position: fixed; inset: 0;
+            background: rgba(0,0,0,0.5);
+            display: none;
+            align-items: center; justify-content: center;
+            z-index: 100;
+        }
+        .modal-bg.shown { display: flex; }
+        .modal {
+            background: var(--panel);
+            border-radius: 8px;
+            min-width: 480px; max-width: 720px; max-height: 80vh;
+            display: flex; flex-direction: column;
+            overflow: hidden;
+        }
+        .modal h3 { margin: 0; padding: 16px 20px; border-bottom: 1px solid var(--border); }
+        .modal .body { padding: 16px 20px; overflow-y: auto; }
+        .modal .actions { padding: 12px 20px; border-top: 1px solid var(--border); display: flex; justify-content: flex-end; gap: 8px; }
+        .diff-row { padding: 6px 0; border-bottom: 1px dashed var(--border); }
+        .diff-row:last-child { border-bottom: 0; }
+        .diff-row .key { font-weight: 600; }
+        .diff-row .file { color: var(--muted); font-size: 12px; }
+        .diff-row .before { color: var(--danger); font-family: ui-monospace, Consolas, monospace; font-size: 13px; }
+        .diff-row .arrow { color: var(--muted); margin: 0 6px; }
+        .diff-row .after  { color: var(--ok);     font-family: ui-monospace, Consolas, monospace; font-size: 13px; }
+
+        .toast {
+            position: fixed;
+            top: 16px; right: 16px;
+            background: var(--ok);
+            color: white;
+            padding: 10px 16px;
+            border-radius: 6px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+            opacity: 0;
+            transform: translateY(-8px);
+            transition: opacity .2s, transform .2s;
+            z-index: 200;
+        }
+        .toast.shown { opacity: 1; transform: translateY(0); }
+        .toast.err { background: var(--danger); }
+
+        .setup-card {
+            background: var(--panel);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 16px 20px;
+            margin-bottom: 16px;
+        }
+        .setup-card h3 { margin: 0 0 8px; font-size: 16px; }
+        .setup-card p  { margin: 0 0 12px; color: var(--muted); }
+        .setup-card .row { display: flex; gap: 8px; align-items: center; }
+        .setup-card .row input { flex: 1; padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px; font: inherit; }
+
+        .badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 999px;
+            font-size: 12px;
+            font-weight: 600;
+            background: var(--bg);
+            color: var(--muted);
+        }
+        .badge-ok    { background: #dcfce7; color: var(--ok); }
+        .badge-warn  { background: var(--warn-bg); color: #875000; }
+        .badge-err   { background: #ffeef0; color: var(--danger); }
+
+        .warn-banner {
+            background: var(--warn-bg);
+            border: 1px solid var(--warn-bd);
+            padding: 10px 16px;
+            border-radius: 6px;
+            margin-bottom: 16px;
+            font-size: 13px;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div>
+            <h1>posh Einstellungen</h1>
+            <div class="meta" id="meta-line">lade …</div>
+        </div>
+        <div>
+            <button class="btn btn-danger" id="quit-btn" title="Editor beenden">Beenden</button>
+        </div>
+    </header>
+
+    <div class="layout">
+        <nav class="tabs" id="tabs"></nav>
+        <main id="main">
+            <p>Lade Schema und aktuelle Werte …</p>
+        </main>
+    </div>
+
+    <div class="savebar">
+        <span class="status" id="dirty-status">Keine Änderungen.</span>
+        <button class="btn btn-primary" id="save-btn" disabled>Speichern</button>
+    </div>
+
+    <div class="modal-bg" id="diff-modal">
+        <div class="modal">
+            <h3>Änderungen prüfen</h3>
+            <div class="body" id="diff-body"></div>
+            <div class="actions">
+                <button class="btn" id="diff-cancel">Abbrechen</button>
+                <button class="btn btn-primary" id="diff-confirm">Übernehmen und speichern</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal-bg" id="prompt-modal">
+        <div class="modal">
+            <h3 id="prompt-title">Eingabe</h3>
+            <div class="body" id="prompt-body"></div>
+            <div class="actions">
+                <button class="btn" id="prompt-cancel">Abbrechen</button>
+                <button class="btn btn-primary" id="prompt-confirm">OK</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="toast" id="toast"></div>
+
+<script>
+(() => {
+    const $  = (sel, ctx = document) => ctx.querySelector(sel);
+    const $$ = (sel, ctx = document) => Array.from(ctx.querySelectorAll(sel));
+    const TOKEN = (POSH_TOKEN && POSH_TOKEN.indexOf('__') !== 0) ? POSH_TOKEN : null;
+    if (!TOKEN) {
+        document.body.innerHTML = '<p style="padding:24px;color:#cf222e">Editor-Token fehlt. Bitte Editor erneut starten.</p>';
+        return;
+    }
+
+    const state = {
+        schema:   null,
+        snapshot: null,
+        current:  {},      // server-side current values, flat
+        proposed: {},      // user edits, flat (only dirty keys)
+        active:   null,    // active tab id
+    };
+
+    const toast = (msg, kind = 'ok') => {
+        const t = $('#toast');
+        t.textContent = msg;
+        t.className = 'toast shown' + (kind === 'err' ? ' err' : '');
+        clearTimeout(toast._t);
+        toast._t = setTimeout(() => t.classList.remove('shown'), 4500);
+    };
+
+    const api = async (method, path, body) => {
+        const opts = {
+            method,
+            credentials: 'same-origin',
+            headers: { 'X-Posh-CSRF': TOKEN }
+        };
+        if (body !== undefined) {
+            opts.headers['Content-Type'] = 'application/json';
+            opts.body = JSON.stringify(body);
+        }
+        const r = await fetch(path, opts);
+        let data;
+        try { data = await r.json(); } catch (e) { data = { ok: false, error: 'Antwort ist kein JSON' }; }
+        if (!r.ok) {
+            const msg = data && data.error ? data.error : ('HTTP ' + r.status);
+            const err = new Error(msg);
+            err.payload = data;
+            err.status = r.status;
+            throw err;
+        }
+        return data;
+    };
+
+    const isFieldDirty = (field) => {
+        if (!(field.Name in state.proposed)) return false;
+        const a = state.current[field.Name];
+        const b = state.proposed[field.Name];
+        if (field.Type === 'string-array') {
+            const aa = Array.isArray(a) ? a : (a ? [a] : []);
+            const bb = Array.isArray(b) ? b : (b ? String(b).split(/\r?\n/).map(s=>s.trim()).filter(Boolean) : []);
+            if (aa.length !== bb.length) return true;
+            for (let i = 0; i < aa.length; i++) if (String(aa[i]) !== String(bb[i])) return true;
+            return false;
+        }
+        if (field.Type === 'bool') return Boolean(a) !== Boolean(b);
+        return String(a ?? '') !== String(b ?? '');
+    };
+
+    const dirtyFieldsCount = () => state.schema.Fields.filter(isFieldDirty).length;
+
+    const updateSaveButton = () => {
+        const n = dirtyFieldsCount();
+        $('#save-btn').disabled = (n === 0);
+        $('#dirty-status').textContent = n === 0 ? 'Keine Änderungen.' : (n + (n === 1 ? ' Änderung' : ' Änderungen') + ' bereit zum Speichern.');
+        for (const field of state.schema.Fields) {
+            const row = document.querySelector('.field[data-name="' + field.Name + '"]');
+            if (!row) continue;
+            row.classList.toggle('dirty', isFieldDirty(field));
+        }
+    };
+
+    const validateField = (field, raw) => {
+        if (field.Type === 'string' || field.Type === 'enum') {
+            const s = String(raw ?? '');
+            if (field.Validator) { try { if (!new RegExp(field.Validator).test(s)) return 'Format passt nicht.'; } catch (e) { /* fallback to server */ } }
+            return null;
+        }
+        if (field.Type === 'int') {
+            const n = Number(raw);
+            if (!Number.isInteger(n)) return 'Ganzzahl erwartet.';
+            if (field.Min !== undefined && n < field.Min) return 'Mindestens ' + field.Min + '.';
+            if (field.Max !== undefined && n > field.Max) return 'Höchstens ' + field.Max + '.';
+            return null;
+        }
+        return null;
+    };
+
+    const formatCurrent = (field) => {
+        const v = state.current[field.Name];
+        if (v === undefined || v === null) return '(nicht gesetzt)';
+        if (field.Type === 'bool') return v ? '$true' : '$false';
+        if (field.Type === 'string-array') {
+            const arr = Array.isArray(v) ? v : [v];
+            return arr.length === 0 ? '(leer)' : arr.join(', ');
+        }
+        return String(v);
+    };
+
+    const renderField = (field) => {
+        const row = document.createElement('div');
+        row.className = 'field';
+        row.dataset.name = field.Name;
+
+        const left = document.createElement('div');
+        const label = document.createElement('label');
+        label.textContent = field.Label;
+        const dot = document.createElement('span');
+        dot.className = 'dirty-marker';
+        dot.title = 'Wert geändert';
+        label.appendChild(dot);
+        const help = document.createElement('div');
+        help.className = 'help';
+        help.textContent = (field.Help || '') + ' · Datei: ' + field.File;
+        const vmsg = document.createElement('div');
+        vmsg.className = 'validator-msg';
+        vmsg.style.display = 'none';
+        left.append(label, help, vmsg);
+
+        const right = document.createElement('div');
+        let input;
+
+        const initial = state.current[field.Name];
+        const initialStr = initial === undefined || initial === null ? '' : (Array.isArray(initial) ? initial.join('\n') : String(initial));
+
+        if (field.Type === 'bool') {
+            input = document.createElement('select');
+            ['$true','$false'].forEach(v => {
+                const o = document.createElement('option');
+                o.value = v === '$true' ? 'true' : 'false';
+                o.textContent = v;
+                input.appendChild(o);
+            });
+            input.value = initial ? 'true' : 'false';
+        } else if (field.Type === 'enum') {
+            input = document.createElement('select');
+            for (const c of (field.Choices || [])) {
+                const o = document.createElement('option');
+                o.value = c; o.textContent = c;
+                input.appendChild(o);
+            }
+            input.value = initialStr;
+        } else if (field.Type === 'int') {
+            input = document.createElement('input');
+            input.type = 'number';
+            if (field.Min !== undefined) input.min = field.Min;
+            if (field.Max !== undefined) input.max = field.Max;
+            input.step = 1;
+            input.value = initialStr;
+        } else if (field.Type === 'string-array') {
+            input = document.createElement('textarea');
+            input.value = initialStr;
+            input.placeholder = 'Eine Zeile pro Eintrag';
+        } else {
+            input = document.createElement('input');
+            input.type = 'text';
+            if (field.Validator) input.pattern = field.Validator;
+            input.value = initialStr;
+        }
+
+        const commit = () => {
+            let raw;
+            if (field.Type === 'bool')        raw = (input.value === 'true');
+            else if (field.Type === 'int')    raw = input.value === '' ? null : Number(input.value);
+            else if (field.Type === 'string-array') raw = input.value.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+            else                              raw = input.value;
+            const err = validateField(field, raw);
+            input.classList.toggle('invalid', Boolean(err));
+            vmsg.textContent = err || '';
+            vmsg.style.display = err ? 'block' : 'none';
+            state.proposed[field.Name] = raw;
+            updateSaveButton();
+        };
+
+        input.addEventListener('input',  commit);
+        input.addEventListener('change', commit);
+
+        right.appendChild(input);
+        const def = document.createElement('div');
+        def.className = 'help';
+        def.innerHTML = 'aktuell in der Datei: <code>' + formatCurrent(field).replace(/</g, '&lt;') + '</code>';
+        right.appendChild(def);
+
+        row.append(left, right);
+        return row;
+    };
+
+    const renderGroup = (groupId) => {
+        const group = state.schema.Groups.find(g => g.Id === groupId);
+        const main = $('#main');
+        main.innerHTML = '';
+
+        const title = document.createElement('h2');
+        title.textContent = group.Title;
+        main.appendChild(title);
+
+        if (groupId === 'setup') {
+            renderSetup(main);
+            return;
+        }
+
+        const desc = document.createElement('p');
+        desc.className = 'group-desc';
+        desc.textContent = 'Werte werden nicht sofort gespeichert. Klick auf "Speichern" zeigt zuerst eine Diff-Vorschau und legt vor dem Schreiben ein Backup an.';
+        main.appendChild(desc);
+
+        const fields = state.schema.Fields.filter(f => f.Group === groupId);
+        for (const f of fields) main.appendChild(renderField(f));
+        updateSaveButton();
+    };
+
+    const renderSetup = (main) => {
+        const desc = document.createElement('p');
+        desc.className = 'group-desc';
+        desc.textContent = 'Spezialfunktionen für die Erst-Einrichtung. Jeweils mit Rückfrage und sicheren Defaults.';
+        main.appendChild(desc);
+
+        const aes = state.snapshot.aesKey;
+        const aesCard = document.createElement('div');
+        aesCard.className = 'setup-card';
+        const aesBadge = aes.Initialised
+            ? '<span class="badge badge-ok">initialisiert</span>'
+            : '<span class="badge badge-warn">Placeholder</span>';
+        aesCard.innerHTML =
+            '<h3>AES-Schlüssel für verschlüsselte Secrets ' + aesBadge + '</h3>' +
+            '<p>Schreibt 32 zufällige Bytes in den <code>$key</code>-Block von <code>globalvars.ps1</code>. ' +
+            'Achtung: Wenn bereits Secrets verschlüsselt sind, müssen sie nach dem Neu-Generieren mit dem neuen Schlüssel neu abgelegt werden.</p>' +
+            '<div class="row">' +
+            '<button class="btn btn-primary" id="aes-gen">Schlüssel ' + (aes.Initialised ? 'neu generieren' : 'generieren') + '</button>' +
+            (aes.Initialised ? '<label><input type="checkbox" id="aes-force"> Bestehenden Schlüssel überschreiben</label>' : '') +
+            '</div>';
+        main.appendChild(aesCard);
+        $('#aes-gen').addEventListener('click', async () => {
+            const force = aes.Initialised ? Boolean(document.getElementById('aes-force')?.checked) : false;
+            if (aes.Initialised && !force) { toast('Bitte erst "Bestehenden Schlüssel überschreiben" anhaken.', 'err'); return; }
+            const sure = confirm(aes.Initialised
+                ? 'Bestehender AES-Schlüssel wird ersetzt. Alle bisherigen Secrets sind danach NICHT mehr lesbar. Wirklich fortfahren?'
+                : 'AES-Schlüssel mit 32 Zufallsbytes erzeugen?');
+            if (!sure) return;
+            try {
+                const r = await api('POST', '/api/initkey', { force });
+                toast('Schlüssel gespeichert. Backup: ' + (r.backup || '(keines)'));
+                await loadAll();
+                renderSetup(main);
+            } catch (e) { toast(e.message, 'err'); }
+        });
+
+        // Secret-Storage
+        const secCard = document.createElement('div');
+        secCard.className = 'setup-card';
+        secCard.innerHTML =
+            '<h3>Verschlüsseltes Secret ablegen</h3>' +
+            '<p>Speichert ein Passwort verschlüsselt in <code>encrypted_pw\\encryptedString_&lt;Label&gt;.txt</code>. ' +
+            'Voraussetzung: AES-Schlüssel ist initialisiert.</p>' +
+            '<div class="row"><input type="text" id="sec-label" placeholder="Label (z.B. ad_adsread)" pattern="^[A-Za-z0-9_-]+$"></div>' +
+            '<div class="row" style="margin-top:8px"><input type="password" id="sec-pw" placeholder="Passwort"></div>' +
+            '<div class="row" style="margin-top:8px"><label><input type="checkbox" id="sec-force"> bestehendes Label überschreiben</label>' +
+            '<button class="btn btn-primary" id="sec-save" style="margin-left:auto">Ablegen</button></div>' +
+            (state.snapshot.secrets && state.snapshot.secrets.length > 0
+                ? '<p style="margin-top:12px"><strong>Vorhandene Labels:</strong> ' + state.snapshot.secrets.map(s => '<code>' + s + '</code>').join(', ') + '</p>'
+                : '<p style="margin-top:12px;color:var(--muted)">Noch keine Secrets abgelegt.</p>');
+        main.appendChild(secCard);
+        $('#sec-save').addEventListener('click', async () => {
+            const label = $('#sec-label').value.trim();
+            const pw    = $('#sec-pw').value;
+            const force = $('#sec-force').checked;
+            if (!/^[A-Za-z0-9_-]+$/.test(label)) { toast('Label darf nur A-Z, 0-9, _ und - enthalten.', 'err'); return; }
+            if (!pw) { toast('Passwort darf nicht leer sein.', 'err'); return; }
+            try {
+                const r = await api('POST', '/api/secret', { label, password: pw, force });
+                toast('Secret abgelegt: ' + r.file);
+                $('#sec-label').value = '';
+                $('#sec-pw').value = '';
+                $('#sec-force').checked = false;
+                await loadAll();
+                renderSetup(main);
+            } catch (e) { toast(e.message, 'err'); }
+        });
+
+        // POSH_API_KEY
+        const env = state.snapshot.env;
+        const envCard = document.createElement('div');
+        envCard.className = 'setup-card';
+        const envBadge = env.SetMachine
+            ? '<span class="badge badge-ok">gesetzt (' + env.LengthChars + ' Zeichen)</span>'
+            : '<span class="badge badge-err">nicht gesetzt</span>';
+        const adminWarn = state.snapshot.isAdmin
+            ? ''
+            : '<div class="warn-banner">Editor wurde nicht als Administrator gestartet — POSH_API_KEY kann nicht im System-Scope gesetzt werden.</div>';
+        envCard.innerHTML =
+            '<h3>POSH_API_KEY (System-Umgebungsvariable) ' + envBadge + '</h3>' +
+            adminWarn +
+            '<p>Wird beim Server-Start als HTTP-API-Key verlangt. Wird im Machine-Scope gespeichert (für den Scheduled Task lesbar).</p>' +
+            '<div class="row"><input type="text" id="env-val" placeholder="neuer API-Key" autocomplete="off">' +
+            '<button class="btn btn-primary" id="env-save"' + (state.snapshot.isAdmin ? '' : ' disabled') + '>Setzen</button></div>';
+        main.appendChild(envCard);
+        if (state.snapshot.isAdmin) {
+            $('#env-save').addEventListener('click', async () => {
+                const v = $('#env-val').value.trim();
+                if (!v) { toast('API-Key darf nicht leer sein.', 'err'); return; }
+                if (!confirm('POSH_API_KEY im System-Scope überschreiben?')) return;
+                try {
+                    await api('POST', '/api/setenv', { value: v });
+                    toast('POSH_API_KEY gesetzt. Scheduled Task neu starten, damit der neue Wert greift.');
+                    $('#env-val').value = '';
+                    await loadAll();
+                    renderSetup(main);
+                } catch (e) { toast(e.message, 'err'); }
+            });
+        }
+    };
+
+    const renderTabs = () => {
+        const nav = $('#tabs');
+        nav.innerHTML = '';
+        for (const g of state.schema.Groups) {
+            const b = document.createElement('button');
+            b.textContent = g.Title;
+            b.dataset.id = g.Id;
+            if (g.Id === state.active) b.classList.add('active');
+            b.addEventListener('click', () => {
+                state.active = g.Id;
+                $$('#tabs button').forEach(x => x.classList.toggle('active', x.dataset.id === g.Id));
+                renderGroup(g.Id);
+            });
+            nav.appendChild(b);
+        }
+    };
+
+    const buildFlatCurrent = () => {
+        const snap = state.snapshot;
+        const out = {};
+        for (const f of state.schema.Fields) {
+            const src = f.File === 'globalvars.ps1' ? snap.globalvars : snap.config;
+            if (src && (f.Name in src)) out[f.Name] = src[f.Name];
+        }
+        return out;
+    };
+
+    const loadAll = async () => {
+        const r = await api('GET', '/api/config');
+        state.schema   = r.schema;
+        state.snapshot = r.snapshot;
+        state.current  = buildFlatCurrent();
+        state.proposed = {};
+        const meta = $('#meta-line');
+        const adminBadge = state.snapshot.isAdmin ? '<span class="badge badge-ok">Admin</span>' : '<span class="badge">Standard-User</span>';
+        meta.innerHTML = state.schema.Fields.length + ' Felder · ' + state.schema.Groups.length + ' Gruppen · ' + adminBadge;
+    };
+
+    const openDiffModal = async () => {
+        // Build the proposed-by-name payload — only dirty fields.
+        const values = {};
+        for (const f of state.schema.Fields) {
+            if (isFieldDirty(f)) values[f.Name] = state.proposed[f.Name];
+        }
+        if (Object.keys(values).length === 0) return;
+        let res;
+        try {
+            res = await api('POST', '/api/diff', { values });
+        } catch (e) {
+            toast(e.message, 'err');
+            return;
+        }
+        const body = $('#diff-body');
+        body.innerHTML = '';
+        if (!res.changes || res.changes.length === 0) {
+            body.innerHTML = '<p>Keine effektiven Änderungen erkannt.</p>';
+        } else {
+            for (const c of res.changes) {
+                const row = document.createElement('div');
+                row.className = 'diff-row';
+                row.innerHTML =
+                    '<div class="key">' + c.Label + ' <span class="file">(' + c.File + ' · ' + c.Name + ')</span></div>' +
+                    '<div><span class="before">' + (c.Before ?? '').toString().replace(/</g,'&lt;') + '</span>' +
+                    '<span class="arrow">→</span>' +
+                    '<span class="after">' + (c.After ?? '').toString().replace(/</g,'&lt;') + '</span></div>';
+                body.appendChild(row);
+            }
+        }
+        $('#diff-modal').classList.add('shown');
+        $('#diff-confirm').dataset.values = JSON.stringify(values);
+    };
+
+    const confirmDiffSave = async () => {
+        const values = JSON.parse($('#diff-confirm').dataset.values);
+        let res;
+        try {
+            res = await api('POST', '/api/save', { values });
+        } catch (e) {
+            toast(e.message, 'err');
+            return;
+        }
+        const bk = (res.backups || []).join(', ');
+        toast('Gespeichert. Backups: ' + (bk || '(keine — keine Datei zu sichern)'));
+        $('#diff-modal').classList.remove('shown');
+        await loadAll();
+        renderGroup(state.active);
+    };
+
+    const init = async () => {
+        $('#diff-cancel').addEventListener('click', () => $('#diff-modal').classList.remove('shown'));
+        $('#diff-confirm').addEventListener('click', confirmDiffSave);
+        $('#save-btn').addEventListener('click', openDiffModal);
+        $('#quit-btn').addEventListener('click', async () => {
+            if (!confirm('Editor beenden?')) return;
+            try { await api('POST', '/api/quit', {}); } catch (e) { /* server is shutting down, that is fine */ }
+            document.body.innerHTML = '<p style="padding:24px">Editor wurde beendet. Du kannst das Browser-Fenster schließen.</p>';
+        });
+        try {
+            await loadAll();
+        } catch (e) {
+            $('#main').innerHTML = '<p style="color:var(--danger)">Konnte Schema nicht laden: ' + e.message + '</p>';
+            return;
+        }
+        renderTabs();
+        state.active = state.schema.Groups[0].Id;
+        $$('#tabs button')[0].classList.add('active');
+        renderGroup(state.active);
+    };
+
+    init();
+})();
+</script>
+</body>
+</html>
