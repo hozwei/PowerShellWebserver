@@ -189,6 +189,48 @@ if ($null -eq $basicUser) { $basicUser = '' }
 if ($null -eq $basicPass) { $basicPass = '' }
 
 # ---------------------------------------------------------------------------
+# pwsh.exe path — auto-derived from the running process. Read here BEFORE the
+# $cfg hashtable literal so the literal can reference $derivedPwshExe (the
+# block is eager-evaluated; see the contract note below).
+#
+# The server hands this path to Process.Start() for every Subprocess-mode
+# request and for BackgroundJobs, so it must point at a real, launchable
+# pwsh.exe. Three strategies, most-reliable first:
+#   1. [Environment]::ProcessPath — .NET 6+, the exact image that started
+#      this process. No Process / MainModule handle needed.
+#   2. (Get-Process -Id $PID).MainModule.FileName — legacy fallback; can
+#      throw on locked-down hosts but normally agrees with (1).
+#   3. Join-Path $PSHOME 'pwsh.exe' — last resort.
+#
+# All three resolve correctly for BOTH the classic MSI install
+# (C:\Program Files\PowerShell\7\) and the MSIX / Microsoft Store "app"
+# package (C:\Program Files\WindowsApps\Microsoft.PowerShell_<ver>_x64__<id>\).
+# The WindowsApps folder blocks directory ENUMERATION for non-admins, but a
+# known full path to pwsh.exe inside it is still Test-Path-able and
+# Process.Start()-able — verified on PowerShell 7.6.1 running as the Store app.
+# Each candidate is Test-Path-verified; the first hit wins. Empty result only
+# if all three fail (essentially impossible — we ARE a running pwsh); the
+# PwshExe validator further down turns that into a clear startup error.
+# ---------------------------------------------------------------------------
+$derivedPwshExe = ''
+$pwshCandidates = [System.Collections.Generic.List[string]]::new()
+$processPath = [System.Environment]::ProcessPath
+if (-not [string]::IsNullOrWhiteSpace($processPath)) { $pwshCandidates.Add($processPath) }
+try {
+    $mainModulePath = (Get-Process -Id $PID).MainModule.FileName
+    if (-not [string]::IsNullOrWhiteSpace($mainModulePath)) { $pwshCandidates.Add($mainModulePath) }
+} catch { }
+if (-not [string]::IsNullOrWhiteSpace($PSHOME)) {
+    $pwshCandidates.Add((Join-Path $PSHOME 'pwsh.exe'))
+}
+foreach ($pwshCandidate in $pwshCandidates) {
+    if (Test-Path -LiteralPath $pwshCandidate -PathType Leaf) {
+        $derivedPwshExe = $pwshCandidate
+        break
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Configuration
 # The prefix is no longer stored in $cfg — it is built dynamically from
 # HttpPort/HttpsPort and added directly to the listener.
@@ -197,7 +239,7 @@ if ($null -eq $basicPass) { $basicPass = '' }
 # PowerShell evaluates this hashtable literal EAGERLY at parse-time of the
 # enclosing scope. Every variable used inside the block — $HttpsEnabled,
 # $HttpPort, $HttpsPort, $baseDir, $apiKey, $basicUser, $basicPass, plus
-# $PID for PwshExe — must therefore be defined BEFORE the block runs.
+# $derivedPwshExe for PwshExe — must therefore be defined BEFORE the block runs.
 # Reordering blocks here without minding that contract leaves silently
 # empty $cfg fields (no error is raised — $null just lands in the value).
 #
@@ -215,7 +257,7 @@ $cfg = @{
     HttpsPort           = $HttpsPort                                 # HTTPS port (only relevant when HttpsEnabled)
     WebRoot             = Join-Path $baseDir 'webroot'
     LogDir              = Join-Path $baseDir 'logs'
-    PwshExe             = (Get-Process -Id $PID).MainModule.FileName # pwsh.exe of the running process — no hardcoded path
+    PwshExe             = $derivedPwshExe                            # pwsh.exe of the running process — auto-derived above; works for classic MSI + MSIX app
     ApiKey              = $apiKey                                    # legacy single-key from $env:POSH_API_KEY — kept for BC; auto-merged into ApiKeys as 'default' when ApiKeys is empty
     ApiKeys             = [ordered]@{}                               # multi-key map: label → key. Populate via config.psd1: @{ ApiKeys = @{ 'ci' = 'k1'; 'mon' = 'k2' } }
     ScriptTimeoutSec         = 300    # 5 minutes — scripts running longer are terminated (HTTP 504)
@@ -517,8 +559,20 @@ if ($null -ne $external) {
     $null = $envSourcedKeys.Add('BasicAuthUser')
     $null = $envSourcedKeys.Add('BasicAuthPass')
 
+    # Machine-derived path keys — these default to a value computed from the
+    # running process (PwshExe = the live pwsh.exe path), which is ALWAYS valid
+    # on this machine. config.psd1 may carry a stale absolute path: the file was
+    # generated on another host, or PowerShell was reinstalled to a different
+    # location. A non-existent override here would hard-fail startup. Skip the
+    # override when it is empty OR points at a path that no longer exists, and
+    # keep the auto-derived default. A VALID custom path still wins, so an
+    # operator pinning a specific pwsh build is unaffected.
+    $machineDerivedPathKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $null = $machineDerivedPathKeys.Add('PwshExe')
+
     $unknownKeys = [System.Collections.Generic.List[string]]::new()
     $skippedEmpty = [System.Collections.Generic.List[string]]::new()
+    $skippedStalePath = [System.Collections.Generic.List[string]]::new()
     foreach ($k in $external.Keys) {
         if (-not $knownCfgKeys.Contains([string]$k)) { $unknownKeys.Add([string]$k) }
         # IsNullOrWhiteSpace (not IsNullOrEmpty): whitespace-only psd1 values like
@@ -527,6 +581,14 @@ if ($null -ne $external) {
         if ($envSourcedKeys.Contains([string]$k) -and [string]::IsNullOrWhiteSpace([string]$external[$k])) {
             $skippedEmpty.Add([string]$k)
             continue
+        }
+        if ($machineDerivedPathKeys.Contains([string]$k)) {
+            $candidatePath = [string]$external[$k]
+            if ([string]::IsNullOrWhiteSpace($candidatePath) -or
+                -not (Test-Path -LiteralPath $candidatePath -PathType Leaf)) {
+                $skippedStalePath.Add([string]$k)
+                continue
+            }
         }
         $cfg[$k] = $external[$k]
     }
@@ -538,6 +600,9 @@ if ($null -ne $external) {
     }
     if ($skippedEmpty.Count -gt 0) {
         $script:externalConfigSkippedNote = "Note: config.psd1 had empty values for env-sourced key(s) [$($skippedEmpty -join ', ')]; preserved env-var defaults instead of wiping them."
+    }
+    if ($skippedStalePath.Count -gt 0) {
+        $script:externalConfigStalePathNote = "Note: config.psd1 had stale/missing path(s) for machine-derived key(s) [$($skippedStalePath -join ', ')]; used the auto-derived value(s) instead. This happens when the file was generated on another host or PowerShell was reinstalled (e.g. classic MSI -> Microsoft Store app). Re-run tools\Initialize-PoshConfig.ps1 to refresh, or remove the key from config.psd1."
     }
 }
 
@@ -1313,6 +1378,9 @@ if (-not [string]::IsNullOrEmpty($script:externalConfigUnknownKeysNote)) {
 if (-not [string]::IsNullOrEmpty($script:externalConfigSkippedNote)) {
     Write-StartupLog $script:externalConfigSkippedNote
 }
+if (-not [string]::IsNullOrEmpty($script:externalConfigStalePathNote)) {
+    Write-StartupLog $script:externalConfigStalePathNote
+}
 if (-not [string]::IsNullOrEmpty($script:envKeyMergeNote)) {
     Write-StartupLog $script:envKeyMergeNote
 }
@@ -1385,22 +1453,33 @@ if ($cfg.AuthMode -in @('ApiKey', 'Both')) {
 
 # ---------------------------------------------------------------------------
 # PwshExe sanity — defaults to the currently running pwsh.exe (auto-derived
-# from $PID), so a normal startup never trips this check. config.psd1 can
-# override the value; warn loudly if the override is no longer valid or
-# accidentally points at Windows PowerShell (which lacks PS-7 features).
+# above via ProcessPath / MainModule / $PSHOME), so a normal startup never
+# trips this check. The config-merge step already skips a stale/missing
+# config.psd1 override for PwshExe, so by this point $cfg.PwshExe is either
+# the verified auto-derived path or a valid operator-supplied override.
+# We still validate as a last-resort safety net.
 # ---------------------------------------------------------------------------
-if (-not [string]::IsNullOrWhiteSpace($cfg.PwshExe)) {
-    if (-not (Test-Path -LiteralPath $cfg.PwshExe -PathType Leaf)) {
-        Write-StartupLog "ERROR: PwshExe = '$($cfg.PwshExe)' does not exist. Subprocess execution would fail at runtime."
-        Write-Output ''
-        Write-Output "ERROR: PwshExe = '$($cfg.PwshExe)' does not exist."
-        Write-Output 'Solution: remove the override from config.psd1 (the script auto-derives the running pwsh) or fix the path.'
-        exit 1
-    }
-    $pwshLeaf = (Split-Path -Leaf $cfg.PwshExe).ToLowerInvariant()
-    if ($pwshLeaf -ne 'pwsh.exe' -and $pwshLeaf -ne 'pwsh') {
-        Write-StartupLog "WARN: PwshExe = '$($cfg.PwshExe)' does not look like pwsh ('$pwshLeaf'). Subprocess scripts may behave unexpectedly under Windows PowerShell."
-    }
+if ([string]::IsNullOrWhiteSpace($cfg.PwshExe)) {
+    # Empty only if all three auto-derive strategies failed AND config.psd1
+    # carried no valid override — essentially impossible (we ARE a running
+    # pwsh). But an empty value would make every Subprocess request and every
+    # BackgroundJob fail confusingly mid-flight, so fail loudly at startup.
+    Write-StartupLog 'ERROR: PwshExe is empty — could not auto-derive pwsh.exe from the running process. Subprocess execution and BackgroundJobs would fail at runtime.'
+    Write-Output ''
+    Write-Output 'ERROR: PwshExe is empty and could not be auto-derived.'
+    Write-Output 'Solution: set PwshExe in config.psd1 to the full path of pwsh.exe.'
+    exit 1
+}
+if (-not (Test-Path -LiteralPath $cfg.PwshExe -PathType Leaf)) {
+    Write-StartupLog "ERROR: PwshExe = '$($cfg.PwshExe)' does not exist. Subprocess execution would fail at runtime."
+    Write-Output ''
+    Write-Output "ERROR: PwshExe = '$($cfg.PwshExe)' does not exist."
+    Write-Output 'Solution: remove the override from config.psd1 (the server auto-derives the running pwsh — works for the classic MSI install AND the Microsoft Store app) or fix the path.'
+    exit 1
+}
+$pwshLeaf = (Split-Path -Leaf $cfg.PwshExe).ToLowerInvariant()
+if ($pwshLeaf -ne 'pwsh.exe' -and $pwshLeaf -ne 'pwsh') {
+    Write-StartupLog "WARN: PwshExe = '$($cfg.PwshExe)' does not look like pwsh ('$pwshLeaf'). Subprocess scripts may behave unexpectedly under Windows PowerShell."
 }
 
 # ---------------------------------------------------------------------------

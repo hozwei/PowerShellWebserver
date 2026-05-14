@@ -105,6 +105,18 @@ foreach ($envOnlyKey in @('ApiKey', 'BasicAuthUser', 'BasicAuthPass')) {
     if ($defaults.ContainsKey($envOnlyKey)) { $null = $defaults.Remove($envOnlyKey) }
 }
 
+# Drop machine-derived path keys. PwshExe is auto-derived at startup from the
+# running process (ProcessPath / MainModule / $PSHOME) and is correct on every
+# host. Freezing the absolute path into config.psd1 breaks the moment the file
+# is copied to another machine OR PowerShell is reinstalled to a different
+# location — most notably the classic MSI install (C:\Program Files\PowerShell\7\)
+# vs the Microsoft Store "app" package (C:\Program Files\WindowsApps\...). The
+# server skips a stale PwshExe override anyway, but not emitting it keeps the
+# generated file clean and avoids the confusing startup note.
+foreach ($machineKey in @('PwshExe')) {
+    if ($defaults.ContainsKey($machineKey)) { $null = $defaults.Remove($machineKey) }
+}
+
 # ---------------------------------------------------------------------------
 # Group ordering: each entry collects related keys under a section header
 # so the generated file reads like a curated config rather than an
