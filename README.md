@@ -6,6 +6,7 @@ Place a `.ps1` file in `webroot\` — it is immediately reachable as an HTTP end
 
 ## Documentation
 
+- **[Handbook](./HANDBOOK.md) — the complete, self-contained administrator manual (start here)**
 - [Overview](./docs/overview.md) — What posh is and the problem it solves
 - [Setup](./docs/setup.md) — Installation and prerequisites
 - [Usage](./docs/usage.md) — How to call endpoints and interpret responses
