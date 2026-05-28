@@ -34,7 +34,9 @@ globalvars.ps1.bak.*
 # Project-specific exclusions
 # ---------------------------------------------------------------------------
 AGENTS.md
+CLAUDE.md
 CONTEXT.md
+.claude/
 webroot/restart-comfyui-graceful.ps1
 
 # ---------------------------------------------------------------------------
